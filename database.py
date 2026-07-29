@@ -342,12 +342,28 @@ class Database:
                 (user_id,),
             ).fetchall()
             if vin:
-                return next((Car(**dict(row)) for row in rows if row["vin"] and row["vin"].casefold() == vin.casefold()), None)
+                found = next((Car(**dict(row)) for row in rows if row["vin"] and row["vin"].casefold() == vin.casefold()), None)
+                if found is not None:
+                    return found
             if plate_number:
-                return next((Car(**dict(row)) for row in rows if row["plate_number"] and row["plate_number"].casefold() == plate_number.casefold()), None)
+                found = next((Car(**dict(row)) for row in rows if row["plate_number"] and row["plate_number"].casefold() == plate_number.casefold()), None)
+                if found is not None:
+                    return found
             if brand and model:
                 return next((Car(**dict(row)) for row in rows if row["brand"].casefold() == brand.casefold() and row["model"].casefold() == model.casefold()), None)
             return None
+        finally:
+            connection.close()
+
+    def find_single_car_for_customer(self, user_id: int, customer_id: int) -> Car | None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT id, user_id, customer_id, brand, model, year, plate_number, vin, mileage
+                   FROM cars WHERE user_id = ? AND customer_id = ? ORDER BY id DESC""",
+                (user_id, customer_id),
+            ).fetchall()
+            return Car(**dict(rows[0])) if len(rows) == 1 else None
         finally:
             connection.close()
 

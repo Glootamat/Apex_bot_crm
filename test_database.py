@@ -81,3 +81,14 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(overview.cars[0].completed, 1)
             self.assertTrue(db.delete_customer(user_id, customer_id))
             self.assertEqual(db.get_recent_orders_for_telegram_user(1001), [])
+
+    def test_new_plate_falls_back_to_existing_brand_and_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(1002, "Мастер", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            car = db.find_car_by_details(user_id, "Kia", "Rio", "А123АА77", None)
+            self.assertEqual(car.id, car_id)
+            db.update_car(car_id, None, None, None, None, "А123АА77", None, None)
+            self.assertEqual(db.find_car_by_details(user_id, None, None, "А123АА77", None).id, car_id)

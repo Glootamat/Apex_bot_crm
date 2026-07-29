@@ -89,7 +89,8 @@ async def show_orders(message: Message) -> None:
     lines = ["🧾 Последние заказ-наряды:"]
     for order in orders:
         car = f"{order.brand} {order.model}" + (f" · {order.plate_number}" if order.plate_number else "")
-        lines.append(f"\n#{order.id} · {car}\n{order.description}\nПрибыль: {order.profit:,} ₽".replace(",", " "))
+        status = "Выполнен" if order.status == "completed" else "В работе"
+        lines.append(f"\n#{order.id} · {car}\n{order.description}\nСтатус: {status} · Прибыль: {order.profit:,} ₽".replace(",", " "))
     await message.answer("\n".join(lines))
 
 
@@ -127,6 +128,8 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
 
     plate = command.plate_number.upper() if command.plate_number else None
     car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, plate, command.vin)
+    if car is None and customer_id is not None:
+        car = db.find_single_car_for_customer(owner_id, customer_id)
     if car is None and command.car_brand and command.car_model:
         car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id, command.vin, command.mileage)
     elif car is not None:
