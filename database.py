@@ -1,4 +1,4 @@
-"""SQLite storage for workshop clients and their cars."""
+"""SQLite storage for the workshop CRM."""
 
 from __future__ import annotations
 
@@ -11,10 +11,53 @@ from pathlib import Path
 class Car:
     id: int
     user_id: int
+    customer_id: int | None
     brand: str
     model: str
     year: int | None
     plate_number: str | None
+
+
+@dataclass(frozen=True)
+class Customer:
+    id: int
+    user_id: int
+    full_name: str
+    phone: str | None
+
+
+@dataclass(frozen=True)
+class ServiceOrder:
+    id: int
+    car_id: int
+    description: str
+    labor_revenue: int
+    parts_cost: int
+    parts_revenue: int
+    created_at: str
+    brand: str
+    model: str
+    plate_number: str | None
+
+    @property
+    def profit(self) -> int:
+        return self.labor_revenue + self.parts_revenue - self.parts_cost
+
+
+@dataclass(frozen=True)
+class Report:
+    orders: int
+    labor_revenue: int
+    parts_revenue: int
+    parts_cost: int
+
+    @property
+    def revenue(self) -> int:
+        return self.labor_revenue + self.parts_revenue
+
+    @property
+    def profit(self) -> int:
+        return self.revenue - self.parts_cost
 
 
 class Database:
@@ -50,8 +93,40 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS service_orders (
+                    id INTEGER PRIMARY KEY,
+                    car_id INTEGER NOT NULL,
+                    description TEXT NOT NULL,
+                    labor_revenue INTEGER NOT NULL DEFAULT 0 CHECK (labor_revenue >= 0),
+                    parts_cost INTEGER NOT NULL DEFAULT 0 CHECK (parts_cost >= 0),
+                    parts_revenue INTEGER NOT NULL DEFAULT 0 CHECK (parts_revenue >= 0),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS customers (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    full_name TEXT NOT NULL,
+                    phone TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS order_photos (
+                    id INTEGER PRIMARY KEY,
+                    service_order_id INTEGER NOT NULL,
+                    telegram_file_id TEXT NOT NULL,
+                    caption TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
+                );
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(cars)")}
+            if "customer_id" not in columns:
+                connection.execute("ALTER TABLE cars ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
             connection.commit()
         finally:
             connection.close()
@@ -64,55 +139,139 @@ class Database:
                 INSERT INTO users (telegram_id, username, full_name)
                 VALUES (?, ?, ?)
                 ON CONFLICT(telegram_id) DO UPDATE SET
-                    username = excluded.username,
-                    full_name = excluded.full_name
+                    username = excluded.username, full_name = excluded.full_name
                 """,
                 (telegram_id, username, full_name),
             )
-            row = connection.execute(
-                "SELECT id FROM users WHERE telegram_id = ?", (telegram_id,)
-            ).fetchone()
+            row = connection.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
             connection.commit()
+            return int(row["id"])
         finally:
             connection.close()
-        return int(row["id"])
 
-    def add_car(
-        self,
-        user_id: int,
-        brand: str,
-        model: str,
-        year: int | None = None,
-        plate_number: str | None = None,
-    ) -> int:
+    def add_customer(self, user_id: int, full_name: str, phone: str | None = None) -> int:
         connection = self.connect()
         try:
             cursor = connection.execute(
-                """
-                INSERT INTO cars (user_id, brand, model, year, plate_number)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (user_id, brand, model, year, plate_number),
+                "INSERT INTO customers (user_id, full_name, phone) VALUES (?, ?, ?)",
+                (user_id, full_name, phone),
             )
-            car_id = int(cursor.lastrowid)
             connection.commit()
+            return int(cursor.lastrowid)
         finally:
             connection.close()
-        return car_id
+
+    def get_customers_for_telegram_user(self, telegram_id: int) -> list[Customer]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT c.id, c.user_id, c.full_name, c.phone FROM customers AS c
+                   JOIN users AS u ON u.id = c.user_id WHERE u.telegram_id = ? ORDER BY c.id DESC""",
+                (telegram_id,),
+            ).fetchall()
+            return [Customer(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None) -> int:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "INSERT INTO cars (user_id, customer_id, brand, model, year, plate_number) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, customer_id, brand, model, year, plate_number),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+        finally:
+            connection.close()
 
     def get_cars_for_telegram_user(self, telegram_id: int) -> list[Car]:
         connection = self.connect()
         try:
             rows = connection.execute(
                 """
-                SELECT cars.id, cars.user_id, cars.brand, cars.model, cars.year, cars.plate_number
-                FROM cars
-                JOIN users ON users.id = cars.user_id
-                WHERE users.telegram_id = ?
-                ORDER BY cars.id DESC
+                SELECT cars.id, cars.user_id, cars.customer_id, cars.brand, cars.model, cars.year, cars.plate_number
+                FROM cars JOIN users ON users.id = cars.user_id
+                WHERE users.telegram_id = ? ORDER BY cars.id DESC
                 """,
                 (telegram_id,),
             ).fetchall()
+            return [Car(**dict(row)) for row in rows]
         finally:
             connection.close()
-        return [Car(**dict(row)) for row in rows]
+
+    def add_service_order(self, car_id: int, description: str, labor_revenue: int, parts_cost: int, parts_revenue: int) -> ServiceOrder:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                """INSERT INTO service_orders (car_id, description, labor_revenue, parts_cost, parts_revenue)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (car_id, description, labor_revenue, parts_cost, parts_revenue),
+            )
+            order_id = int(cursor.lastrowid)
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
+
+    def get_service_order(self, order_id: int) -> ServiceOrder:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.created_at,
+                          c.brand, c.model, c.plate_number
+                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id WHERE o.id = ?""",
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Service order {order_id} does not exist")
+            return ServiceOrder(**dict(row))
+        finally:
+            connection.close()
+
+    def get_recent_orders_for_telegram_user(self, telegram_id: int, limit: int = 10) -> list[ServiceOrder]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.created_at,
+                          c.brand, c.model, c.plate_number
+                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
+                   WHERE u.telegram_id = ? ORDER BY o.id DESC LIMIT ?""",
+                (telegram_id, limit),
+            ).fetchall()
+            return [ServiceOrder(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def add_order_photo(self, service_order_id: int, telegram_file_id: str, caption: str | None) -> int:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "INSERT INTO order_photos (service_order_id, telegram_file_id, caption) VALUES (?, ?, ?)",
+                (service_order_id, telegram_file_id, caption),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+        finally:
+            connection.close()
+
+    def count_order_photos(self, service_order_id: int) -> int:
+        connection = self.connect()
+        try:
+            return int(connection.execute("SELECT COUNT(*) FROM order_photos WHERE service_order_id = ?", (service_order_id,)).fetchone()[0])
+        finally:
+            connection.close()
+
+    def get_report_for_telegram_user(self, telegram_id: int) -> Report:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT COUNT(o.id) AS orders, COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
+                          COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost
+                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
+                   WHERE u.telegram_id = ?""",
+                (telegram_id,),
+            ).fetchone()
+            return Report(**dict(row))
+        finally:
+            connection.close()
