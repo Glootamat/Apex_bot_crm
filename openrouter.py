@@ -53,7 +53,7 @@ COMMAND_SCHEMA = {
             "parts_revenue": {"type": ["integer", "null"], "minimum": 0},
             "parts_profit": {"type": ["integer", "null"], "minimum": 0, "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
             "order_id": {"type": ["integer", "null"], "minimum": 1},
-            "order_status": {"type": ["string", "null"], "enum": ["in_progress", "completed", null]},
+            "order_status": {"type": ["string", "null"], "enum": ["in_progress", "completed", None]},
         },
         "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "order_id", "order_status"],
         "additionalProperties": False,
