@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
+from backup import create_backup
 from database import Database, ServiceOrder
 from openrouter import OpenRouterError, WorkshopCommand, parse_workshop_command, transcribe_voice
 
@@ -33,6 +34,7 @@ NEW_ENTRY = "🤖 Новая запись"
 ORDERS = "🧾 Заказ-наряды"
 COMPLETE_ORDER = "✅ Закрыть заказ"
 CUSTOMERS = "👥 Клиенты"
+SEARCH = "🔎 Поиск"
 ADD_PHOTO = "📷 Фото к заказу"
 REPORT = "📊 Финансы"
 CANCEL = "Отмена"
@@ -41,7 +43,8 @@ CONFIRM_DELETE = "Удалить"
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=NEW_ENTRY)],
-        [KeyboardButton(text=ORDERS), KeyboardButton(text=CUSTOMERS)],
+        [KeyboardButton(text=SEARCH), KeyboardButton(text=CUSTOMERS)],
+        [KeyboardButton(text=ORDERS)],
         [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=ADD_PHOTO)],
         [KeyboardButton(text=REPORT)],
     ],
@@ -62,6 +65,10 @@ class ConfirmDelete(StatesGroup):
 
 class CompleteOrder(StatesGroup):
     select = State()
+
+
+class Search(StatesGroup):
+    query = State()
 
 
 def current_user_id(message: Message) -> int:
@@ -97,7 +104,30 @@ async def show_orders(message: Message) -> None:
         car = f"{order.brand} {order.model}" + (f" · {order.plate_number}" if order.plate_number else "")
         status = "Выполнен" if order.status == "completed" else "В работе"
         lines.append(f"\n#{order.id} · {car}\n{order.description}\nСтатус: {status} · Прибыль: {order.profit:,} ₽".replace(",", " "))
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), reply_markup=main_keyboard)
+
+
+async def show_search_result(message: Message, query: str) -> None:
+    assert message.from_user is not None
+    result = db.search(message.from_user.id, query)
+    if not any(result.values()):
+        await message.answer("Ничего не найдено.")
+        return
+    lines = [f"🔎 Результаты: {query}"]
+    for item in result["customers"]:
+        lines.append(f"\nКлиент: {item['full_name']}" + (f" · {item['phone']}" if item["phone"] else ""))
+    for item in result["cars"]:
+        title = f"{item['brand']} {item['model']}" + (f" · {item['plate_number']}" if item["plate_number"] else "")
+        details = []
+        if item["vin"]:
+            details.append(f"VIN {item['vin']}")
+        if item["mileage"]:
+            details.append(f"{item['mileage']} км")
+        lines.append(f"\nАвтомобиль: {title}" + (f" · {item['customer_name']}" if item["customer_name"] else "") + (f"\n{' · '.join(details)}" if details else ""))
+    for item in result["orders"]:
+        status = "Выполнен" if item["status"] == "completed" else "В работе"
+        lines.append(f"\nЗаказ #{item['id']}: {item['brand']} {item['model']} · {item['description']}\nСтатус: {status}")
+    await message.answer("\n".join(lines), reply_markup=main_keyboard)
 
 
 async def apply_command(message: Message, command: WorkshopCommand, state: FSMContext) -> None:
@@ -209,6 +239,18 @@ async def start(message: Message) -> None:
 @router.message(F.text == NEW_ENTRY)
 async def new_entry(message: Message) -> None:
     await message.answer("Отправьте текст или голосовое в любой форме. Например: «Приехал Иван на Kia Rio, поменяли масло, работа 1500»." )
+
+
+@router.message(F.text == SEARCH)
+async def search_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(Search.query)
+    await message.answer("Введите имя, телефон, госномер или VIN.", reply_markup=cancel_keyboard)
+
+
+@router.message(Search.query, F.text)
+async def search_query(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await show_search_result(message, message.text.strip())
 
 
 @router.message(F.text == ORDERS)
@@ -370,9 +412,21 @@ async def main() -> None:
     if not token or token == "your_telegram_bot_token":
         raise RuntimeError("Set BOT_TOKEN in the .env file before starting the bot.")
     db.initialize()
+    backup_dir = Path(os.getenv("BACKUP_DIR", BASE_DIR / "backups"))
+    retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))
+
+    async def backup_loop() -> None:
+        while True:
+            try:
+                await asyncio.to_thread(create_backup, BASE_DIR / "workshop.sqlite3", backup_dir, retention_days)
+            except Exception:
+                pass
+            await asyncio.sleep(24 * 60 * 60)
+
     bot = Bot(token=token)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+    asyncio.create_task(backup_loop())
     await dispatcher.start_polling(bot)
 
 

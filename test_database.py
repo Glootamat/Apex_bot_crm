@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from backup import create_backup
 from database import Database
 
 
@@ -92,3 +93,18 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(car.id, car_id)
             db.update_car(car_id, None, None, None, None, "А123АА77", None, None)
             self.assertEqual(db.find_car_by_details(user_id, None, None, "А123АА77", None).id, car_id)
+
+    def test_search_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            db = Database(directory_path / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2001, "Мастер", None)
+            customer_id = db.add_customer(user_id, "Иван Петров", "+79990000000")
+            db.add_car(user_id, "Kia", "Rio", plate_number="А123АА77", customer_id=customer_id, vin="XTA123")
+
+            result = db.search(2001, "xta123")
+            self.assertEqual(len(result["cars"]), 1)
+            self.assertEqual(len(db.search(2001, "+7999")["customers"]), 1)
+            backup = create_backup(directory_path / "test.sqlite3", directory_path / "backups")
+            self.assertTrue(backup.exists())

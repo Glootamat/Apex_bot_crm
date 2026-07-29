@@ -285,6 +285,37 @@ class Database:
         finally:
             connection.close()
 
+    def search(self, telegram_id: int, query: str) -> dict[str, list[dict[str, object]]]:
+        """Search client, car and order data without relying on SQLite's limited Unicode collation."""
+        needle = query.casefold().replace(" ", "")
+        connection = self.connect()
+        try:
+            customers = [dict(row) for row in connection.execute(
+                """SELECT c.id, c.full_name, c.phone FROM customers c JOIN users u ON u.id = c.user_id
+                   WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
+            ).fetchall()]
+            cars = [dict(row) for row in connection.execute(
+                """SELECT c.id, c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
+                   FROM cars c JOIN users u ON u.id = c.user_id LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
+            ).fetchall()]
+            orders = [dict(row) for row in connection.execute(
+                """SELECT o.id, o.description, o.status, c.brand, c.model, c.plate_number, cu.full_name AS customer_name
+                   FROM service_orders o JOIN cars c ON c.id = o.car_id JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id WHERE u.telegram_id = ? ORDER BY o.id DESC""", (telegram_id,)
+            ).fetchall()]
+        finally:
+            connection.close()
+
+        def matches(values: list[object]) -> bool:
+            return any(needle in str(value or "").casefold().replace(" ", "") for value in values)
+
+        return {
+            "customers": [row for row in customers if matches([row["full_name"], row["phone"]])][:10],
+            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"]])][:10],
+            "orders": [row for row in orders if matches([row["description"], row["brand"], row["model"], row["plate_number"], row["customer_name"]])][:10],
+        }
+
     def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None, vin: str | None = None, mileage: int | None = None) -> int:
         connection = self.connect()
         try:
