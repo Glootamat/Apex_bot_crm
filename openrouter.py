@@ -21,10 +21,13 @@ class WorkshopCommand:
     car_model: str | None
     car_year: int | None
     plate_number: str | None
+    vin: str | None
+    mileage: int | None
     description: str | None
     labor_revenue: int | None
     parts_cost: int | None
     parts_revenue: int | None
+    parts_profit: int | None
 
 
 COMMAND_SCHEMA = {
@@ -40,12 +43,15 @@ COMMAND_SCHEMA = {
             "car_model": {"type": ["string", "null"]},
             "car_year": {"type": ["integer", "null"]},
             "plate_number": {"type": ["string", "null"]},
+            "vin": {"type": ["string", "null"]},
+            "mileage": {"type": ["integer", "null"], "minimum": 0},
             "description": {"type": ["string", "null"]},
             "labor_revenue": {"type": ["integer", "null"], "minimum": 0},
             "parts_cost": {"type": ["integer", "null"], "minimum": 0},
             "parts_revenue": {"type": ["integer", "null"], "minimum": 0},
+            "parts_profit": {"type": ["integer", "null"], "minimum": 0, "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
         },
-        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "description", "labor_revenue", "parts_cost", "parts_revenue"],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit"],
         "additionalProperties": False,
     },
 }
@@ -80,7 +86,7 @@ intent:
 - update_order: дополняют уже существующий заказ для указанной машины (например «добавь фильтр»); суммы должны быть только добавляемыми суммами;
 - list_orders: просят показать заказ-наряды/историю;
 - unknown: запрос не относится к CRM.
-Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель и госномер извлекай независимо от порядка слов. Суммы указывай в рублях. Описание оставляй null, если работ нет."""
+Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет."""
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}],

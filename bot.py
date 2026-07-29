@@ -62,7 +62,8 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
     return (
         f"{prefix}\n\nАвтомобиль: {car}\nРаботы: {order.description}\n"
         f"Работы: {order.labor_revenue:,} ₽\nСебестоимость запчастей: {order.parts_cost:,} ₽\n"
-        f"Запчасти клиенту: {order.parts_revenue:,} ₽\nПрибыль: {order.profit:,} ₽"
+        f"Запчасти клиенту: {order.parts_revenue:,} ₽\nПрибыль на запчастях: {order.parts_margin:,} ₽\n"
+        f"Общая прибыль: {order.profit:,} ₽"
     ).replace(",", " ")
 
 
@@ -105,12 +106,12 @@ async def apply_command(message: Message, command: WorkshopCommand) -> None:
         customer_id = None
 
     plate = command.plate_number.upper() if command.plate_number else None
-    car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, plate)
+    car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, plate, command.vin)
     if car is None and command.car_brand and command.car_model:
-        car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id)
+        car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id, command.vin, command.mileage)
     elif car is not None:
         car_id = car.id
-        db.update_car(car_id, customer_id, command.car_brand, command.car_model, command.car_year, plate)
+        db.update_car(car_id, customer_id, command.car_brand, command.car_model, command.car_year, plate, command.vin, command.mileage)
     else:
         car_id = None
 
@@ -129,7 +130,7 @@ async def apply_command(message: Message, command: WorkshopCommand) -> None:
         if not command.description:
             await message.answer("Напишите, какие работы выполнены — тогда создам заказ-наряд.")
             return
-        order = db.add_service_order(car_id, command.description, command.labor_revenue or 0, command.parts_cost or 0, command.parts_revenue or 0)
+        order = db.add_service_order(car_id, command.description, command.labor_revenue or 0, command.parts_cost or 0, command.parts_revenue or 0, command.parts_profit or 0)
         await message.answer(order_summary(order, "🤖 Запись создана автоматически"), reply_markup=main_keyboard)
         return
 
@@ -138,7 +139,7 @@ async def apply_command(message: Message, command: WorkshopCommand) -> None:
         if order is None:
             await message.answer("У этого автомобиля пока нет заказ-нарядов. Опишите выполненные работы, и я создам первый.")
             return
-        updated = db.update_service_order(order.id, command.description, command.labor_revenue, command.parts_cost, command.parts_revenue, add_amounts=True)
+        updated = db.update_service_order(order.id, command.description, command.labor_revenue, command.parts_cost, command.parts_revenue, command.parts_profit, add_amounts=True)
         await message.answer(order_summary(updated, "✅ Заказ-наряд дополнен"), reply_markup=main_keyboard)
 
 
@@ -216,7 +217,7 @@ async def report(message: Message) -> None:
     data = db.get_report_for_telegram_user(message.from_user.id)
     await message.answer(
         f"📊 Финансы\n\nЗаказ-нарядов: {data.orders}\nРаботы: {data.labor_revenue:,} ₽\n"
-        f"Запчасти: {data.parts_revenue:,} ₽\nСебестоимость: {data.parts_cost:,} ₽\n"
+        f"Запчасти: {data.parts_revenue:,} ₽\nСебестоимость: {data.parts_cost:,} ₽\nПрибыль на запчастях: {data.parts_margin:,} ₽\n"
         f"Выручка: {data.revenue:,} ₽\nПрибыль: {data.profit:,} ₽".replace(",", " ")
     )
 

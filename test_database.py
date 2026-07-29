@@ -43,9 +43,23 @@ class DatabaseTest(unittest.TestCase):
             user_id = db.add_or_update_user(789, "Мастер", None)
             car_id = db.add_car(user_id, "Kia", "Rio")
             original = db.add_service_order(car_id, "Замена масла", 1500, 0, 0)
-            updated = db.update_service_order(original.id, "Фильтр", None, 400, 650, add_amounts=True)
+            updated = db.update_service_order(original.id, "Фильтр", None, 400, 650, None, add_amounts=True)
 
             self.assertEqual(updated.description, "Замена масла; Фильтр")
             self.assertEqual(updated.parts_cost, 400)
             self.assertEqual(updated.parts_revenue, 650)
             self.assertEqual(updated.profit, 1750)
+
+    def test_vin_mileage_and_direct_parts_profit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(999, "Мастер", None)
+            car_id = db.add_car(user_id, "Toyota", "Camry", vin="XTA123", mileage=125000)
+            car = db.find_car_by_details(user_id, None, None, None, "xta123")
+            self.assertEqual(car.id, car_id)
+            db.update_car(car_id, None, None, None, None, "А123АА77", None, 126000)
+            order = db.add_service_order(car_id, "Масло", 0, 0, 0, parts_profit=500)
+
+            self.assertEqual(order.parts_margin, 500)
+            self.assertEqual(order.profit, 500)

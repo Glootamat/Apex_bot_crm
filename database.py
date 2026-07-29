@@ -16,6 +16,8 @@ class Car:
     model: str
     year: int | None
     plate_number: str | None
+    vin: str | None
+    mileage: int | None
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class ServiceOrder:
     labor_revenue: int
     parts_cost: int
     parts_revenue: int
+    parts_profit: int
     created_at: str
     brand: str
     model: str
@@ -41,7 +44,11 @@ class ServiceOrder:
 
     @property
     def profit(self) -> int:
-        return self.labor_revenue + self.parts_revenue - self.parts_cost
+        return self.labor_revenue + self.parts_revenue - self.parts_cost + self.parts_profit
+
+    @property
+    def parts_margin(self) -> int:
+        return self.parts_revenue - self.parts_cost + self.parts_profit
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,7 @@ class Report:
     labor_revenue: int
     parts_revenue: int
     parts_cost: int
+    parts_profit: int
 
     @property
     def revenue(self) -> int:
@@ -57,7 +65,11 @@ class Report:
 
     @property
     def profit(self) -> int:
-        return self.revenue - self.parts_cost
+        return self.revenue - self.parts_cost + self.parts_profit
+
+    @property
+    def parts_margin(self) -> int:
+        return self.parts_revenue - self.parts_cost + self.parts_profit
 
 
 class Database:
@@ -101,6 +113,7 @@ class Database:
                     labor_revenue INTEGER NOT NULL DEFAULT 0 CHECK (labor_revenue >= 0),
                     parts_cost INTEGER NOT NULL DEFAULT 0 CHECK (parts_cost >= 0),
                     parts_revenue INTEGER NOT NULL DEFAULT 0 CHECK (parts_revenue >= 0),
+                    parts_profit INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE
                 );
@@ -127,6 +140,13 @@ class Database:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(cars)")}
             if "customer_id" not in columns:
                 connection.execute("ALTER TABLE cars ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
+            if "vin" not in columns:
+                connection.execute("ALTER TABLE cars ADD COLUMN vin TEXT")
+            if "mileage" not in columns:
+                connection.execute("ALTER TABLE cars ADD COLUMN mileage INTEGER")
+            order_columns = {row["name"] for row in connection.execute("PRAGMA table_info(service_orders)")}
+            if "parts_profit" not in order_columns:
+                connection.execute("ALTER TABLE service_orders ADD COLUMN parts_profit INTEGER NOT NULL DEFAULT 0")
             connection.commit()
         finally:
             connection.close()
@@ -215,12 +235,13 @@ class Database:
         finally:
             connection.close()
 
-    def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None) -> int:
+    def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None, vin: str | None = None, mileage: int | None = None) -> int:
         connection = self.connect()
         try:
             cursor = connection.execute(
-                "INSERT INTO cars (user_id, customer_id, brand, model, year, plate_number) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, customer_id, brand, model, year, plate_number),
+                """INSERT INTO cars (user_id, customer_id, brand, model, year, plate_number, vin, mileage)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, customer_id, brand, model, year, plate_number, vin, mileage),
             )
             connection.commit()
             return int(cursor.lastrowid)
@@ -232,7 +253,7 @@ class Database:
         try:
             rows = connection.execute(
                 """
-                SELECT cars.id, cars.user_id, cars.customer_id, cars.brand, cars.model, cars.year, cars.plate_number
+                SELECT cars.id, cars.user_id, cars.customer_id, cars.brand, cars.model, cars.year, cars.plate_number, cars.vin, cars.mileage
                 FROM cars JOIN users ON users.id = cars.user_id
                 WHERE users.telegram_id = ? ORDER BY cars.id DESC
                 """,
@@ -246,7 +267,7 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT id, user_id, customer_id, brand, model, year, plate_number FROM cars WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, user_id, customer_id, brand, model, year, plate_number, vin, mileage FROM cars WHERE user_id = ? ORDER BY id DESC",
                 (user_id,),
             ).fetchall()
             normalized_plate = plate_number.casefold() if plate_number else None
@@ -263,13 +284,15 @@ class Database:
         finally:
             connection.close()
 
-    def find_car_by_details(self, user_id: int, brand: str | None, model: str | None, plate_number: str | None) -> Car | None:
+    def find_car_by_details(self, user_id: int, brand: str | None, model: str | None, plate_number: str | None, vin: str | None) -> Car | None:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT id, user_id, customer_id, brand, model, year, plate_number FROM cars WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, user_id, customer_id, brand, model, year, plate_number, vin, mileage FROM cars WHERE user_id = ? ORDER BY id DESC",
                 (user_id,),
             ).fetchall()
+            if vin:
+                return next((Car(**dict(row)) for row in rows if row["vin"] and row["vin"].casefold() == vin.casefold()), None)
             if plate_number:
                 return next((Car(**dict(row)) for row in rows if row["plate_number"] and row["plate_number"].casefold() == plate_number.casefold()), None)
             if brand and model:
@@ -278,25 +301,26 @@ class Database:
         finally:
             connection.close()
 
-    def update_car(self, car_id: int, customer_id: int | None, brand: str | None, model: str | None, year: int | None, plate_number: str | None) -> None:
+    def update_car(self, car_id: int, customer_id: int | None, brand: str | None, model: str | None, year: int | None, plate_number: str | None, vin: str | None, mileage: int | None) -> None:
         connection = self.connect()
         try:
             connection.execute(
                 """UPDATE cars SET customer_id = COALESCE(?, customer_id), brand = COALESCE(?, brand),
-                   model = COALESCE(?, model), year = COALESCE(?, year), plate_number = COALESCE(?, plate_number) WHERE id = ?""",
-                (customer_id, brand, model, year, plate_number, car_id),
+                   model = COALESCE(?, model), year = COALESCE(?, year), plate_number = COALESCE(?, plate_number),
+                   vin = COALESCE(?, vin), mileage = COALESCE(?, mileage) WHERE id = ?""",
+                (customer_id, brand, model, year, plate_number, vin, mileage, car_id),
             )
             connection.commit()
         finally:
             connection.close()
 
-    def add_service_order(self, car_id: int, description: str, labor_revenue: int, parts_cost: int, parts_revenue: int) -> ServiceOrder:
+    def add_service_order(self, car_id: int, description: str, labor_revenue: int, parts_cost: int, parts_revenue: int, parts_profit: int = 0) -> ServiceOrder:
         connection = self.connect()
         try:
             cursor = connection.execute(
-                """INSERT INTO service_orders (car_id, description, labor_revenue, parts_cost, parts_revenue)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (car_id, description, labor_revenue, parts_cost, parts_revenue),
+                """INSERT INTO service_orders (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit),
             )
             order_id = int(cursor.lastrowid)
             connection.commit()
@@ -308,7 +332,7 @@ class Database:
         connection = self.connect()
         try:
             row = connection.execute(
-                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.created_at,
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.created_at,
                           c.brand, c.model, c.plate_number
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id WHERE o.id = ?""",
                 (order_id,),
@@ -323,7 +347,7 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.created_at,
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.created_at,
                           c.brand, c.model, c.plate_number
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? ORDER BY o.id DESC LIMIT ?""",
@@ -341,7 +365,7 @@ class Database:
         finally:
             connection.close()
 
-    def update_service_order(self, order_id: int, description: str | None, labor_revenue: int | None, parts_cost: int | None, parts_revenue: int | None, add_amounts: bool) -> ServiceOrder:
+    def update_service_order(self, order_id: int, description: str | None, labor_revenue: int | None, parts_cost: int | None, parts_revenue: int | None, parts_profit: int | None, add_amounts: bool) -> ServiceOrder:
         connection = self.connect()
         try:
             current = connection.execute("SELECT * FROM service_orders WHERE id = ?", (order_id,)).fetchone()
@@ -353,8 +377,8 @@ class Database:
                     return int(current[field])
                 return int(current[field]) + incoming if add_amounts else incoming
             connection.execute(
-                """UPDATE service_orders SET description = ?, labor_revenue = ?, parts_cost = ?, parts_revenue = ? WHERE id = ?""",
-                (new_description, value("labor_revenue", labor_revenue), value("parts_cost", parts_cost), value("parts_revenue", parts_revenue), order_id),
+                """UPDATE service_orders SET description = ?, labor_revenue = ?, parts_cost = ?, parts_revenue = ?, parts_profit = ? WHERE id = ?""",
+                (new_description, value("labor_revenue", labor_revenue), value("parts_cost", parts_cost), value("parts_revenue", parts_revenue), value("parts_profit", parts_profit), order_id),
             )
             connection.commit()
         finally:
@@ -385,7 +409,8 @@ class Database:
         try:
             row = connection.execute(
                 """SELECT COUNT(o.id) AS orders, COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
-                          COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost
+                          COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost,
+                          COALESCE(SUM(o.parts_profit), 0) AS parts_profit
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ?""",
                 (telegram_id,),
