@@ -14,6 +14,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from database import Car, Database, ServiceOrder
+from openrouter import OpenRouterError, WorkshopRecord, parse_workshop_record, transcribe_voice
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -108,6 +109,36 @@ def order_summary(order: ServiceOrder) -> str:
         f"Продажа запчастей: {order.parts_revenue:,} ₽\n"
         f"Прибыль: {order.profit:,} ₽"
     ).replace(",", " ")
+
+
+def openrouter_settings() -> tuple[str, str, str] | None:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key or api_key == "your_openrouter_api_key":
+        return None
+    return (
+        api_key,
+        os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        os.getenv("OPENROUTER_TRANSCRIBE_MODEL", "openai/gpt-4o-mini-transcribe"),
+    )
+
+
+async def save_ai_record(message: Message, record: WorkshopRecord) -> None:
+    if not record.customer_name or not record.car_brand or not record.car_model or not record.description:
+        await message.answer(
+            "Не хватает данных для автоматической записи. Нужны имя клиента, марка и модель автомобиля, а также работы.\n\n"
+            "Пример: Иван Петров, Kia Rio, замена масла, работа 1500, масло продали за 3200."
+        )
+        return
+    owner_id = current_user_id(message)
+    customer_id = db.find_or_add_customer(owner_id, record.customer_name, record.customer_phone)
+    plate = record.plate_number.upper() if record.plate_number else None
+    car = db.find_car(owner_id, record.car_brand, record.car_model, plate)
+    if car is None:
+        car_id = db.add_car(owner_id, record.car_brand, record.car_model, record.car_year, plate, customer_id)
+    else:
+        car_id = car.id
+    order = db.add_service_order(car_id, record.description, record.labor_revenue, record.parts_cost, record.parts_revenue)
+    await message.answer("🤖 Данные обработаны автоматически.\n\n" + order_summary(order), reply_markup=main_keyboard)
 
 
 @router.message(CommandStart())
@@ -350,6 +381,43 @@ async def report(message: Message) -> None:
         f"Прибыль: {data.profit:,} ₽"
         .replace(",", " ")
     )
+
+
+@router.message(F.voice)
+async def voice_to_crm(message: Message, bot: Bot) -> None:
+    settings = openrouter_settings()
+    if settings is None:
+        await message.answer("Чтобы обрабатывать голосовые, добавьте OPENROUTER_API_KEY в файл .env и перезапустите бота.")
+        return
+    api_key, model, transcription_model = settings
+    await message.answer("🎙️ Расшифровываю голосовое и создаю запись…")
+    try:
+        audio_file = await bot.download(message.voice)
+        if audio_file is None:
+            raise OpenRouterError("Не удалось скачать голосовое сообщение из Telegram.")
+        transcript = await transcribe_voice(api_key, audio_file.getvalue(), transcription_model)
+        record = await parse_workshop_record(api_key, transcript, model)
+        await message.answer(f"Распознано: {transcript}")
+        await save_ai_record(message, record)
+    except OpenRouterError as error:
+        await message.answer(f"Не удалось обработать голосовое: {error}")
+
+
+@router.message(F.text)
+async def text_to_crm(message: Message) -> None:
+    settings = openrouter_settings()
+    if settings is None:
+        await message.answer(
+            "Для автоматической обработки добавьте OPENROUTER_API_KEY в .env и перезапустите бота.\n\n"
+            "После этого можно будет просто написать: «Иван Петров, Kia Rio, замена масла, работа 1500».")
+        return
+    api_key, model, _ = settings
+    await message.answer("🤖 Обрабатываю сообщение…")
+    try:
+        record = await parse_workshop_record(api_key, message.text, model)
+        await save_ai_record(message, record)
+    except OpenRouterError as error:
+        await message.answer(f"Не удалось обработать сообщение: {error}")
 
 
 async def main() -> None:

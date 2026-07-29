@@ -173,6 +173,22 @@ class Database:
         finally:
             connection.close()
 
+    def find_or_add_customer(self, user_id: int, full_name: str, phone: str | None) -> int:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, full_name FROM customers WHERE user_id = ? ORDER BY id DESC", (user_id,)
+            ).fetchall()
+            row = next((item for item in rows if item["full_name"].casefold() == full_name.casefold()), None)
+            if row is not None:
+                if phone:
+                    connection.execute("UPDATE customers SET phone = COALESCE(phone, ?) WHERE id = ?", (phone, row["id"]))
+                    connection.commit()
+                return int(row["id"])
+        finally:
+            connection.close()
+        return self.add_customer(user_id, full_name, phone)
+
     def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None) -> int:
         connection = self.connect()
         try:
@@ -197,6 +213,27 @@ class Database:
                 (telegram_id,),
             ).fetchall()
             return [Car(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def find_car(self, user_id: int, brand: str, model: str, plate_number: str | None) -> Car | None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, user_id, customer_id, brand, model, year, plate_number FROM cars WHERE user_id = ? ORDER BY id DESC",
+                (user_id,),
+            ).fetchall()
+            normalized_plate = plate_number.casefold() if plate_number else None
+            row = next(
+                (
+                    item for item in rows
+                    if item["brand"].casefold() == brand.casefold()
+                    and item["model"].casefold() == model.casefold()
+                    and (item["plate_number"].casefold() if item["plate_number"] else None) == normalized_plate
+                ),
+                None,
+            )
+            return Car(**dict(row)) if row is not None else None
         finally:
             connection.close()
 
