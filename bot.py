@@ -241,13 +241,11 @@ async def voice_to_crm(message: Message, bot: Bot) -> None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
         return
     api_key, _, transcription_model = settings
-    await message.answer("🎙️ Расшифровываю голосовое…")
     try:
         audio = await bot.download(message.voice)
         if audio is None:
             raise OpenRouterError("Не удалось скачать голосовое из Telegram.")
         transcript = await transcribe_voice(api_key, audio.getvalue(), transcription_model)
-        await message.answer(f"Распознано: {transcript}")
         await process_text(message, transcript)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать голосовое: {error}")
@@ -255,7 +253,6 @@ async def voice_to_crm(message: Message, bot: Bot) -> None:
 
 @router.message(F.text)
 async def text_to_crm(message: Message) -> None:
-    await message.answer("🤖 Обрабатываю…")
     await process_text(message, message.text)
 
 
