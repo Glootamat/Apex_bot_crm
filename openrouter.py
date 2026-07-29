@@ -5,11 +5,22 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 
 import aiohttp
 
 
 API_URL = "https://openrouter.ai/api/v1"
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class AIResponse(Generic[T]):
+    value: T
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
 
 
 @dataclass(frozen=True)
@@ -69,20 +80,33 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
-async def transcribe_voice(api_key: str, audio: bytes, model: str) -> str:
+def _response_meta(data: dict[str, object], requested_model: str) -> tuple[str, int, int, float]:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    assert isinstance(usage, dict)
+    return (
+        str(data.get("model") or requested_model),
+        int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+        int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+        float(usage.get("cost") or 0),
+    )
+
+
+async def transcribe_voice(api_key: str, audio: bytes, model: str) -> AIResponse[str]:
     payload = {"model": model, "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "ogg"}, "language": "ru"}
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{API_URL}/audio/transcriptions", headers=_headers(api_key), json=payload, timeout=aiohttp.ClientTimeout(total=90)) as response:
             body = await response.text()
     if response.status >= 400:
         raise OpenRouterError(f"OpenRouter вернул ошибку {response.status}: {body[:300]}")
-    text = json.loads(body).get("text", "").strip()
+    data = json.loads(body)
+    text = data.get("text", "").strip()
     if not text:
         raise OpenRouterError("OpenRouter не вернул текст голосового сообщения.")
-    return text
+    actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
+    return AIResponse(text, actual_model, input_tokens, output_tokens, cost_usd)
 
 
-async def parse_workshop_command(api_key: str, text: str, model: str) -> WorkshopCommand:
+async def parse_workshop_command(api_key: str, text: str, model: str) -> AIResponse[WorkshopCommand]:
     prompt = """Ты помощник CRM автосервиса. Разбери русское сообщение в структуру.
 intent:
 - upsert_customer: добавляют или меняют имя, телефон либо данные автомобиля, без работ;
@@ -105,7 +129,10 @@ intent:
     if response.status >= 400:
         raise OpenRouterError(f"OpenRouter вернул ошибку {response.status}: {body[:300]}")
     try:
-        content = json.loads(body)["choices"][0]["message"]["content"]
-        return WorkshopCommand(**(json.loads(content) if isinstance(content, str) else content))
+        data = json.loads(body)
+        content = data["choices"][0]["message"]["content"]
+        command = WorkshopCommand(**(json.loads(content) if isinstance(content, str) else content))
+        actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
+        return AIResponse(command, actual_model, input_tokens, output_tokens, cost_usd)
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise OpenRouterError("Не удалось разобрать ответ OpenRouter.") from error

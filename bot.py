@@ -35,6 +35,7 @@ ORDERS = "🧾 Заказ-наряды"
 COMPLETE_ORDER = "✅ Закрыть заказ"
 CUSTOMERS = "👥 Клиенты"
 SEARCH = "🔎 Поиск"
+AI_USAGE = "💳 ИИ-расходы"
 ADD_PHOTO = "📷 Фото к заказу"
 REPORT = "📊 Финансы"
 CANCEL = "Отмена"
@@ -46,7 +47,7 @@ main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=SEARCH), KeyboardButton(text=CUSTOMERS)],
         [KeyboardButton(text=ORDERS)],
         [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=ADD_PHOTO)],
-        [KeyboardButton(text=REPORT)],
+        [KeyboardButton(text=REPORT), KeyboardButton(text=AI_USAGE)],
     ],
     resize_keyboard=True,
 )
@@ -86,11 +87,29 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
     ).replace(",", " ")
 
 
-def openrouter_settings() -> tuple[str, str, str] | None:
+def openrouter_settings() -> tuple[str, str, str, str, str] | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key or api_key == "your_openrouter_api_key":
         return None
-    return api_key, os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"), os.getenv("OPENROUTER_TRANSCRIBE_MODEL", "openai/gpt-4o-mini-transcribe")
+    return (
+        api_key,
+        os.getenv("OPENROUTER_TEXT_MODEL", os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")),
+        os.getenv("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"),
+        os.getenv("OPENROUTER_ADVANCED_MODEL", "anthropic/claude-sonnet-4.5"),
+        os.getenv("OPENROUTER_TRANSCRIBE_MODEL", "openai/gpt-4o-mini-transcribe"),
+    )
+
+
+def ai_budget_available() -> bool:
+    daily_limit = float(os.getenv("AI_DAILY_LIMIT_USD", "1.00"))
+    monthly_limit = float(os.getenv("AI_MONTHLY_LIMIT_USD", "15.00"))
+    daily_cost, _ = db.get_ai_usage("datetime('now', 'start of day')")
+    monthly_cost, _ = db.get_ai_usage("datetime('now', 'start of month')")
+    return daily_cost < daily_limit and monthly_cost < monthly_limit
+
+
+def record_ai_usage(task_type: str, response: object) -> None:
+    db.log_ai_usage(task_type, response.model, response.input_tokens, response.output_tokens, response.cost_usd)  # type: ignore[attr-defined]
 
 
 async def show_orders(message: Message) -> None:
@@ -372,15 +391,31 @@ async def report(message: Message) -> None:
     )
 
 
+@router.message(F.text == AI_USAGE)
+async def ai_usage(message: Message) -> None:
+    daily_cost, daily_requests = db.get_ai_usage("datetime('now', 'start of day')")
+    monthly_cost, monthly_requests = db.get_ai_usage("datetime('now', 'start of month')")
+    await message.answer(
+        f"💳 Расходы ИИ\n\nСегодня: ${daily_cost:.4f} · запросов: {daily_requests}\n"
+        f"За месяц: ${monthly_cost:.4f} · запросов: {monthly_requests}\n\n"
+        f"Лимиты: ${float(os.getenv('AI_DAILY_LIMIT_USD', '1.00')):.2f}/день · "
+        f"${float(os.getenv('AI_MONTHLY_LIMIT_USD', '15.00')):.2f}/месяц"
+    )
+
+
 async def process_text(message: Message, text: str, state: FSMContext) -> None:
     settings = openrouter_settings()
     if settings is None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
         return
-    api_key, model, _ = settings
+    if not ai_budget_available():
+        await message.answer("Достигнут лимит расходов ИИ. Обычные кнопки и поиск продолжают работать.")
+        return
+    api_key, model, _, _, _ = settings
     try:
-        command = await parse_workshop_command(api_key, text, model)
-        await apply_command(message, command, state)
+        response = await parse_workshop_command(api_key, text, model)
+        record_ai_usage("text", response)
+        await apply_command(message, response.value, state)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать запрос: {error}")
 
@@ -391,13 +426,17 @@ async def voice_to_crm(message: Message, bot: Bot, state: FSMContext) -> None:
     if settings is None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
         return
-    api_key, _, transcription_model = settings
+    if not ai_budget_available():
+        await message.answer("Достигнут лимит расходов ИИ. Попробуйте позже или увеличьте лимит в .env.")
+        return
+    api_key, _, _, _, transcription_model = settings
     try:
         audio = await bot.download(message.voice)
         if audio is None:
             raise OpenRouterError("Не удалось скачать голосовое из Telegram.")
-        transcript = await transcribe_voice(api_key, audio.getvalue(), transcription_model)
-        await process_text(message, transcript, state)
+        transcript_response = await transcribe_voice(api_key, audio.getvalue(), transcription_model)
+        record_ai_usage("transcription", transcript_response)
+        await process_text(message, transcript_response.value, state)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать голосовое: {error}")
 

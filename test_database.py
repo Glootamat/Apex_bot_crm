@@ -108,3 +108,12 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(len(db.search(2001, "+7999")["customers"]), 1)
             backup = create_backup(directory_path / "test.sqlite3", directory_path / "backups")
             self.assertTrue(backup.exists())
+
+    def test_ai_usage_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.log_ai_usage("text", "test-model", 100, 20, 0.0015)
+            cost, requests = db.get_ai_usage("datetime('now', 'start of day')")
+            self.assertEqual(requests, 1)
+            self.assertAlmostEqual(cost, 0.0015)

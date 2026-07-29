@@ -151,6 +151,16 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_usage_log (
+                    id INTEGER PRIMARY KEY,
+                    task_type TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(cars)")}
@@ -315,6 +325,28 @@ class Database:
             "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"]])][:10],
             "orders": [row for row in orders if matches([row["description"], row["brand"], row["model"], row["plate_number"], row["customer_name"]])][:10],
         }
+
+    def log_ai_usage(self, task_type: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                """INSERT INTO ai_usage_log (task_type, model, input_tokens, output_tokens, cost_usd)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (task_type, model, input_tokens, output_tokens, cost_usd),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_ai_usage(self, period_sql: str) -> tuple[float, int]:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                f"SELECT COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS requests FROM ai_usage_log WHERE created_at >= {period_sql}"
+            ).fetchone()
+            return float(row["cost"]), int(row["requests"])
+        finally:
+            connection.close()
 
     def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None, vin: str | None = None, mileage: int | None = None) -> int:
         connection = self.connect()
