@@ -37,6 +37,7 @@ class ServiceOrder:
     parts_cost: int
     parts_revenue: int
     parts_profit: int
+    status: str
     created_at: str
     brand: str
     model: str
@@ -70,6 +71,20 @@ class Report:
     @property
     def parts_margin(self) -> int:
         return self.parts_revenue - self.parts_cost + self.parts_profit
+
+
+@dataclass(frozen=True)
+class CustomerCarOverview:
+    car: Car
+    orders_total: int
+    in_progress: int
+    completed: int
+
+
+@dataclass(frozen=True)
+class CustomerOverview:
+    customer: Customer
+    cars: list[CustomerCarOverview]
 
 
 class Database:
@@ -114,6 +129,7 @@ class Database:
                     parts_cost INTEGER NOT NULL DEFAULT 0 CHECK (parts_cost >= 0),
                     parts_revenue INTEGER NOT NULL DEFAULT 0 CHECK (parts_revenue >= 0),
                     parts_profit INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'in_progress',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE
                 );
@@ -147,6 +163,8 @@ class Database:
             order_columns = {row["name"] for row in connection.execute("PRAGMA table_info(service_orders)")}
             if "parts_profit" not in order_columns:
                 connection.execute("ALTER TABLE service_orders ADD COLUMN parts_profit INTEGER NOT NULL DEFAULT 0")
+            if "status" not in order_columns:
+                connection.execute("ALTER TABLE service_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'in_progress'")
             connection.commit()
         finally:
             connection.close()
@@ -232,6 +250,38 @@ class Database:
                 (full_name, phone, customer_id),
             )
             connection.commit()
+        finally:
+            connection.close()
+
+    def get_customer_overviews(self, telegram_id: int) -> list[CustomerOverview]:
+        connection = self.connect()
+        try:
+            customer_rows = connection.execute(
+                """SELECT c.id, c.user_id, c.full_name, c.phone FROM customers c
+                   JOIN users u ON u.id = c.user_id WHERE u.telegram_id = ? ORDER BY c.id DESC""",
+                (telegram_id,),
+            ).fetchall()
+            result: list[CustomerOverview] = []
+            for row in customer_rows:
+                customer = Customer(**dict(row))
+                car_rows = connection.execute(
+                    """SELECT c.id, c.user_id, c.customer_id, c.brand, c.model, c.year, c.plate_number, c.vin, c.mileage,
+                              COUNT(o.id) AS orders_total,
+                              COALESCE(SUM(CASE WHEN o.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress,
+                              COALESCE(SUM(CASE WHEN o.status = 'completed' THEN 1 ELSE 0 END), 0) AS completed
+                       FROM cars c LEFT JOIN service_orders o ON o.car_id = c.id
+                       WHERE c.customer_id = ? GROUP BY c.id ORDER BY c.id DESC""",
+                    (customer.id,),
+                ).fetchall()
+                cars = [
+                    CustomerCarOverview(
+                        car=Car(**{key: row[key] for key in ("id", "user_id", "customer_id", "brand", "model", "year", "plate_number", "vin", "mileage")} ),
+                        orders_total=int(row["orders_total"]), in_progress=int(row["in_progress"]), completed=int(row["completed"]),
+                    )
+                    for row in car_rows
+                ]
+                result.append(CustomerOverview(customer, cars))
+            return result
         finally:
             connection.close()
 
@@ -332,7 +382,7 @@ class Database:
         connection = self.connect()
         try:
             row = connection.execute(
-                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.created_at,
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id WHERE o.id = ?""",
                 (order_id,),
@@ -347,7 +397,7 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.created_at,
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? ORDER BY o.id DESC LIMIT ?""",
@@ -384,6 +434,49 @@ class Database:
         finally:
             connection.close()
         return self.get_service_order(order_id)
+
+    def set_order_status(self, order_id: int, status: str) -> ServiceOrder:
+        if status not in {"in_progress", "completed"}:
+            raise ValueError("Unknown order status")
+        connection = self.connect()
+        try:
+            connection.execute("UPDATE service_orders SET status = ? WHERE id = ?", (status, order_id))
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
+
+    def delete_customer(self, user_id: int, customer_id: int) -> bool:
+        connection = self.connect()
+        try:
+            car_ids = [row["id"] for row in connection.execute("SELECT id FROM cars WHERE user_id = ? AND customer_id = ?", (user_id, customer_id)).fetchall()]
+            connection.executemany("DELETE FROM cars WHERE id = ?", [(car_id,) for car_id in car_ids])
+            cursor = connection.execute("DELETE FROM customers WHERE id = ? AND user_id = ?", (customer_id, user_id))
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def delete_car(self, user_id: int, car_id: int) -> bool:
+        connection = self.connect()
+        try:
+            cursor = connection.execute("DELETE FROM cars WHERE id = ? AND user_id = ?", (car_id, user_id))
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def delete_service_order(self, user_id: int, order_id: int) -> bool:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "DELETE FROM service_orders WHERE id = ? AND car_id IN (SELECT id FROM cars WHERE user_id = ?)",
+                (order_id, user_id),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
 
     def add_order_photo(self, service_order_id: int, telegram_file_id: str, caption: str | None) -> int:
         connection = self.connect()

@@ -63,3 +63,21 @@ class DatabaseTest(unittest.TestCase):
 
             self.assertEqual(order.parts_margin, 500)
             self.assertEqual(order.profit, 500)
+
+    def test_customer_overview_status_and_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(1001, "Мастер", None)
+            customer_id = db.add_customer(user_id, "Иван Петров", "+79990000000")
+            car_id = db.add_car(user_id, "Kia", "Rio", plate_number="А123АА77", customer_id=customer_id)
+            order = db.add_service_order(car_id, "Замена масла", 1500, 0, 0)
+            db.set_order_status(order.id, "completed")
+
+            overview = db.get_customer_overviews(1001)[0]
+            self.assertEqual(overview.customer.phone, "+79990000000")
+            self.assertEqual(overview.cars[0].car.plate_number, "А123АА77")
+            self.assertEqual(overview.cars[0].orders_total, 1)
+            self.assertEqual(overview.cars[0].completed, 1)
+            self.assertTrue(db.delete_customer(user_id, customer_id))
+            self.assertEqual(db.get_recent_orders_for_telegram_user(1001), [])

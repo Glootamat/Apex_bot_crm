@@ -35,6 +35,7 @@ CUSTOMERS = "👥 Клиенты"
 ADD_PHOTO = "📷 Фото к заказу"
 REPORT = "📊 Финансы"
 CANCEL = "Отмена"
+CONFIRM_DELETE = "Удалить"
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -45,11 +46,16 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=CANCEL)]], resize_keyboard=True)
+confirm_delete_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=CONFIRM_DELETE)], [KeyboardButton(text=CANCEL)]], resize_keyboard=True)
 
 
 class AddPhoto(StatesGroup):
     order = State()
     upload = State()
+
+
+class ConfirmDelete(StatesGroup):
+    waiting = State()
 
 
 def current_user_id(message: Message) -> int:
@@ -63,7 +69,7 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
         f"{prefix}\n\nАвтомобиль: {car}\nРаботы: {order.description}\n"
         f"Работы: {order.labor_revenue:,} ₽\nСебестоимость запчастей: {order.parts_cost:,} ₽\n"
         f"Запчасти клиенту: {order.parts_revenue:,} ₽\nПрибыль на запчастях: {order.parts_margin:,} ₽\n"
-        f"Общая прибыль: {order.profit:,} ₽"
+        f"Общая прибыль: {order.profit:,} ₽\nСтатус: {'Выполнен' if order.status == 'completed' else 'В работе'}"
     ).replace(",", " ")
 
 
@@ -87,7 +93,7 @@ async def show_orders(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
-async def apply_command(message: Message, command: WorkshopCommand) -> None:
+async def apply_command(message: Message, command: WorkshopCommand, state: FSMContext) -> None:
     if command.intent == "list_orders":
         await show_orders(message)
         return
@@ -96,6 +102,20 @@ async def apply_command(message: Message, command: WorkshopCommand) -> None:
         return
 
     owner_id = current_user_id(message)
+
+    if command.intent.startswith("delete_"):
+        await request_delete(message, command, owner_id, state)
+        return
+
+    if command.intent == "set_order_status":
+        car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
+        order = db.get_service_order(command.order_id) if command.order_id else (db.get_latest_order_for_car(car.id) if car else None)
+        if order is None or command.order_status is None:
+            await message.answer("Укажите номер заказ-наряда или автомобиль и статус: «в работе» либо «выполнен».")
+            return
+        updated = db.set_order_status(order.id, command.order_status)
+        await message.answer(order_summary(updated, "✅ Статус заказ-наряда обновлён"), reply_markup=main_keyboard)
+        return
     customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
     if customer is None and command.customer_name:
         customer_id = db.add_customer(owner_id, command.customer_name, command.customer_phone)
@@ -143,6 +163,30 @@ async def apply_command(message: Message, command: WorkshopCommand) -> None:
         await message.answer(order_summary(updated, "✅ Заказ-наряд дополнен"), reply_markup=main_keyboard)
 
 
+async def request_delete(message: Message, command: WorkshopCommand, owner_id: int, state: FSMContext) -> None:
+    target_id: int | None = None
+    label = ""
+    if command.intent == "delete_customer":
+        customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
+        if customer:
+            target_id, label = customer.id, f"клиента {customer.full_name} и все его автомобили с заказ-нарядами"
+    elif command.intent == "delete_car":
+        car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
+        if car:
+            target_id, label = car.id, f"автомобиль {car.brand} {car.model}" + (f" ({car.plate_number})" if car.plate_number else "") + " и его заказ-наряды"
+    elif command.intent == "delete_order":
+        car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
+        order = db.get_service_order(command.order_id) if command.order_id else (db.get_latest_order_for_car(car.id) if car else None)
+        if order:
+            target_id, label = order.id, f"заказ-наряд #{order.id}: {order.description}"
+    if target_id is None:
+        await message.answer("Не нашёл запись для удаления. Укажите имя клиента, автомобиль с номером/VIN или номер заказ-наряда.")
+        return
+    await state.set_state(ConfirmDelete.waiting)
+    await state.update_data(delete_kind=command.intent, delete_id=target_id)
+    await message.answer(f"Подтвердите: удалить {label}? Это действие нельзя отменить.", reply_markup=confirm_delete_keyboard)
+
+
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     current_user_id(message)
@@ -166,17 +210,47 @@ async def orders_button(message: Message) -> None:
 @router.message(F.text == CUSTOMERS)
 async def customers_button(message: Message) -> None:
     assert message.from_user is not None
-    customers = db.get_customers_for_telegram_user(message.from_user.id)
+    customers = db.get_customer_overviews(message.from_user.id)
     if not customers:
         await message.answer("Клиентов пока нет.")
         return
-    await message.answer("👥 Клиенты:\n" + "\n".join(f"{item.full_name}" + (f" · {item.phone}" if item.phone else "") for item in customers[:30]))
+    lines = ["👥 Клиенты:"]
+    for overview in customers[:20]:
+        customer = overview.customer
+        lines.append(f"\n{customer.full_name}" + (f" · {customer.phone}" if customer.phone else " · телефон не указан"))
+        if not overview.cars:
+            lines.append("Автомобили не добавлены")
+        for item in overview.cars:
+            car = item.car
+            title = f"{car.brand} {car.model}" + (f" · {car.plate_number}" if car.plate_number else " · без номера")
+            lines.append(f"{title}\nЗаказов: {item.orders_total} · В работе: {item.in_progress} · Выполнено: {item.completed}")
+    await message.answer("\n".join(lines))
 
 
 @router.message(F.text == CANCEL)
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Готово.", reply_markup=main_keyboard)
+
+
+@router.message(ConfirmDelete.waiting, F.text == CONFIRM_DELETE)
+async def confirm_delete(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    owner_id = current_user_id(message)
+    kind, target_id = data["delete_kind"], int(data["delete_id"])
+    if kind == "delete_customer":
+        deleted = db.delete_customer(owner_id, target_id)
+    elif kind == "delete_car":
+        deleted = db.delete_car(owner_id, target_id)
+    else:
+        deleted = db.delete_service_order(owner_id, target_id)
+    await state.clear()
+    await message.answer("✅ Удалено." if deleted else "Запись уже удалена или не найдена.", reply_markup=main_keyboard)
+
+
+@router.message(ConfirmDelete.waiting)
+async def delete_waiting(message: Message) -> None:
+    await message.answer("Нажмите «Удалить» для подтверждения или «Отмена».")
 
 
 @router.message(F.text == ADD_PHOTO)
@@ -222,7 +296,7 @@ async def report(message: Message) -> None:
     )
 
 
-async def process_text(message: Message, text: str) -> None:
+async def process_text(message: Message, text: str, state: FSMContext) -> None:
     settings = openrouter_settings()
     if settings is None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
@@ -230,13 +304,13 @@ async def process_text(message: Message, text: str) -> None:
     api_key, model, _ = settings
     try:
         command = await parse_workshop_command(api_key, text, model)
-        await apply_command(message, command)
+        await apply_command(message, command, state)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать запрос: {error}")
 
 
 @router.message(F.voice)
-async def voice_to_crm(message: Message, bot: Bot) -> None:
+async def voice_to_crm(message: Message, bot: Bot, state: FSMContext) -> None:
     settings = openrouter_settings()
     if settings is None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
@@ -247,14 +321,14 @@ async def voice_to_crm(message: Message, bot: Bot) -> None:
         if audio is None:
             raise OpenRouterError("Не удалось скачать голосовое из Telegram.")
         transcript = await transcribe_voice(api_key, audio.getvalue(), transcription_model)
-        await process_text(message, transcript)
+        await process_text(message, transcript, state)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать голосовое: {error}")
 
 
 @router.message(F.text)
-async def text_to_crm(message: Message) -> None:
-    await process_text(message, message.text)
+async def text_to_crm(message: Message, state: FSMContext) -> None:
+    await process_text(message, message.text, state)
 
 
 async def main() -> None:
