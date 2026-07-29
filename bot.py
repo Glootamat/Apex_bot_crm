@@ -31,6 +31,7 @@ router.message.filter(F.from_user.id == ADMIN_ID)
 
 NEW_ENTRY = "🤖 Новая запись"
 ORDERS = "🧾 Заказ-наряды"
+COMPLETE_ORDER = "✅ Закрыть заказ"
 CUSTOMERS = "👥 Клиенты"
 ADD_PHOTO = "📷 Фото к заказу"
 REPORT = "📊 Финансы"
@@ -41,7 +42,8 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=NEW_ENTRY)],
         [KeyboardButton(text=ORDERS), KeyboardButton(text=CUSTOMERS)],
-        [KeyboardButton(text=ADD_PHOTO), KeyboardButton(text=REPORT)],
+        [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=ADD_PHOTO)],
+        [KeyboardButton(text=REPORT)],
     ],
     resize_keyboard=True,
 )
@@ -56,6 +58,10 @@ class AddPhoto(StatesGroup):
 
 class ConfirmDelete(StatesGroup):
     waiting = State()
+
+
+class CompleteOrder(StatesGroup):
+    select = State()
 
 
 def current_user_id(message: Message) -> int:
@@ -208,6 +214,31 @@ async def new_entry(message: Message) -> None:
 @router.message(F.text == ORDERS)
 async def orders_button(message: Message) -> None:
     await show_orders(message)
+
+
+@router.message(F.text == COMPLETE_ORDER)
+async def complete_order_start(message: Message, state: FSMContext) -> None:
+    assert message.from_user is not None
+    orders = [order for order in db.get_recent_orders_for_telegram_user(message.from_user.id, limit=30) if order.status == "in_progress"]
+    if not orders:
+        await message.answer("Нет заказ-нарядов в работе.")
+        return
+    await state.update_data(active_orders={str(order.id): order.id for order in orders})
+    await state.set_state(CompleteOrder.select)
+    choices = "\n".join(f"{order.id}. {order.brand} {order.model}" + (f" · {order.plate_number}" if order.plate_number else "") + f" — {order.description}" for order in orders)
+    await message.answer(f"Выберите номер заказ-наряда, который нужно закрыть:\n{choices}", reply_markup=cancel_keyboard)
+
+
+@router.message(CompleteOrder.select, F.text)
+async def complete_order_selected(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = message.text.strip()
+    if selected not in data["active_orders"]:
+        await message.answer("Выберите номер из списка или нажмите «Отмена».")
+        return
+    order = db.set_order_status(data["active_orders"][selected], "completed")
+    await state.clear()
+    await message.answer(order_summary(order, "✅ Заказ-наряд закрыт"), reply_markup=main_keyboard)
 
 
 @router.message(F.text == CUSTOMERS)
