@@ -36,7 +36,8 @@ COMPLETE_ORDER = "✅ Закрыть заказ"
 CUSTOMERS = "👥 Клиенты"
 SEARCH = "🔎 Поиск"
 AI_USAGE = "💳 ИИ-расходы"
-ADD_PHOTO = "📷 Фото к заказу"
+WORK_PHOTO = "📷 Фото работ"
+RECEIPT_PHOTO = "🧾 Чек / корзина"
 REPORT = "📊 Финансы"
 CANCEL = "Отмена"
 CONFIRM_DELETE = "Удалить"
@@ -47,7 +48,8 @@ main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=NEW_ENTRY)],
         [KeyboardButton(text=SEARCH), KeyboardButton(text=CUSTOMERS)],
         [KeyboardButton(text=ORDERS)],
-        [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=ADD_PHOTO)],
+        [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=WORK_PHOTO)],
+        [KeyboardButton(text=RECEIPT_PHOTO)],
         [KeyboardButton(text=REPORT), KeyboardButton(text=AI_USAGE)],
     ],
     resize_keyboard=True,
@@ -373,17 +375,26 @@ async def delete_waiting(message: Message) -> None:
     await message.answer("Нажмите «Удалить» для подтверждения или «Отмена».")
 
 
-@router.message(F.text == ADD_PHOTO)
-async def add_photo_start(message: Message, state: FSMContext) -> None:
+async def add_photo_start(message: Message, state: FSMContext, recognize: bool) -> None:
     assert message.from_user is not None
     orders = db.get_recent_orders_for_telegram_user(message.from_user.id)
     if not orders:
         await message.answer("Сначала создайте заказ-наряд.")
         return
-    await state.update_data(orders={str(order.id): order.id for order in orders})
+    await state.update_data(orders={str(order.id): order.id for order in orders}, recognize_image=recognize)
     await state.set_state(AddPhoto.order)
     choices = "\n".join(f"{order.id}. {order.brand} {order.model}: {order.description}" for order in orders)
     await message.answer(f"Выберите номер заказ-наряда:\n{choices}", reply_markup=cancel_keyboard)
+
+
+@router.message(F.text == WORK_PHOTO)
+async def add_work_photo_start(message: Message, state: FSMContext) -> None:
+    await add_photo_start(message, state, recognize=False)
+
+
+@router.message(F.text == RECEIPT_PHOTO)
+async def add_receipt_photo_start(message: Message, state: FSMContext) -> None:
+    await add_photo_start(message, state, recognize=True)
 
 
 @router.message(AddPhoto.order, F.text)
@@ -395,7 +406,10 @@ async def photo_order(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(order_id=data["orders"][selected])
     await state.set_state(AddPhoto.upload)
-    await message.answer("Отправляйте фото работ или чеков. Нажмите «Отмена», когда закончите.")
+    if data.get("recognize_image"):
+        await message.answer("Отправьте чек или скриншот корзины с запчастями и ценами. Бот распознает только это изображение.")
+    else:
+        await message.answer("Отправляйте фото выполненных работ. Они будут только сохранены в заказе — распознавания не будет.")
 
 
 async def recognize_order_image(message: Message, state: FSMContext, bot: Bot, file_id: str, mime_type: str) -> None:
@@ -443,11 +457,20 @@ async def recognize_order_image(message: Message, state: FSMContext, bot: Bot, f
 
 @router.message(AddPhoto.upload, F.photo)
 async def save_order_photo(message: Message, state: FSMContext, bot: Bot) -> None:
-    await recognize_order_image(message, state, bot, message.photo[-1].file_id, "image/jpeg")
+    data = await state.get_data()
+    if data.get("recognize_image"):
+        await recognize_order_image(message, state, bot, message.photo[-1].file_id, "image/jpeg")
+        return
+    db.add_order_photo(int(data["order_id"]), message.photo[-1].file_id, message.caption)
+    await message.answer(f"✅ Фото работы сохранено. Всего: {db.count_order_photos(data['order_id'])}.")
 
 
 @router.message(AddPhoto.upload, F.document)
 async def save_order_document(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    if not data.get("recognize_image"):
+        await message.answer("Для фото выполненных работ отправьте обычное фото, не файл-документ.")
+        return
     document = message.document
     if document.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
         await message.answer("Пришлите изображение: JPG, PNG или WEBP.")
