@@ -35,3 +35,17 @@ class DatabaseTest(unittest.TestCase):
             car_id = db.add_car(user_id, "Kia", "Rio", 2020, "А123АА77", customer_id)
             car = db.find_car(user_id, "kia", "rio", "а123аа77")
             self.assertEqual(car.id, car_id)
+
+    def test_existing_order_can_be_completed_later(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(789, "Мастер", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            original = db.add_service_order(car_id, "Замена масла", 1500, 0, 0)
+            updated = db.update_service_order(original.id, "Фильтр", None, 400, 650, add_amounts=True)
+
+            self.assertEqual(updated.description, "Замена масла; Фильтр")
+            self.assertEqual(updated.parts_cost, 400)
+            self.assertEqual(updated.parts_revenue, 650)
+            self.assertEqual(updated.profit, 1750)

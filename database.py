@@ -189,6 +189,32 @@ class Database:
             connection.close()
         return self.add_customer(user_id, full_name, phone)
 
+    def find_customer(self, user_id: int, full_name: str | None, phone: str | None) -> Customer | None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, user_id, full_name, phone FROM customers WHERE user_id = ? ORDER BY id DESC", (user_id,)
+            ).fetchall()
+            for row in rows:
+                if full_name and row["full_name"].casefold() == full_name.casefold():
+                    return Customer(**dict(row))
+                if phone and row["phone"] and row["phone"].replace(" ", "") == phone.replace(" ", ""):
+                    return Customer(**dict(row))
+            return None
+        finally:
+            connection.close()
+
+    def update_customer(self, customer_id: int, full_name: str | None, phone: str | None) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "UPDATE customers SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone) WHERE id = ?",
+                (full_name, phone, customer_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None) -> int:
         connection = self.connect()
         try:
@@ -237,6 +263,33 @@ class Database:
         finally:
             connection.close()
 
+    def find_car_by_details(self, user_id: int, brand: str | None, model: str | None, plate_number: str | None) -> Car | None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, user_id, customer_id, brand, model, year, plate_number FROM cars WHERE user_id = ? ORDER BY id DESC",
+                (user_id,),
+            ).fetchall()
+            if plate_number:
+                return next((Car(**dict(row)) for row in rows if row["plate_number"] and row["plate_number"].casefold() == plate_number.casefold()), None)
+            if brand and model:
+                return next((Car(**dict(row)) for row in rows if row["brand"].casefold() == brand.casefold() and row["model"].casefold() == model.casefold()), None)
+            return None
+        finally:
+            connection.close()
+
+    def update_car(self, car_id: int, customer_id: int | None, brand: str | None, model: str | None, year: int | None, plate_number: str | None) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                """UPDATE cars SET customer_id = COALESCE(?, customer_id), brand = COALESCE(?, brand),
+                   model = COALESCE(?, model), year = COALESCE(?, year), plate_number = COALESCE(?, plate_number) WHERE id = ?""",
+                (customer_id, brand, model, year, plate_number, car_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def add_service_order(self, car_id: int, description: str, labor_revenue: int, parts_cost: int, parts_revenue: int) -> ServiceOrder:
         connection = self.connect()
         try:
@@ -279,6 +332,34 @@ class Database:
             return [ServiceOrder(**dict(row)) for row in rows]
         finally:
             connection.close()
+
+    def get_latest_order_for_car(self, car_id: int) -> ServiceOrder | None:
+        connection = self.connect()
+        try:
+            row = connection.execute("SELECT id FROM service_orders WHERE car_id = ? ORDER BY id DESC LIMIT 1", (car_id,)).fetchone()
+            return self.get_service_order(int(row["id"])) if row is not None else None
+        finally:
+            connection.close()
+
+    def update_service_order(self, order_id: int, description: str | None, labor_revenue: int | None, parts_cost: int | None, parts_revenue: int | None, add_amounts: bool) -> ServiceOrder:
+        connection = self.connect()
+        try:
+            current = connection.execute("SELECT * FROM service_orders WHERE id = ?", (order_id,)).fetchone()
+            if current is None:
+                raise ValueError(f"Service order {order_id} does not exist")
+            new_description = current["description"] if not description else f"{current['description']}; {description}"
+            def value(field: str, incoming: int | None) -> int:
+                if incoming is None:
+                    return int(current[field])
+                return int(current[field]) + incoming if add_amounts else incoming
+            connection.execute(
+                """UPDATE service_orders SET description = ?, labor_revenue = ?, parts_cost = ?, parts_revenue = ? WHERE id = ?""",
+                (new_description, value("labor_revenue", labor_revenue), value("parts_cost", parts_cost), value("parts_revenue", parts_revenue), order_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
 
     def add_order_photo(self, service_order_id: int, telegram_file_id: str, caption: str | None) -> int:
         connection = self.connect()

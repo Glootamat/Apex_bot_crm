@@ -1,4 +1,4 @@
-"""OpenRouter integration for transcription and CRM data extraction."""
+"""OpenRouter integration for flexible workshop CRM requests."""
 
 from __future__ import annotations
 
@@ -13,40 +13,39 @@ API_URL = "https://openrouter.ai/api/v1"
 
 
 @dataclass(frozen=True)
-class WorkshopRecord:
-    customer_name: str
+class WorkshopCommand:
+    intent: str
+    customer_name: str | None
     customer_phone: str | None
-    car_brand: str
-    car_model: str
+    car_brand: str | None
+    car_model: str | None
     car_year: int | None
     plate_number: str | None
-    description: str
-    labor_revenue: int
-    parts_cost: int
-    parts_revenue: int
+    description: str | None
+    labor_revenue: int | None
+    parts_cost: int | None
+    parts_revenue: int | None
 
 
-RECORD_SCHEMA = {
-    "name": "workshop_record",
+COMMAND_SCHEMA = {
+    "name": "workshop_command",
     "strict": True,
     "schema": {
         "type": "object",
         "properties": {
-            "customer_name": {"type": "string", "description": "Имя клиента. Если не названо, пустая строка."},
+            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "update_order", "list_orders", "unknown"]},
+            "customer_name": {"type": ["string", "null"]},
             "customer_phone": {"type": ["string", "null"]},
-            "car_brand": {"type": "string", "description": "Марка автомобиля. Если не указана, пустая строка."},
-            "car_model": {"type": "string", "description": "Модель автомобиля. Если не указана, пустая строка."},
+            "car_brand": {"type": ["string", "null"]},
+            "car_model": {"type": ["string", "null"]},
             "car_year": {"type": ["integer", "null"]},
             "plate_number": {"type": ["string", "null"]},
-            "description": {"type": "string", "description": "Краткое описание выполненных работ."},
-            "labor_revenue": {"type": "integer", "minimum": 0, "description": "Сколько клиент заплатил за работу, ₽."},
-            "parts_cost": {"type": "integer", "minimum": 0, "description": "Себестоимость запчастей для сервиса, ₽."},
-            "parts_revenue": {"type": "integer", "minimum": 0, "description": "Сколько клиент заплатил за запчасти, ₽."},
+            "description": {"type": ["string", "null"]},
+            "labor_revenue": {"type": ["integer", "null"], "minimum": 0},
+            "parts_cost": {"type": ["integer", "null"], "minimum": 0},
+            "parts_revenue": {"type": ["integer", "null"], "minimum": 0},
         },
-        "required": [
-            "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number",
-            "description", "labor_revenue", "parts_cost", "parts_revenue",
-        ],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "description", "labor_revenue", "parts_cost", "parts_revenue"],
         "additionalProperties": False,
     },
 }
@@ -61,11 +60,7 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 async def transcribe_voice(api_key: str, audio: bytes, model: str) -> str:
-    payload = {
-        "model": model,
-        "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "ogg"},
-        "language": "ru",
-    }
+    payload = {"model": model, "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "ogg"}, "language": "ru"}
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{API_URL}/audio/transcriptions", headers=_headers(api_key), json=payload, timeout=aiohttp.ClientTimeout(total=90)) as response:
             body = await response.text()
@@ -77,17 +72,19 @@ async def transcribe_voice(api_key: str, audio: bytes, model: str) -> str:
     return text
 
 
-async def parse_workshop_record(api_key: str, text: str, model: str) -> WorkshopRecord:
-    system_prompt = (
-        "Ты помощник автосервиса. Извлеки из сообщения данные для создания заказ-наряда. "
-        "Не придумывай значения: неизвестные строки оставляй пустыми, числа ставь 0, неизвестный год — null. "
-        "Если указана только одна сумма запчастей без слов о закупке или продаже, считай её продажей клиенту. "
-        "Описание работ напиши кратко по-русски."
-    )
+async def parse_workshop_command(api_key: str, text: str, model: str) -> WorkshopCommand:
+    prompt = """Ты помощник CRM автосервиса. Разбери русское сообщение в структуру.
+intent:
+- upsert_customer: добавляют или меняют имя, телефон либо данные автомобиля, без работ;
+- create_order: описывают новый визит, выполненные работы, оплату или запчасти;
+- update_order: дополняют уже существующий заказ для указанной машины (например «добавь фильтр»); суммы должны быть только добавляемыми суммами;
+- list_orders: просят показать заказ-наряды/историю;
+- unknown: запрос не относится к CRM.
+Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель и госномер извлекай независимо от порядка слов. Суммы указывай в рублях. Описание оставляй null, если работ нет."""
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}],
-        "response_format": {"type": "json_schema", "json_schema": RECORD_SCHEMA},
+        "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        "response_format": {"type": "json_schema", "json_schema": COMMAND_SCHEMA},
         "provider": {"require_parameters": True},
     }
     async with aiohttp.ClientSession() as session:
@@ -97,7 +94,6 @@ async def parse_workshop_record(api_key: str, text: str, model: str) -> Workshop
         raise OpenRouterError(f"OpenRouter вернул ошибку {response.status}: {body[:300]}")
     try:
         content = json.loads(body)["choices"][0]["message"]["content"]
-        data = json.loads(content) if isinstance(content, str) else content
-        return WorkshopRecord(**data)
+        return WorkshopCommand(**(json.loads(content) if isinstance(content, str) else content))
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise OpenRouterError("Не удалось разобрать ответ OpenRouter.") from error
