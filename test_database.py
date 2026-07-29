@@ -117,3 +117,31 @@ class DatabaseTest(unittest.TestCase):
             cost, requests = db.get_ai_usage("datetime('now', 'start of day')")
             self.assertEqual(requests, 1)
             self.assertAlmostEqual(cost, 0.0015)
+
+    def test_receipt_parts_are_saved_and_added_to_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(3001, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            order = db.add_service_order(car_id, "Oil service", 0, 100, 0)
+            db.add_part_items(order.id, [("Oil filter", 1, 450, 450), ("Engine oil", 4, 800, 3200)])
+            updated = db.update_service_order(order.id, None, None, 3650, None, None, add_amounts=True)
+
+            self.assertEqual(len(db.get_part_items(order.id)), 2)
+            self.assertEqual(updated.parts_cost, 3750)
+
+    def test_receipt_parts_can_be_marked_up_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(3002, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            order = db.add_service_order(car_id, "Oil service", 0, 3650, 0)
+            db.add_part_items(order.id, [("Oil filter", 1, 450, 450), ("Engine oil", 4, 800, 3200)])
+
+            count, purchase_cost, profit = db.apply_markup_to_unmarked_parts(order.id, 40)
+            self.assertEqual((count, purchase_cost, profit), (2, 3650, 1460))
+            self.assertEqual(db.apply_markup_to_unmarked_parts(order.id, 40), (0, 0, 0))
+            updated = db.update_service_order(order.id, None, None, None, purchase_cost + profit, None, add_amounts=True)
+            self.assertEqual(updated.parts_margin, 1460)

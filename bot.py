@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from backup import create_backup
 from database import Database, ServiceOrder
-from openrouter import OpenRouterError, WorkshopCommand, parse_workshop_command, transcribe_voice
+from openrouter import OpenRouterError, WorkshopCommand, analyze_receipt_image, parse_workshop_command, transcribe_voice
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +40,7 @@ ADD_PHOTO = "📷 Фото к заказу"
 REPORT = "📊 Финансы"
 CANCEL = "Отмена"
 CONFIRM_DELETE = "Удалить"
+CONFIRM_RECEIPT = "Добавить запчасти"
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -53,11 +54,16 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 cancel_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=CANCEL)]], resize_keyboard=True)
 confirm_delete_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=CONFIRM_DELETE)], [KeyboardButton(text=CANCEL)]], resize_keyboard=True)
+confirm_receipt_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=CONFIRM_RECEIPT)], [KeyboardButton(text=CANCEL)]], resize_keyboard=True)
 
 
 class AddPhoto(StatesGroup):
     order = State()
     upload = State()
+
+
+class ConfirmReceipt(StatesGroup):
+    waiting = State()
 
 
 class ConfirmDelete(StatesGroup):
@@ -171,6 +177,25 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
             return
         updated = db.set_order_status(order.id, command.order_status)
         await message.answer(order_summary(updated, "✅ Статус заказ-наряда обновлён"), reply_markup=main_keyboard)
+        return
+    if command.intent == "markup_parts":
+        car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
+        order = db.get_service_order(command.order_id) if command.order_id else (db.get_latest_order_for_car(car.id) if car else None)
+        if order is None or command.parts_markup_percent is None:
+            await message.answer("Укажите номер заказ-наряда или автомобиль и процент. Например: «В заказе Kia Rio нацени запчасти из чека на 40%».")
+            return
+        count, purchase_cost, profit = db.apply_markup_to_unmarked_parts(order.id, command.parts_markup_percent)
+        if count == 0:
+            await message.answer("В этом заказе нет новых позиций из чеков или корзины для наценки. Повторно одни и те же позиции не нацениваю.")
+            return
+        updated = db.update_service_order(order.id, None, None, None, purchase_cost + profit, None, add_amounts=True)
+        await message.answer(
+            f"✅ Наценка {command.parts_markup_percent:g}% применена к {count} позициям.\n"
+            f"Цена запчастей клиенту: {purchase_cost + profit:,} ₽.\n"
+            f"В прибыль по запчастям добавлено: {profit:,} ₽.\n"
+            f"Текущая прибыль по запчастям: {updated.parts_margin:,} ₽.".replace(",", " "),
+            reply_markup=main_keyboard,
+        )
         return
     customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
     if customer is None and command.customer_name:
@@ -373,11 +398,82 @@ async def photo_order(message: Message, state: FSMContext) -> None:
     await message.answer("Отправляйте фото работ или чеков. Нажмите «Отмена», когда закончите.")
 
 
-@router.message(AddPhoto.upload, F.photo)
-async def save_order_photo(message: Message, state: FSMContext) -> None:
+async def recognize_order_image(message: Message, state: FSMContext, bot: Bot, file_id: str, mime_type: str) -> None:
     data = await state.get_data()
-    db.add_order_photo(data["order_id"], message.photo[-1].file_id, message.caption)
-    await message.answer(f"✅ Фото сохранено. Всего: {db.count_order_photos(data['order_id'])}.")
+    order_id = int(data["order_id"])
+    db.add_order_photo(order_id, file_id, message.caption)
+    settings = openrouter_settings()
+    if settings is None or not ai_budget_available():
+        await message.answer("✅ Фото сохранено. Распознавание сейчас недоступно: проверьте ключ OpenRouter или лимит ИИ.")
+        return
+    try:
+        downloaded = await bot.download(file_id)
+        if downloaded is None:
+            raise OpenRouterError("Не удалось скачать изображение из Telegram.")
+        image = downloaded.getvalue()
+        if len(image) > 10 * 1024 * 1024:
+            await message.answer("✅ Фото сохранено. Для распознавания отправьте изображение до 10 МБ.")
+            return
+        api_key, _, vision_model, _, _ = settings
+        response = await analyze_receipt_image(api_key, image, mime_type, vision_model)
+        record_ai_usage("vision", response)
+        analysis = response.value
+        items = [item for item in analysis.items if item.name and item.total_cost is not None]
+        total_cost = analysis.total_cost if analysis.total_cost is not None else sum(item.total_cost or 0 for item in items)
+        if not items and not total_cost:
+            await message.answer("✅ Фото сохранено. Не удалось уверенно распознать позиции или итоговую сумму.")
+            return
+        await state.update_data(
+            receipt_order_id=order_id,
+            receipt_items=[(item.name, item.quantity, item.unit_cost, item.total_cost) for item in items],
+            receipt_total=total_cost,
+        )
+        lines = ["🧾 Распознано как закупка запчастей:"]
+        for item in items[:12]:
+            quantity = f" × {item.quantity:g}" if item.quantity is not None else ""
+            amount = f" — {item.total_cost:,} ₽".replace(",", " ") if item.total_cost is not None else ""
+            lines.append(f"• {item.name}{quantity}{amount}")
+        lines.append(f"\nСебестоимость к добавлению: {total_cost:,} ₽".replace(",", " "))
+        lines.append("Добавить позиции и сумму в заказ? Выручка и работы не изменятся.")
+        await state.set_state(ConfirmReceipt.waiting)
+        await message.answer("\n".join(lines), reply_markup=confirm_receipt_keyboard)
+    except OpenRouterError as error:
+        await message.answer(f"✅ Фото сохранено, но распознать его не удалось: {error}")
+
+
+@router.message(AddPhoto.upload, F.photo)
+async def save_order_photo(message: Message, state: FSMContext, bot: Bot) -> None:
+    await recognize_order_image(message, state, bot, message.photo[-1].file_id, "image/jpeg")
+
+
+@router.message(AddPhoto.upload, F.document)
+async def save_order_document(message: Message, state: FSMContext, bot: Bot) -> None:
+    document = message.document
+    if document.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+        await message.answer("Пришлите изображение: JPG, PNG или WEBP.")
+        return
+    await recognize_order_image(message, state, bot, document.file_id, document.mime_type)
+
+
+@router.message(ConfirmReceipt.waiting, F.text == CONFIRM_RECEIPT)
+async def confirm_receipt(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_id = int(data["receipt_order_id"])
+    items = data.get("receipt_items", [])
+    db.add_part_items(order_id, [(str(name), quantity, unit_cost, total_cost) for name, quantity, unit_cost, total_cost in items])
+    total_cost = int(data["receipt_total"])
+    updated = db.update_service_order(order_id, None, None, total_cost, None, None, add_amounts=True)
+    await state.clear()
+    await message.answer(
+        f"✅ В заказ #{order_id} добавлены запчасти и себестоимость {total_cost:,} ₽.\n"
+        f"Текущая себестоимость запчастей: {updated.parts_cost:,} ₽.".replace(",", " "),
+        reply_markup=main_keyboard,
+    )
+
+
+@router.message(ConfirmReceipt.waiting)
+async def receipt_waiting(message: Message) -> None:
+    await message.answer("Нажмите «Добавить запчасти» или «Отмена».")
 
 
 @router.message(F.text == REPORT)

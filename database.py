@@ -87,6 +87,17 @@ class CustomerOverview:
     cars: list[CustomerCarOverview]
 
 
+@dataclass(frozen=True)
+class PartItem:
+    id: int
+    service_order_id: int
+    name: str
+    quantity: float | None
+    unit_cost: int | None
+    total_cost: int | None
+    markup_percent: float | None
+
+
 class Database:
     def __init__(self, path: str | Path = "workshop.sqlite3") -> None:
         self.path = Path(path)
@@ -152,6 +163,18 @@ class Database:
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS part_items (
+                    id INTEGER PRIMARY KEY,
+                    service_order_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    quantity REAL,
+                    unit_cost INTEGER,
+                    total_cost INTEGER,
+                    markup_percent REAL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS ai_usage_log (
                     id INTEGER PRIMARY KEY,
                     task_type TEXT NOT NULL,
@@ -175,6 +198,9 @@ class Database:
                 connection.execute("ALTER TABLE service_orders ADD COLUMN parts_profit INTEGER NOT NULL DEFAULT 0")
             if "status" not in order_columns:
                 connection.execute("ALTER TABLE service_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'in_progress'")
+            part_columns = {row["name"] for row in connection.execute("PRAGMA table_info(part_items)")}
+            if "markup_percent" not in part_columns:
+                connection.execute("ALTER TABLE part_items ADD COLUMN markup_percent REAL")
             connection.commit()
         finally:
             connection.close()
@@ -573,6 +599,50 @@ class Database:
         connection = self.connect()
         try:
             return int(connection.execute("SELECT COUNT(*) FROM order_photos WHERE service_order_id = ?", (service_order_id,)).fetchone()[0])
+        finally:
+            connection.close()
+
+    def add_part_items(self, service_order_id: int, items: list[tuple[str, float | None, int | None, int | None]]) -> None:
+        if not items:
+            return
+        connection = self.connect()
+        try:
+            connection.executemany(
+                "INSERT INTO part_items (service_order_id, name, quantity, unit_cost, total_cost) VALUES (?, ?, ?, ?, ?)",
+                [(service_order_id, name, quantity, unit_cost, total_cost) for name, quantity, unit_cost, total_cost in items],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_part_items(self, service_order_id: int) -> list[PartItem]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, service_order_id, name, quantity, unit_cost, total_cost, markup_percent FROM part_items WHERE service_order_id = ? ORDER BY id",
+                (service_order_id,),
+            ).fetchall()
+            return [PartItem(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def apply_markup_to_unmarked_parts(self, service_order_id: int, percent: float) -> tuple[int, int, int]:
+        """Apply a margin once to receipt-derived positions not marked up before."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, total_cost FROM part_items WHERE service_order_id = ? AND markup_percent IS NULL AND total_cost IS NOT NULL",
+                (service_order_id,),
+            ).fetchall()
+            purchase_cost = sum(int(row["total_cost"]) for row in rows)
+            profit = sum(int(float(row["total_cost"]) * percent / 100 + 0.5) for row in rows)
+            if rows:
+                connection.execute(
+                    "UPDATE part_items SET markup_percent = ? WHERE service_order_id = ? AND markup_percent IS NULL AND total_cost IS NOT NULL",
+                    (percent, service_order_id),
+                )
+                connection.commit()
+            return len(rows), purchase_cost, profit
         finally:
             connection.close()
 

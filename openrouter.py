@@ -39,8 +39,24 @@ class WorkshopCommand:
     parts_cost: int | None
     parts_revenue: int | None
     parts_profit: int | None
+    parts_markup_percent: float | None
     order_id: int | None
     order_status: str | None
+
+
+@dataclass(frozen=True)
+class ReceiptItem:
+    name: str
+    quantity: float | None
+    unit_cost: int | None
+    total_cost: int | None
+
+
+@dataclass(frozen=True)
+class ReceiptAnalysis:
+    document_type: str
+    items: list[ReceiptItem]
+    total_cost: int | None
 
 
 COMMAND_SCHEMA = {
@@ -49,7 +65,7 @@ COMMAND_SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "update_order", "set_order_status", "list_orders", "delete_customer", "delete_car", "delete_order", "unknown"]},
+            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "update_order", "markup_parts", "set_order_status", "list_orders", "delete_customer", "delete_car", "delete_order", "unknown"]},
             "customer_name": {"type": ["string", "null"]},
             "customer_phone": {"type": ["string", "null"]},
             "car_brand": {"type": ["string", "null"]},
@@ -63,10 +79,11 @@ COMMAND_SCHEMA = {
             "parts_cost": {"type": ["integer", "null"], "minimum": 0},
             "parts_revenue": {"type": ["integer", "null"], "minimum": 0},
             "parts_profit": {"type": ["integer", "null"], "minimum": 0, "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
+            "parts_markup_percent": {"type": ["number", "null"], "minimum": 0, "maximum": 1000},
             "order_id": {"type": ["integer", "null"], "minimum": 1},
             "order_status": {"type": ["string", "null"], "enum": ["in_progress", "completed", None]},
         },
-        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "order_id", "order_status"],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status"],
         "additionalProperties": False,
     },
 }
@@ -74,6 +91,63 @@ COMMAND_SCHEMA = {
 
 class OpenRouterError(RuntimeError):
     pass
+
+
+RECEIPT_SCHEMA = {
+    "name": "workshop_receipt",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "document_type": {"type": "string", "enum": ["receipt", "supplier_cart", "unknown"]},
+            "items": {"type": "array", "items": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "quantity": {"type": ["number", "null"], "minimum": 0},
+                "unit_cost": {"type": ["integer", "null"], "minimum": 0},
+                "total_cost": {"type": ["integer", "null"], "minimum": 0},
+            }, "required": ["name", "quantity", "unit_cost", "total_cost"], "additionalProperties": False}},
+            "total_cost": {"type": ["integer", "null"], "minimum": 0},
+        },
+        "required": ["document_type", "items", "total_cost"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def analyze_receipt_image(api_key: str, image: bytes, mime_type: str, model: str) -> AIResponse[ReceiptAnalysis]:
+    """Extract purchase positions from a receipt or supplier cart image."""
+    prompt = """You extract auto-parts purchase positions from a receipt or supplier cart image.
+Return only legible parts and purchase costs in rubles. Never invent data. Treat this as
+purchase cost only: do not include labor, customer revenue, or profit. Compute a line total
+when unit price and quantity are visible; use the visible document total when available."""
+    encoded = base64.b64encode(image).decode("ascii")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+        ]}],
+        "response_format": {"type": "json_schema", "json_schema": RECEIPT_SCHEMA},
+        "provider": {"require_parameters": True},
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{API_URL}/chat/completions", headers=_headers(api_key), json=payload, timeout=aiohttp.ClientTimeout(total=90)) as response:
+            body = await response.text()
+    if response.status >= 400:
+        raise OpenRouterError(f"OpenRouter returned error {response.status}: {body[:300]}")
+    try:
+        data = json.loads(body)
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content) if isinstance(content, str) else content
+        analysis = ReceiptAnalysis(
+            document_type=parsed["document_type"],
+            items=[ReceiptItem(**item) for item in parsed["items"]],
+            total_cost=parsed["total_cost"],
+        )
+        actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
+        return AIResponse(analysis, actual_model, input_tokens, output_tokens, cost_usd)
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise OpenRouterError("Could not recognize receipt data.") from error
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -119,7 +193,7 @@ intent:
 Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет."""
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        "messages": [{"role": "system", "content": prompt + "\n- markup_parts: user asks to mark up parts from a receipt/cart by a percentage. Set parts_markup_percent, and extract order_id or vehicle details. Do not set parts_profit for this intent."}, {"role": "user", "content": text}],
         "response_format": {"type": "json_schema", "json_schema": COMMAND_SCHEMA},
         "provider": {"require_parameters": True},
     }
