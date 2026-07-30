@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Generic, TypeVar
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -42,11 +44,13 @@ class WorkshopCommand:
     parts_markup_percent: float | None
     order_id: int | None
     order_status: str | None
+    appointment_start: str | None
 
 
 @dataclass(frozen=True)
 class ReceiptItem:
     name: str
+    article: str | None
     quantity: float | None
     unit_cost: int | None
     total_cost: int | None
@@ -65,7 +69,7 @@ COMMAND_SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "update_order", "markup_parts", "set_order_status", "list_orders", "delete_customer", "delete_car", "delete_order", "unknown"]},
+            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "create_appointment", "update_order", "markup_parts", "set_order_status", "list_orders", "delete_customer", "delete_car", "delete_order", "unknown"]},
             "customer_name": {"type": ["string", "null"]},
             "customer_phone": {"type": ["string", "null"]},
             "car_brand": {"type": ["string", "null"]},
@@ -73,17 +77,23 @@ COMMAND_SCHEMA = {
             "car_year": {"type": ["integer", "null"]},
             "plate_number": {"type": ["string", "null"]},
             "vin": {"type": ["string", "null"]},
-            "mileage": {"type": ["integer", "null"], "minimum": 0},
+            "mileage": {"type": ["integer", "null"]},
             "description": {"type": ["string", "null"]},
-            "labor_revenue": {"type": ["integer", "null"], "minimum": 0},
-            "parts_cost": {"type": ["integer", "null"], "minimum": 0},
-            "parts_revenue": {"type": ["integer", "null"], "minimum": 0},
-            "parts_profit": {"type": ["integer", "null"], "minimum": 0, "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
-            "parts_markup_percent": {"type": ["number", "null"], "minimum": 0, "maximum": 1000},
-            "order_id": {"type": ["integer", "null"], "minimum": 1},
-            "order_status": {"type": ["string", "null"], "enum": ["in_progress", "completed", None]},
+            "labor_revenue": {"type": ["integer", "null"]},
+            "parts_cost": {"type": ["integer", "null"]},
+            "parts_revenue": {"type": ["integer", "null"]},
+            "parts_profit": {"type": ["integer", "null"], "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
+            "parts_markup_percent": {"type": ["number", "null"]},
+            "order_id": {"type": ["integer", "null"]},
+            "order_status": {
+                "anyOf": [
+                    {"type": "string", "enum": ["in_progress", "completed"]},
+                    {"type": "null"},
+                ]
+            },
+            "appointment_start": {"type": ["string", "null"]},
         },
-        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status"],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status", "appointment_start"],
         "additionalProperties": False,
     },
 }
@@ -102,10 +112,11 @@ RECEIPT_SCHEMA = {
             "document_type": {"type": "string", "enum": ["receipt", "supplier_cart", "unknown"]},
             "items": {"type": "array", "items": {"type": "object", "properties": {
                 "name": {"type": "string"},
+                "article": {"type": ["string", "null"]},
                 "quantity": {"type": ["number", "null"], "minimum": 0},
                 "unit_cost": {"type": ["integer", "null"], "minimum": 0},
                 "total_cost": {"type": ["integer", "null"], "minimum": 0},
-            }, "required": ["name", "quantity", "unit_cost", "total_cost"], "additionalProperties": False}},
+            }, "required": ["name", "article", "quantity", "unit_cost", "total_cost"], "additionalProperties": False}},
             "total_cost": {"type": ["integer", "null"], "minimum": 0},
         },
         "required": ["document_type", "items", "total_cost"],
@@ -117,9 +128,11 @@ RECEIPT_SCHEMA = {
 async def analyze_receipt_image(api_key: str, image: bytes, mime_type: str, model: str) -> AIResponse[ReceiptAnalysis]:
     """Extract purchase positions from a receipt or supplier cart image."""
     prompt = """You extract auto-parts purchase positions from a receipt or supplier cart image.
-Return only legible parts and purchase costs in rubles. Never invent data. Treat this as
-purchase cost only: do not include labor, customer revenue, or profit. Compute a line total
-when unit price and quantity are visible; use the visible document total when available."""
+For name return only a short generic Russian part name, without brand, article, compatibility,
+dimensions, marketing text, separators, or other product description. Put the catalog/SKU code
+in article separately. Return quantity and purchase costs in rubles. Never invent data. Treat
+this as purchase cost only: do not include labor, customer revenue, or profit. Compute a line
+total when unit price and quantity are visible; use the visible document total when available."""
     encoded = base64.b64encode(image).decode("ascii")
     payload = {
         "model": model,
@@ -191,9 +204,12 @@ intent:
 - delete_customer, delete_car, delete_order: просят удалить клиента, автомобиль или заказ; извлеки максимум идентификаторов;
 - unknown: запрос не относится к CRM.
 Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет."""
+    now = datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="minutes")
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": prompt + "\n- markup_parts: user asks to mark up parts from a receipt/cart by a percentage. Set parts_markup_percent, and extract order_id or vehicle details. Do not set parts_profit for this intent."}, {"role": "user", "content": text}],
+        "messages": [{"role": "system", "content": prompt + f"""
+- create_appointment: клиент записывается на будущую дату или время, а работы ещё не выполнены. Заполни appointment_start в ISO 8601 с часовым поясом +03:00. Текущее московское время: {now}.
+- markup_parts: user asks to mark up parts from a receipt/cart by a percentage. Set parts_markup_percent, and extract order_id or vehicle details. Do not set parts_profit for this intent."""}, {"role": "user", "content": text}],
         "response_format": {"type": "json_schema", "json_schema": COMMAND_SCHEMA},
         "provider": {"require_parameters": True},
     }

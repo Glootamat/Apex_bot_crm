@@ -25,6 +25,12 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(db.get_customers_for_telegram_user(123)[0].full_name, "Пётр Петров")
             db.add_order_photo(order.id, "telegram-file-id", "После ремонта")
             self.assertEqual(db.count_order_photos(order.id), 1)
+            photos = db.get_order_photos(order.id)
+            self.assertEqual(photos[0]["telegram_file_id"], "telegram-file-id")
+            self.assertEqual(db.search(123, "после ремонта")["orders"][0]["id"], order.id)
+            db.add_order_photo(order.id, "receipt-file-id", None, photo_type="receipt")
+            self.assertEqual(db.count_order_photos(order.id), 1)
+            self.assertEqual(len(db.get_order_photos(order.id)), 1)
 
     def test_find_or_add_customer_and_car(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -118,6 +124,47 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(requests, 1)
             self.assertAlmostEqual(cost, 0.0015)
 
+    def test_daily_reminder_is_claimed_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            self.assertTrue(db.claim_daily_reminder("2026-07-30"))
+            self.assertFalse(db.claim_daily_reminder("2026-07-30"))
+            self.assertTrue(db.claim_daily_reminder("2026-07-31"))
+
+    def test_upcoming_appointment_keeps_client_car_and_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4001, "Master", None)
+            customer_id = db.add_customer(user_id, "Sergey", "+79990000000")
+            car_id = db.add_car(
+                user_id, "Lada", "Granta", plate_number="A123AA", customer_id=customer_id
+            )
+            appointment_id = db.add_appointment(
+                car_id, "Brake pads", "2026-07-31T11:00:00+03:00"
+            )
+            appointment = db.get_upcoming_appointments_for_telegram_user(4001)[0]
+            self.assertEqual(appointment.id, appointment_id)
+            self.assertEqual(appointment.customer_name, "Sergey")
+            self.assertEqual(appointment.brand, "Lada")
+
+    def test_completed_order_is_hidden_from_appointments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4002, "Master", None)
+            car_id = db.add_car(user_id, "Lada", "Vesta")
+            order = db.add_service_order(car_id, "Service", 1500, 0, 0)
+            db.add_appointment(
+                car_id,
+                "Service",
+                "2026-08-01T11:00:00+03:00",
+                service_order_id=order.id,
+            )
+            db.set_order_status(order.id, "completed")
+            self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4002), [])
+
     def test_receipt_parts_are_saved_and_added_to_cost(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -145,3 +192,41 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(db.apply_markup_to_unmarked_parts(order.id, 40), (0, 0, 0))
             updated = db.update_service_order(order.id, None, None, None, purchase_cost + profit, None, add_amounts=True)
             self.assertEqual(updated.parts_margin, 1460)
+
+    def test_receipt_total_can_be_edited_and_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(3003, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            order = db.add_service_order(car_id, "Oil service", 0, 100, 0)
+            receipt = db.add_receipt(order.id, 450, [("Oil filter", "OF-1", 1, 450, 450)])
+
+            self.assertEqual(db.get_service_order(order.id).parts_cost, 550)
+            self.assertTrue(db.update_receipt_total(user_id, receipt.id, 500))
+            self.assertEqual(db.get_service_order(order.id).parts_cost, 600)
+            self.assertTrue(db.delete_receipt(user_id, receipt.id))
+            self.assertEqual(db.get_service_order(order.id).parts_cost, 100)
+            self.assertEqual(db.get_part_items(order.id), [])
+
+    def test_receipt_purchase_does_not_reduce_labor_before_markup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(3004, "Master", None)
+            car_id = db.add_car(user_id, "Audi", "Q3")
+            order = db.add_service_order(car_id, "Brake pads", 1500, 0, 0)
+            receipt = db.add_receipt(order.id, 1533, [("Pads", "BD3619", 1, 1310, 1310), ("Wiper", "AWBK600", 1, 223, 223)])
+
+            self.assertEqual(db.get_service_order(order.id).profit, 1500)
+            result = db.apply_markup_to_receipt(user_id, receipt.id, 40)
+            self.assertEqual(result, (order.id, 2, 1533, 613))
+            updated = db.get_service_order(order.id)
+            self.assertEqual(updated.parts_margin, 613)
+            self.assertEqual(updated.profit, 2113)
+            self.assertEqual(db.apply_markup_to_receipt(user_id, receipt.id, 40), (order.id, 0, 0, 0))
+            overview = db.get_recent_receipts_for_telegram_user(3004)[0]
+            self.assertTrue(overview.markup_applied)
+            self.assertEqual(overview.receipt.total_cost, 1533)
+            self.assertEqual(len(overview.items), 2)
+            self.assertEqual(overview.items[0].article, "BD3619")

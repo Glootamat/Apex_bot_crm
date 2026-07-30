@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -42,13 +43,20 @@ class ServiceOrder:
     brand: str
     model: str
     plate_number: str | None
+    vin: str | None
+    mileage: int | None
+    customer_name: str | None
 
     @property
     def profit(self) -> int:
-        return self.labor_revenue + self.parts_revenue - self.parts_cost + self.parts_profit
+        return self.labor_revenue + self.parts_margin
 
     @property
     def parts_margin(self) -> int:
+        # A saved receipt is a purchase awaiting a selling price. Until markup is
+        # chosen it must not turn paid labor into a negative profit.
+        if self.parts_revenue == 0:
+            return self.parts_profit
         return self.parts_revenue - self.parts_cost + self.parts_profit
 
 
@@ -66,10 +74,12 @@ class Report:
 
     @property
     def profit(self) -> int:
-        return self.revenue - self.parts_cost + self.parts_profit
+        return self.labor_revenue + self.parts_margin
 
     @property
     def parts_margin(self) -> int:
+        if self.parts_revenue == 0:
+            return self.parts_profit
         return self.parts_revenue - self.parts_cost + self.parts_profit
 
 
@@ -92,10 +102,48 @@ class PartItem:
     id: int
     service_order_id: int
     name: str
+    article: str | None
     quantity: float | None
     unit_cost: int | None
     total_cost: int | None
     markup_percent: float | None
+
+
+@dataclass(frozen=True)
+class Receipt:
+    id: int
+    service_order_id: int
+    total_cost: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ReceiptOverview:
+    receipt: Receipt
+    brand: str
+    model: str
+    plate_number: str | None
+    customer_name: str | None
+    items: list[PartItem]
+
+    @property
+    def markup_applied(self) -> bool:
+        return bool(self.items) and all(item.markup_percent is not None for item in self.items)
+
+
+@dataclass(frozen=True)
+class AppointmentOverview:
+    id: int
+    car_id: int
+    service_order_id: int | None
+    description: str
+    starts_at: str
+    status: str
+    brand: str
+    model: str
+    plate_number: str | None
+    customer_name: str | None
+    customer_phone: str | None
 
 
 class Database:
@@ -159,6 +207,7 @@ class Database:
                     service_order_id INTEGER NOT NULL,
                     telegram_file_id TEXT NOT NULL,
                     caption TEXT,
+                    photo_type TEXT NOT NULL DEFAULT 'work',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
                 );
@@ -167,10 +216,19 @@ class Database:
                     id INTEGER PRIMARY KEY,
                     service_order_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
+                    article TEXT,
                     quantity REAL,
                     unit_cost INTEGER,
                     total_cost INTEGER,
                     markup_percent REAL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS receipts (
+                    id INTEGER PRIMARY KEY,
+                    service_order_id INTEGER NOT NULL,
+                    total_cost INTEGER NOT NULL CHECK (total_cost >= 0),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
                 );
@@ -183,6 +241,30 @@ class Database:
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     cost_usd REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_reminders (
+                    reminder_date TEXT PRIMARY KEY,
+                    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS incoming_messages (
+                    id INTEGER PRIMARY KEY,
+                    telegram_id INTEGER NOT NULL,
+                    message_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS appointments (
+                    id INTEGER PRIMARY KEY,
+                    car_id INTEGER NOT NULL,
+                    service_order_id INTEGER,
+                    description TEXT NOT NULL,
+                    starts_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'scheduled',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE SET NULL
                 );
                 """
             )
@@ -198,9 +280,27 @@ class Database:
                 connection.execute("ALTER TABLE service_orders ADD COLUMN parts_profit INTEGER NOT NULL DEFAULT 0")
             if "status" not in order_columns:
                 connection.execute("ALTER TABLE service_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'in_progress'")
+            photo_columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_photos)")}
+            if "photo_type" not in photo_columns:
+                connection.execute("ALTER TABLE order_photos ADD COLUMN photo_type TEXT NOT NULL DEFAULT 'work'")
             part_columns = {row["name"] for row in connection.execute("PRAGMA table_info(part_items)")}
             if "markup_percent" not in part_columns:
                 connection.execute("ALTER TABLE part_items ADD COLUMN markup_percent REAL")
+            if "receipt_id" not in part_columns:
+                connection.execute("ALTER TABLE part_items ADD COLUMN receipt_id INTEGER REFERENCES receipts(id) ON DELETE CASCADE")
+            if "article" not in part_columns:
+                connection.execute("ALTER TABLE part_items ADD COLUMN article TEXT")
+            appointment_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(appointments)")
+            }
+            if "service_order_id" not in appointment_columns:
+                connection.execute(
+                    "ALTER TABLE appointments ADD COLUMN service_order_id INTEGER REFERENCES service_orders(id) ON DELETE SET NULL"
+                )
+            if "status" not in appointment_columns:
+                connection.execute(
+                    "ALTER TABLE appointments ADD COLUMN status TEXT NOT NULL DEFAULT 'scheduled'"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -244,6 +344,92 @@ class Database:
                 (telegram_id,),
             ).fetchall()
             return [Customer(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def get_customer_for_telegram_user(self, telegram_id: int, customer_id: int) -> Customer | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT c.id, c.user_id, c.full_name, c.phone
+                   FROM customers c JOIN users u ON u.id = c.user_id
+                   WHERE u.telegram_id = ? AND c.id = ?""",
+                (telegram_id, customer_id),
+            ).fetchone()
+            return Customer(**dict(row)) if row is not None else None
+        finally:
+            connection.close()
+
+    def claim_daily_reminder(self, reminder_date: str) -> bool:
+        """Atomically claim one daily reminder, returning False if already sent."""
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO daily_reminders (reminder_date) VALUES (?)",
+                (reminder_date,),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def log_incoming_message(self, telegram_id: int, message_text: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "INSERT INTO incoming_messages (telegram_id, message_text) VALUES (?, ?)",
+                (telegram_id, message_text),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def add_appointment(
+        self, car_id: int, description: str, starts_at: str, service_order_id: int | None = None
+    ) -> int:
+        connection = self.connect()
+        try:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(appointments)")}
+            if "ends_at" in columns:
+                ends_at = (datetime.fromisoformat(starts_at) + timedelta(hours=1)).isoformat()
+                cursor = connection.execute(
+                    """INSERT INTO appointments
+                       (car_id, service_order_id, description, starts_at, ends_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at, ends_at),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO appointments (car_id, service_order_id, description, starts_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at),
+                )
+            connection.commit()
+            return int(cursor.lastrowid)
+        finally:
+            connection.close()
+
+    def get_upcoming_appointments_for_telegram_user(
+        self, telegram_id: int, limit: int = 20
+    ) -> list[AppointmentOverview]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at, a.status,
+                          c.brand, c.model, c.plate_number, cu.full_name AS customer_name,
+                          cu.phone AS customer_phone
+                   FROM appointments a
+                   JOIN cars c ON c.id = a.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   LEFT JOIN service_orders o ON o.id = a.service_order_id
+                   WHERE u.telegram_id = ?
+                     AND a.status = 'scheduled'
+                     AND (a.service_order_id IS NULL OR o.status != 'completed')
+                   ORDER BY a.starts_at LIMIT ?""",
+                (telegram_id, limit),
+            ).fetchall()
+            return [AppointmentOverview(**dict(row)) for row in rows]
         finally:
             connection.close()
 
@@ -336,7 +522,12 @@ class Database:
                    WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             orders = [dict(row) for row in connection.execute(
-                """SELECT o.id, o.description, o.status, c.brand, c.model, c.plate_number, cu.full_name AS customer_name
+                """SELECT o.id, o.description, o.status, c.brand, c.model, c.plate_number,
+                          cu.full_name AS customer_name,
+                          (SELECT GROUP_CONCAT(op.caption, ' ')
+                           FROM order_photos op
+                           WHERE op.service_order_id = o.id
+                             AND op.photo_type = 'work') AS photo_captions
                    FROM service_orders o JOIN cars c ON c.id = o.car_id JOIN users u ON u.id = c.user_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id WHERE u.telegram_id = ? ORDER BY o.id DESC""", (telegram_id,)
             ).fetchall()]
@@ -349,7 +540,10 @@ class Database:
         return {
             "customers": [row for row in customers if matches([row["full_name"], row["phone"]])][:10],
             "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"]])][:10],
-            "orders": [row for row in orders if matches([row["description"], row["brand"], row["model"], row["plate_number"], row["customer_name"]])][:10],
+            "orders": [row for row in orders if matches([
+                row["description"], row["brand"], row["model"], row["plate_number"],
+                row["customer_name"], row["photo_captions"],
+            ])][:10],
         }
 
     def log_ai_usage(self, task_type: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
@@ -488,8 +682,9 @@ class Database:
         try:
             row = connection.execute(
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
-                          c.brand, c.model, c.plate_number
-                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id WHERE o.id = ?""",
+                          c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
+                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id WHERE o.id = ?""",
                 (order_id,),
             ).fetchone()
             if row is None:
@@ -503,8 +698,9 @@ class Database:
         try:
             rows = connection.execute(
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
-                          c.brand, c.model, c.plate_number
-                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
+                          c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
+                   FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? ORDER BY o.id DESC LIMIT ?""",
                 (telegram_id, limit),
             ).fetchall()
@@ -517,6 +713,24 @@ class Database:
         try:
             row = connection.execute("SELECT id FROM service_orders WHERE car_id = ? ORDER BY id DESC LIMIT 1", (car_id,)).fetchone()
             return self.get_service_order(int(row["id"])) if row is not None else None
+        finally:
+            connection.close()
+
+    def get_active_orders_for_customer(self, user_id: int, customer_id: int) -> list[ServiceOrder]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost,
+                          o.parts_revenue, o.parts_profit, o.status, o.created_at,
+                          c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
+                   FROM service_orders o
+                   JOIN cars c ON c.id = o.car_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE c.user_id = ? AND c.customer_id = ? AND o.status = 'in_progress'
+                   ORDER BY o.id DESC""",
+                (user_id, customer_id),
+            ).fetchall()
+            return [ServiceOrder(**dict(row)) for row in rows]
         finally:
             connection.close()
 
@@ -546,6 +760,12 @@ class Database:
         connection = self.connect()
         try:
             connection.execute("UPDATE service_orders SET status = ? WHERE id = ?", (status, order_id))
+            if status == "completed":
+                connection.execute(
+                    """UPDATE appointments SET status = 'completed'
+                       WHERE service_order_id = ? AND status = 'scheduled'""",
+                    (order_id,),
+                )
             connection.commit()
         finally:
             connection.close()
@@ -583,12 +803,22 @@ class Database:
         finally:
             connection.close()
 
-    def add_order_photo(self, service_order_id: int, telegram_file_id: str, caption: str | None) -> int:
+    def add_order_photo(
+        self,
+        service_order_id: int,
+        telegram_file_id: str,
+        caption: str | None,
+        photo_type: str = "work",
+    ) -> int:
+        if photo_type not in {"work", "receipt"}:
+            raise ValueError("Unknown order photo type")
         connection = self.connect()
         try:
             cursor = connection.execute(
-                "INSERT INTO order_photos (service_order_id, telegram_file_id, caption) VALUES (?, ?, ?)",
-                (service_order_id, telegram_file_id, caption),
+                """INSERT INTO order_photos
+                   (service_order_id, telegram_file_id, caption, photo_type)
+                   VALUES (?, ?, ?, ?)""",
+                (service_order_id, telegram_file_id, caption, photo_type),
             )
             connection.commit()
             return int(cursor.lastrowid)
@@ -598,20 +828,156 @@ class Database:
     def count_order_photos(self, service_order_id: int) -> int:
         connection = self.connect()
         try:
-            return int(connection.execute("SELECT COUNT(*) FROM order_photos WHERE service_order_id = ?", (service_order_id,)).fetchone()[0])
+            return int(connection.execute(
+                """SELECT COUNT(*) FROM order_photos
+                   WHERE service_order_id = ? AND photo_type = 'work'""",
+                (service_order_id,),
+            ).fetchone()[0])
         finally:
             connection.close()
 
-    def add_part_items(self, service_order_id: int, items: list[tuple[str, float | None, int | None, int | None]]) -> None:
+    def get_order_photos(self, service_order_id: int) -> list[dict[str, object]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT id, telegram_file_id, caption, created_at
+                   FROM order_photos
+                   WHERE service_order_id = ? AND photo_type = 'work'
+                   ORDER BY id""",
+                (service_order_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def add_part_items(self, service_order_id: int, items: list[tuple[str, float | None, int | None, int | None]], receipt_id: int | None = None) -> None:
         if not items:
             return
         connection = self.connect()
         try:
             connection.executemany(
-                "INSERT INTO part_items (service_order_id, name, quantity, unit_cost, total_cost) VALUES (?, ?, ?, ?, ?)",
-                [(service_order_id, name, quantity, unit_cost, total_cost) for name, quantity, unit_cost, total_cost in items],
+                "INSERT INTO part_items (service_order_id, name, article, quantity, unit_cost, total_cost, receipt_id) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                [(service_order_id, name, quantity, unit_cost, total_cost, receipt_id) for name, quantity, unit_cost, total_cost in items],
             )
             connection.commit()
+        finally:
+            connection.close()
+
+    def add_receipt(self, service_order_id: int, total_cost: int, items: list[tuple[str, str | None, float | None, int | None, int | None]]) -> Receipt:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "INSERT INTO receipts (service_order_id, total_cost) VALUES (?, ?)",
+                (service_order_id, total_cost),
+            )
+            receipt_id = int(cursor.lastrowid)
+            connection.executemany(
+                "INSERT INTO part_items (service_order_id, name, article, quantity, unit_cost, total_cost, receipt_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(service_order_id, name, article, quantity, unit_cost, item_total, receipt_id) for name, article, quantity, unit_cost, item_total in items],
+            )
+            connection.execute(
+                "UPDATE service_orders SET parts_cost = parts_cost + ? WHERE id = ?",
+                (total_cost, service_order_id),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT id, service_order_id, total_cost, created_at FROM receipts WHERE id = ?",
+                (receipt_id,),
+            ).fetchone()
+            return Receipt(**dict(row))
+        finally:
+            connection.close()
+
+    def get_recent_receipts_for_telegram_user(self, telegram_id: int, limit: int = 10) -> list[ReceiptOverview]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT r.id, r.service_order_id, r.total_cost, r.created_at,
+                          c.brand, c.model, c.plate_number, cu.full_name AS customer_name
+                   FROM receipts r
+                   JOIN service_orders o ON o.id = r.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   JOIN users u ON u.id = c.user_id
+                   WHERE u.telegram_id = ?
+                   ORDER BY r.id DESC LIMIT ?""",
+                (telegram_id, limit),
+            ).fetchall()
+            result: list[ReceiptOverview] = []
+            for row in rows:
+                item_rows = connection.execute(
+                    """SELECT id, service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent
+                       FROM part_items WHERE receipt_id = ? ORDER BY id""",
+                    (row["id"],),
+                ).fetchall()
+                result.append(
+                    ReceiptOverview(
+                        receipt=Receipt(row["id"], row["service_order_id"], row["total_cost"], row["created_at"]),
+                        brand=row["brand"],
+                        model=row["model"],
+                        plate_number=row["plate_number"],
+                        customer_name=row["customer_name"],
+                        items=[PartItem(**dict(item)) for item in item_rows],
+                    )
+                )
+            return result
+        finally:
+            connection.close()
+
+    def update_receipt_total(self, user_id: int, receipt_id: int, total_cost: int) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT r.total_cost, r.service_order_id FROM receipts r
+                   JOIN service_orders o ON o.id = r.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   WHERE r.id = ? AND c.user_id = ?""",
+                (receipt_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            difference = total_cost - int(row["total_cost"])
+            connection.execute("UPDATE receipts SET total_cost = ? WHERE id = ?", (total_cost, receipt_id))
+            connection.execute(
+                "UPDATE service_orders SET parts_cost = MAX(0, parts_cost + ?) WHERE id = ?",
+                (difference, row["service_order_id"]),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def delete_receipt(self, user_id: int, receipt_id: int) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT r.total_cost, r.service_order_id FROM receipts r
+                   JOIN service_orders o ON o.id = r.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   WHERE r.id = ? AND c.user_id = ?""",
+                (receipt_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            marked_items = connection.execute(
+                "SELECT total_cost, markup_percent FROM part_items WHERE receipt_id = ? AND markup_percent IS NOT NULL",
+                (receipt_id,),
+            ).fetchall()
+            receipt_revenue = sum(
+                int(item["total_cost"] or 0)
+                + int(float(item["total_cost"] or 0) * float(item["markup_percent"]) / 100 + 0.5)
+                for item in marked_items
+            )
+            connection.execute("DELETE FROM receipts WHERE id = ?", (receipt_id,))
+            connection.execute(
+                """UPDATE service_orders
+                   SET parts_cost = MAX(0, parts_cost - ?),
+                       parts_revenue = MAX(0, parts_revenue - ?)
+                   WHERE id = ?""",
+                (row["total_cost"], receipt_revenue, row["service_order_id"]),
+            )
+            connection.commit()
+            return True
         finally:
             connection.close()
 
@@ -619,7 +985,7 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT id, service_order_id, name, quantity, unit_cost, total_cost, markup_percent FROM part_items WHERE service_order_id = ? ORDER BY id",
+                "SELECT id, service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent FROM part_items WHERE service_order_id = ? ORDER BY id",
                 (service_order_id,),
             ).fetchall()
             return [PartItem(**dict(row)) for row in rows]
@@ -643,6 +1009,40 @@ class Database:
                 )
                 connection.commit()
             return len(rows), purchase_cost, profit
+        finally:
+            connection.close()
+
+    def apply_markup_to_receipt(self, user_id: int, receipt_id: int, percent: float) -> tuple[int, int, int, int] | None:
+        """Apply markup once to one receipt and add its selling price to the order."""
+        connection = self.connect()
+        try:
+            receipt = connection.execute(
+                """SELECT r.service_order_id FROM receipts r
+                   JOIN service_orders o ON o.id = r.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   WHERE r.id = ? AND c.user_id = ?""",
+                (receipt_id, user_id),
+            ).fetchone()
+            if receipt is None:
+                return None
+            rows = connection.execute(
+                """SELECT id, total_cost FROM part_items
+                   WHERE receipt_id = ? AND markup_percent IS NULL AND total_cost IS NOT NULL""",
+                (receipt_id,),
+            ).fetchall()
+            purchase_cost = sum(int(row["total_cost"]) for row in rows)
+            markup_profit = sum(int(float(row["total_cost"]) * percent / 100 + 0.5) for row in rows)
+            if rows:
+                connection.execute(
+                    "UPDATE part_items SET markup_percent = ? WHERE receipt_id = ? AND markup_percent IS NULL",
+                    (percent, receipt_id),
+                )
+                connection.execute(
+                    "UPDATE service_orders SET parts_revenue = parts_revenue + ? WHERE id = ?",
+                    (purchase_cost + markup_profit, receipt["service_order_id"]),
+                )
+                connection.commit()
+            return int(receipt["service_order_id"]), len(rows), purchase_cost, markup_profit
         finally:
             connection.close()
 
