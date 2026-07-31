@@ -45,6 +45,11 @@ class WorkshopCommand:
     order_id: int | None
     order_status: str | None
     appointment_start: str | None
+    concern: str | None
+    agreed_amount: int | None
+    recommendations: str | None
+    next_service_date: str | None
+    next_service_mileage: int | None
 
 
 @dataclass(frozen=True)
@@ -87,13 +92,18 @@ COMMAND_SCHEMA = {
             "order_id": {"type": ["integer", "null"]},
             "order_status": {
                 "anyOf": [
-                    {"type": "string", "enum": ["in_progress", "completed"]},
+                    {"type": "string", "enum": ["planned", "in_progress", "ready"]},
                     {"type": "null"},
                 ]
             },
             "appointment_start": {"type": ["string", "null"]},
+            "concern": {"type": ["string", "null"], "description": "Причина обращения или жалоба клиента до начала работ."},
+            "agreed_amount": {"type": ["integer", "null"], "minimum": 0, "description": "Сумма, заранее озвученная или согласованная с клиентом."},
+            "recommendations": {"type": ["string", "null"], "description": "Что рекомендуется сделать при следующем визите."},
+            "next_service_date": {"type": ["string", "null"], "description": "Дата следующего ТО в ISO 8601, если названа."},
+            "next_service_mileage": {"type": ["integer", "null"], "description": "Пробег следующего ТО, если назван."},
         },
-        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status", "appointment_start"],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status", "appointment_start", "concern", "agreed_amount", "recommendations", "next_service_date", "next_service_mileage"],
         "additionalProperties": False,
     },
 }
@@ -199,11 +209,11 @@ intent:
 - upsert_customer: добавляют или меняют имя, телефон либо данные автомобиля, без работ;
 - create_order: описывают новый визит, выполненные работы, оплату или запчасти;
 - update_order: дополняют уже существующий заказ для указанной машины (например «добавь фильтр»); суммы должны быть только добавляемыми суммами;
-- set_order_status: меняют статус заказа («выполнен», «в работе»). Фразы «закрой заказ», «заверши заказ», «машина готова», «ремонт закончен», «Kia Rio готова» означают order_status=completed. Фразы «открой заказ», «снова в работе» означают order_status=in_progress. Если назван номер заказа, заполни order_id;
+- set_order_status: меняют статус заказа. Фразы «закрой заказ», «заверши заказ», «машина готова», «ремонт закончен», «Kia Rio готова» означают order_status=ready. Фразы «машина приехала», «принял машину», «в работу», «снова в работе» означают order_status=in_progress. Если назван номер заказа, заполни order_id;
 - list_orders: просят показать заказ-наряды/историю;
 - delete_customer, delete_car, delete_order: просят удалить клиента, автомобиль или заказ; извлеки максимум идентификаторов;
 - unknown: запрос не относится к CRM.
-Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет."""
+Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет. Причину первоначального обращения положи в concern. Фразы «озвучил», «согласовали», «предварительно будет стоить» относятся к agreed_amount. Советы на следующий визит положи в recommendations. Дату или пробег следующего ТО положи в next_service_date/next_service_mileage."""
     now = datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="minutes")
     payload = {
         "model": model,

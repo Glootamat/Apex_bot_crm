@@ -25,3 +25,14 @@ def create_backup(database_path: Path, backup_dir: Path, retention_days: int = 3
         if file != destination and datetime.fromtimestamp(file.stat().st_mtime) < threshold:
             file.unlink()
     return destination
+
+
+def verify_backup(database_path: Path) -> None:
+    """Raise when a newly-created SQLite backup cannot be read cleanly."""
+    connection = sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True)
+    try:
+        result = connection.execute("PRAGMA integrity_check").fetchone()
+        if result is None or result[0] != "ok":
+            raise RuntimeError(f"Backup integrity check failed: {result}")
+    finally:
+        connection.close()

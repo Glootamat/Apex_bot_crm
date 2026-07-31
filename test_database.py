@@ -165,6 +165,82 @@ class DatabaseTest(unittest.TestCase):
             db.set_order_status(order.id, "completed")
             self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4002), [])
 
+    def test_appointment_arrival_creates_order_with_concern_and_agreed_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4003, "Master", None)
+            customer_id = db.add_customer(user_id, "Sergey", "+7 999 000-00-00")
+            car_id = db.add_car(user_id, "Lada", "Vesta", customer_id=customer_id)
+            appointment_id = db.add_appointment(
+                car_id, "Стук спереди", "2026-08-02T11:00:00+03:00", agreed_amount=5000
+            )
+
+            order = db.start_appointment(user_id, appointment_id)
+
+            self.assertIsNotNone(order)
+            self.assertEqual(order.status, "in_progress")
+            self.assertEqual(order.concern, "Стук спереди")
+            self.assertEqual(order.agreed_amount, 5000)
+            ready = db.set_order_status(order.id, "ready", user_id)
+            self.assertEqual(ready.status, "ready")
+            self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4003), [])
+
+    def test_archive_and_audit_keep_order_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4004, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            order = db.add_service_order(car_id, "Замена масла", 1500, 0, 0)
+
+            self.assertTrue(db.delete_service_order(user_id, order.id))
+            self.assertEqual(db.get_recent_orders_for_telegram_user(4004), [])
+            self.assertEqual(db.get_archived(user_id)[0]["id"], order.id)
+            self.assertEqual(db.get_audit_log(user_id)[0]["action"], "archived")
+
+    def test_archive_can_be_purged_manually_or_after_retention_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4006, "Master", None)
+            old_car = db.add_car(user_id, "Kia", "Rio")
+            old_order = db.add_service_order(old_car, "Old service", 1000, 0, 0)
+            new_car = db.add_car(user_id, "Lada", "Vesta")
+            new_order = db.add_service_order(new_car, "Recent service", 1000, 0, 0)
+            db.delete_service_order(user_id, old_order.id)
+            db.delete_service_order(user_id, new_order.id)
+            connection = db.connect()
+            try:
+                connection.execute(
+                    "UPDATE service_orders SET archived_at = datetime('now', '-31 days') WHERE id = ?",
+                    (old_order.id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            deleted = db.purge_archived(user_id, older_than_days=30)
+
+            self.assertEqual(deleted["orders"], 1)
+            self.assertEqual(db.count_archived(user_id)["orders"], 1)
+            self.assertEqual(db.purge_archived(user_id)["orders"], 1)
+            self.assertEqual(db.count_archived(user_id)["orders"], 0)
+
+    def test_phone_and_plate_are_normalized_for_future_deduplication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4005, "Master", None)
+            db.add_customer(user_id, "Ivan", "8 (999) 000-00-00")
+            db.add_car(user_id, "Kia", "Rio", plate_number="а 123 аа 77")
+            connection = db.connect()
+            try:
+                self.assertEqual(connection.execute("SELECT phone_normalized FROM customers").fetchone()[0], "79990000000")
+                self.assertEqual(connection.execute("SELECT plate_normalized FROM cars").fetchone()[0], "А123АА77")
+            finally:
+                connection.close()
+
     def test_receipt_parts_are_saved_and_added_to_cost(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

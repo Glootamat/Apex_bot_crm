@@ -9,14 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.methods import SendMessage, SendPhoto, SendDocument
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
-from backup import create_backup
+from backup import create_backup, verify_backup
 from database import Database, ServiceOrder
 from openrouter import OpenRouterError, WorkshopCommand, analyze_receipt_image, parse_workshop_command, transcribe_voice
 
@@ -25,6 +27,31 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 db = Database(BASE_DIR / "workshop.sqlite3")
 router = Router()
+
+
+class IncomingMessageTracker(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.from_user:
+            text = event.text or event.caption or "[медиа/голосовое]"
+            db.log_incoming_message(event.from_user.id, text, event.message_id)
+            db.remember_chat_message(event.chat.id, event.message_id, important=False)
+        return await handler(event, data)
+
+
+class OutgoingMessageTracker(BaseRequestMiddleware):
+    IMPORTANT_PREFIXES = (
+        "📋 Заказ-наряд", "✅ Заказ-наряд", "🤖 Запись создана",
+        "✅ Запись #", "🚘 Машина приехала", "✅ Стоимость сохранена",
+        "✅ Статус заказ-наряда",
+    )
+
+    async def __call__(self, make_request, bot, method):
+        result = await make_request(bot, method)
+        if isinstance(result, Message) and isinstance(method, (SendMessage, SendPhoto, SendDocument)):
+            text = (getattr(method, "text", None) or getattr(method, "caption", None) or "")
+            important = isinstance(method, (SendPhoto, SendDocument)) or text.startswith(self.IMPORTANT_PREFIXES)
+            db.remember_chat_message(result.chat.id, result.message_id, important=important)
+        return result
 
 try:
     ADMIN_ID = int(os.environ["ADMIN_ID"])
@@ -229,7 +256,12 @@ def money(value: int) -> str:
 
 
 def order_status_label(status: str) -> str:
-    return "✅ Выполнен" if status == "completed" else "🟡 В работе"
+    return {
+        "planned": "🗓 Запланирован",
+        "in_progress": "🟡 В работе",
+        "ready": "✅ Готов",
+        "completed": "✅ Готов",
+    }.get(status, status)
 
 
 def appointment_datetime_label(value: datetime) -> str:
@@ -251,7 +283,11 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
         f"{prefix}\n\n"
         f"👤 {order.customer_name or 'Клиент не указан'}\n"
         f"🚘 {car}\n"
-        f"🔧 {order.description}\n\n"
+        + (f"Причина обращения: {order.concern}\n" if order.concern else "")
+        + f"🔧 {order.description}\n"
+        + (f"Согласовано с клиентом: {money(order.agreed_amount)}\n" if order.agreed_amount is not None else "")
+        + (f"Рекомендация: {order.recommendations}\n" if order.recommendations else "")
+        + "\n"
         f"Работы: {money(order.labor_revenue)}\n"
         f"Закупка: {money(order.parts_cost)}\n"
         f"Запчасти клиенту: {money(order.parts_revenue)}\n"
@@ -259,6 +295,13 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
         f"💰 Итого: {money(order.profit)}\n"
         f"Статус: {order_status_label(order.status)}"
     )
+
+
+def appointment_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🚘 Машина приехала · В работу",
+        callback_data=f"appointment:start:{appointment_id}",
+    )]])
 
 
 def openrouter_settings() -> tuple[str, str, str, str, str] | None:
@@ -326,12 +369,18 @@ async def open_order(callback: CallbackQuery) -> None:
         f"Автомобиль: {car}",
         f"Статус: {status}",
         "",
+    ]
+    if order.concern:
+        lines.extend(["💬 Причина обращения:", order.concern, ""])
+    if order.agreed_amount is not None:
+        lines.extend([f"🤝 Согласовано с клиентом: {money(order.agreed_amount)}", ""])
+    lines.extend([
         "🔧 Работы:",
         f"• {order.description}",
         f"Стоимость работ: {money(order.labor_revenue)}",
         "",
         "⚙️ Запчасти:",
-    ]
+    ])
     items = db.get_part_items(order.id)
     if not items:
         lines.append("Запчасти из чеков не добавлены.")
@@ -359,6 +408,17 @@ async def open_order(callback: CallbackQuery) -> None:
         f"Прибыль с запчастей: {money(order.parts_margin)}",
         f"💰 Общая прибыль: {money(order.profit)}",
     ])
+    if order.recommendations:
+        lines.extend(["", "📌 На следующий визит:", order.recommendations])
+    history = [item for item in db.get_car_service_history(order.car_id, limit=6) if item.id != order.id]
+    if history:
+        lines.extend(["", "🕘 Предыдущие обращения:"])
+        for previous in history[:5]:
+            date = previous.completed_at or previous.created_at
+            lines.append(f"• {date[:10]} · #{previous.id} · {previous.description}")
+            previous_parts = db.get_part_items(previous.id)
+            if previous_parts:
+                lines.append("  Детали: " + ", ".join(item.name for item in previous_parts[:6]))
     await callback.message.answer("\n".join(lines), reply_markup=order_detail_keyboard(order.id))
 
 
@@ -409,7 +469,7 @@ async def add_photo_to_order(callback: CallbackQuery, state: FSMContext) -> None
     await state.clear()
     await state.update_data(order_id=order_id, recognize_image=False)
     await state.set_state(AddPhoto.upload)
-    status = "закрытый" if order.status == "completed" else "активный"
+    status = "готовый" if order.status in {"ready", "completed"} else "активный"
     await callback.message.answer(
         f"Отправляйте фото работ в {status} заказ #{order_id} · "
         f"{order.brand} {order.model}. Можно добавить подпись к каждому фото.",
@@ -492,7 +552,7 @@ async def show_search_result(message: Message, query: str) -> None:
             details.append(f"{item['mileage']} км")
         lines.append(f"\nАвтомобиль: {title}" + (f" · {item['customer_name']}" if item["customer_name"] else "") + (f"\n{' · '.join(details)}" if details else ""))
     for item in result["orders"]:
-        status = "Выполнен" if item["status"] == "completed" else "В работе"
+        status = order_status_label(str(item["status"]))
         lines.append(f"\nЗаказ #{item['id']}: {item['brand']} {item['model']} · {item['description']}\nСтатус: {status}")
     await message.answer("\n".join(lines), reply_markup=main_keyboard)
     for item in result["orders"]:
@@ -558,12 +618,12 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
         car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
         order = db.get_service_order(command.order_id) if command.order_id else (db.get_latest_order_for_car(car.id) if car else None)
         if order is None or command.order_status is None:
-            await message.answer("Укажите номер заказ-наряда или автомобиль и статус: «в работе» либо «выполнен».")
+            await message.answer("Укажите номер заказ-наряда или автомобиль и статус: «в работе» либо «готов».")
             return
-        if command.order_status == "completed" and order.labor_revenue <= 0:
+        if command.order_status == "ready" and order.labor_revenue <= 0:
             await close_order_or_request_cost(message, state, order)
             return
-        updated = db.set_order_status(order.id, command.order_status)
+        updated = db.set_order_status(order.id, command.order_status, owner_id)
         await message.answer(order_summary(updated, "✅ Статус заказ-наряда обновлён"), reply_markup=main_keyboard)
         return
     if command.intent == "markup_parts":
@@ -601,6 +661,12 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
             command.parts_profit,
             add_amounts=False,
         )
+        if command.concern or command.agreed_amount is not None or command.recommendations:
+            updated = db.update_order_crm_fields(
+                updated.id, owner_id, concern=command.concern,
+                agreed_amount=command.agreed_amount,
+                recommendations=command.recommendations,
+            )
         await message.answer(
             order_summary(updated, "✅ Заказ-наряд изменён"),
             reply_markup=action_keyboard("order", updated.id),
@@ -620,10 +686,10 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
     if car is None and customer_id is not None:
         car = db.find_single_car_for_customer(owner_id, customer_id)
     if car is None and command.car_brand and command.car_model:
-        car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id, command.vin, command.mileage)
+        car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id, command.vin, command.mileage, command.next_service_date, command.next_service_mileage)
     elif car is not None:
         car_id = car.id
-        db.update_car(car_id, customer_id, command.car_brand, command.car_model, command.car_year, plate, command.vin, command.mileage)
+        db.update_car(car_id, customer_id, command.car_brand, command.car_model, command.car_year, plate, command.vin, command.mileage, command.next_service_date, command.next_service_mileage)
     else:
         car_id = None
 
@@ -639,7 +705,8 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
             await message.answer("Не удалось разобрать дату и время записи. Ничего не сохранено.")
             return
         appointment_id = db.add_appointment(
-            car_id, command.description, starts_at.isoformat()
+            car_id, command.concern or command.description, starts_at.isoformat(),
+            agreed_amount=command.agreed_amount,
         )
         await message.answer(
             f"✅ Запись #{appointment_id} создана\n"
@@ -647,8 +714,9 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
             f"Клиент: {command.customer_name or 'не указан'}\n"
             f"Автомобиль: {command.car_brand or ''} {command.car_model or ''}"
             + (f" · {plate}" if plate else "")
-            + f"\nРаботы: {command.description}",
-            reply_markup=main_keyboard,
+            + f"\nПричина обращения: {command.concern or command.description}"
+            + (f"\nСогласовано: {money(command.agreed_amount)}" if command.agreed_amount is not None else ""),
+            reply_markup=appointment_keyboard(appointment_id),
         )
         return
 
@@ -667,7 +735,13 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
         if not command.description:
             await message.answer("Напишите, какие работы выполнены — тогда создам заказ-наряд.")
             return
-        order = db.add_service_order(car_id, command.description, command.labor_revenue or 0, command.parts_cost or 0, command.parts_revenue or 0, command.parts_profit or 0)
+        order = db.add_service_order(
+            car_id, command.description, command.labor_revenue or 0,
+            command.parts_cost or 0, command.parts_revenue or 0,
+            command.parts_profit or 0, concern=command.concern,
+            agreed_amount=command.agreed_amount,
+            recommendations=command.recommendations,
+        )
         await message.answer(order_summary(order, "🤖 Запись создана автоматически"), reply_markup=main_keyboard)
         return
 
@@ -677,6 +751,12 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
             await message.answer("У этого автомобиля пока нет заказ-нарядов. Опишите выполненные работы, и я создам первый.")
             return
         updated = db.update_service_order(order.id, command.description, command.labor_revenue, command.parts_cost, command.parts_revenue, command.parts_profit, add_amounts=True)
+        if command.concern or command.agreed_amount is not None or command.recommendations:
+            updated = db.update_order_crm_fields(
+                updated.id, owner_id, concern=command.concern,
+                agreed_amount=command.agreed_amount,
+                recommendations=command.recommendations,
+            )
         await message.answer(order_summary(updated, "✅ Заказ-наряд дополнен"), reply_markup=main_keyboard)
 
 
@@ -701,7 +781,7 @@ async def request_delete(message: Message, command: WorkshopCommand, owner_id: i
         return
     await state.set_state(ConfirmDelete.waiting)
     await state.update_data(delete_kind=command.intent, delete_id=target_id)
-    await message.answer(f"Подтвердите: удалить {label}? Это действие нельзя отменить.", reply_markup=confirm_delete_keyboard)
+    await message.answer(f"Подтвердите: переместить в архив {label}? Запись останется в журнале.", reply_markup=confirm_delete_keyboard)
 
 
 @router.message(CommandStart())
@@ -754,7 +834,27 @@ async def appointments_button(message: Message) -> None:
             f"👤 {appointment.customer_name or 'Клиент не указан'}"
             + (f" · {appointment.customer_phone}" if appointment.customer_phone else "")
             + f"\n🚘 {car}\n"
-            f"🔧 {appointment.description}"
+            f"Причина обращения: {appointment.description}"
+            + (f"\nСогласовано: {money(appointment.agreed_amount)}" if appointment.agreed_amount is not None else ""),
+            reply_markup=appointment_keyboard(appointment.id) if appointment.status == "scheduled" else None,
+        )
+
+
+@router.callback_query(F.data.startswith("appointment:start:"))
+async def start_appointment(callback: CallbackQuery) -> None:
+    appointment_id = int(callback.data.rsplit(":", 1)[1])
+    owner_id = db.add_or_update_user(
+        callback.from_user.id, callback.from_user.full_name, callback.from_user.username
+    )
+    order = db.start_appointment(owner_id, appointment_id)
+    if order is None:
+        await callback.answer("Запись не найдена или уже завершена.", show_alert=True)
+        return
+    await callback.answer("Машина принята в работу")
+    if callback.message:
+        await callback.message.answer(
+            order_summary(order, "🚘 Машина приехала · заказ создан"),
+            reply_markup=order_detail_keyboard(order.id),
         )
 
 
@@ -770,7 +870,7 @@ async def close_order_or_request_cost(
             reply_markup=cancel_keyboard,
         )
         return
-    closed = db.set_order_status(order.id, "completed")
+    closed = db.set_order_status(order.id, "ready")
     await state.clear()
     await message.answer(order_summary(closed, "✅ Заказ-наряд закрыт"), reply_markup=main_keyboard)
 
@@ -818,7 +918,7 @@ async def close_order_cost(message: Message, state: FSMContext) -> None:
     updated = db.update_service_order(
         order_id, None, int(digits), None, None, None, add_amounts=False
     )
-    closed = db.set_order_status(updated.id, "completed")
+    closed = db.set_order_status(updated.id, "ready")
     await state.clear()
     await message.answer(order_summary(closed, "✅ Стоимость сохранена, заказ закрыт"), reply_markup=main_keyboard)
 
@@ -839,7 +939,7 @@ async def customers_button(message: Message) -> None:
         for item in overview.cars:
             car = item.car
             title = f"{car.brand} {car.model}" + (f" · {car.plate_number}" if car.plate_number else " · без номера")
-            lines.append(f"{title}\nЗаказов: {item.orders_total} · В работе: {item.in_progress} · Выполнено: {item.completed}")
+            lines.append(f"{title}\nЗаказов: {item.orders_total} · В работе: {item.in_progress} · Готово: {item.completed}")
         await message.answer(
             "\n".join(lines),
             reply_markup=customer_action_keyboard(customer.id, has_phone=bool(customer.phone)),
@@ -872,7 +972,7 @@ async def handle_order_reminder(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Заказ не найден.", show_alert=True)
         return
     if action == "close":
-        if order.status == "completed":
+        if order.status in {"ready", "completed"}:
             await callback.answer("Заказ уже закрыт.")
             return
         if callback.message:
@@ -967,13 +1067,15 @@ async def edit_record_value(message: Message, state: FSMContext) -> None:
             if car is not None:
                 db.update_car(
                     car.id, record_id, parsed.car_brand, parsed.car_model, parsed.car_year,
-                    plate, parsed.vin, parsed.mileage,
+                    plate, parsed.vin, parsed.mileage, parsed.next_service_date,
+                    parsed.next_service_mileage,
                 )
                 car_changed = True
             elif parsed.car_brand and parsed.car_model:
                 db.add_car(
                     owner_id, parsed.car_brand, parsed.car_model, parsed.car_year,
                     plate, record_id, parsed.vin, parsed.mileage,
+                    parsed.next_service_date, parsed.next_service_mileage,
                 )
                 car_changed = True
 
@@ -1012,7 +1114,7 @@ async def delete_record(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            f"Подтвердите удаление: {labels.get(kind, 'запись')}? Это действие нельзя отменить.",
+            f"Переместить в архив: {labels.get(kind, 'запись')}? Запись останется в журнале.",
             reply_markup=confirm_delete_keyboard,
         )
 
@@ -1057,7 +1159,31 @@ async def cancel(message: Message, state: FSMContext) -> None:
 async def confirm_delete(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     owner_id = current_user_id(message)
-    kind, target_id = data["delete_kind"], int(data["delete_id"])
+    kind = data["delete_kind"]
+    if kind == "purge_archive":
+        backup_dir = Path(os.getenv("BACKUP_DIR", BASE_DIR / "backups"))
+        retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))
+        try:
+            backup_path = await asyncio.to_thread(
+                create_backup, BASE_DIR / "workshop.sqlite3", backup_dir, retention_days
+            )
+            await asyncio.to_thread(verify_backup, backup_path)
+            deleted = db.purge_archived(owner_id)
+        except Exception as error:
+            await state.clear()
+            await message.answer(
+                f"⚠️ Архив не очищен: резервная копия не прошла проверку ({type(error).__name__}).",
+                reply_markup=main_keyboard,
+            )
+            return
+        await state.clear()
+        await message.answer(
+            "✅ Архив очищен безвозвратно после создания резервной копии.\n"
+            f"Заказов: {deleted['orders']} · автомобилей: {deleted['cars']} · клиентов: {deleted['customers']}",
+            reply_markup=main_keyboard,
+        )
+        return
+    target_id = int(data["delete_id"])
     if kind == "delete_customer":
         deleted = db.delete_customer(owner_id, target_id)
     elif kind == "delete_car":
@@ -1067,7 +1193,7 @@ async def confirm_delete(message: Message, state: FSMContext) -> None:
     else:
         deleted = db.delete_service_order(owner_id, target_id)
     await state.clear()
-    await message.answer("✅ Удалено." if deleted else "Запись уже удалена или не найдена.", reply_markup=main_keyboard)
+    await message.answer("✅ Перемещено в архив." if deleted else "Запись уже в архиве или не найдена.", reply_markup=main_keyboard)
 
 
 @router.message(ConfirmDelete.waiting)
@@ -1363,7 +1489,58 @@ async def ai_usage(message: Message) -> None:
 
 async def process_text(message: Message, text: str, state: FSMContext) -> None:
     assert message.from_user is not None
-    db.log_incoming_message(message.from_user.id, text)
+    normalized_request = text.casefold().replace("ё", "е")
+    owner_id = current_user_id(message)
+    if "очист" in normalized_request and "архив" in normalized_request:
+        counts = db.count_archived(owner_id)
+        total = sum(counts.values())
+        if total == 0:
+            await message.answer("Архив уже пуст.")
+            return
+        await state.set_state(ConfirmDelete.waiting)
+        await state.update_data(delete_kind="purge_archive")
+        await message.answer(
+            "Безвозвратно очистить весь архив? Перед удалением будет создана и проверена резервная копия.\n"
+            f"Заказов: {counts['orders']} · автомобилей: {counts['cars']} · клиентов: {counts['customers']}",
+            reply_markup=confirm_delete_keyboard,
+        )
+        return
+    if "журнал измен" in normalized_request or "что изменял" in normalized_request:
+        entries = db.get_audit_log(owner_id)
+        if not entries:
+            await message.answer("Журнал изменений пока пуст.")
+            return
+        labels = {"order": "заказ", "car": "автомобиль", "customer": "клиент"}
+        lines = ["🕘 Последние изменения:"]
+        for entry in entries:
+            title = labels.get(str(entry["entity_type"]), str(entry["entity_type"]))
+            details = f" · {entry['details']}" if entry["details"] else ""
+            lines.append(f"{str(entry['created_at'])[:16]} · {title} #{entry['entity_id']} · {entry['action']}{details}")
+        await message.answer("\n".join(lines))
+        return
+    if normalized_request.strip() in {"покажи архив", "архив", "что в архиве"}:
+        entries = db.get_archived(owner_id)
+        if not entries:
+            await message.answer("Архив пуст.")
+            return
+        lines = ["🗄 Архив заказов:"]
+        for entry in entries:
+            car = f"{entry['brand']} {entry['model']}" + (f" · {entry['plate_number']}" if entry["plate_number"] else "")
+            lines.append(f"#{entry['id']} · {car} · {entry['description']} · {str(entry['archived_at'])[:16]}")
+        await message.answer("\n".join(lines))
+        return
+    if "давно не приезжал" in normalized_request or "давно не приезжали" in normalized_request:
+        entries = db.get_inactive_customers(owner_id)
+        if not entries:
+            await message.answer("Нет клиентов без визита более 180 дней.")
+            return
+        lines = ["📭 Клиенты без визита более 180 дней:"]
+        for entry in entries:
+            last_visit = str(entry["last_visit"])[:10] if entry["last_visit"] else "визитов ещё не было"
+            car = f"{entry['brand']} {entry['model']}" + (f" · {entry['plate_number']}" if entry["plate_number"] else "")
+            lines.append(f"• {entry['full_name']} · {car} · {last_visit}")
+        await message.answer("\n".join(lines))
+        return
     settings = openrouter_settings()
     if settings is None:
         await message.answer("Добавьте OPENROUTER_API_KEY в .env и перезапустите бота.")
@@ -1484,15 +1661,81 @@ async def main() -> None:
     async def backup_loop() -> None:
         while True:
             try:
-                await asyncio.to_thread(create_backup, BASE_DIR / "workshop.sqlite3", backup_dir, retention_days)
-            except Exception:
-                pass
+                backup_path = await asyncio.to_thread(
+                    create_backup, BASE_DIR / "workshop.sqlite3", backup_dir, retention_days
+                )
+                await asyncio.to_thread(verify_backup, backup_path)
+            except Exception as error:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Не удалось создать или проверить резервную копию CRM: {type(error).__name__}: {error}",
+                )
             await asyncio.sleep(24 * 60 * 60)
+
+    async def chat_cleanup_loop() -> None:
+        if os.getenv("CHAT_CLEANUP_ENABLED", "true").casefold() not in {"1", "true", "yes", "да"}:
+            return
+        timezone = ZoneInfo("Europe/Moscow")
+        cleanup_hour = int(os.getenv("CHAT_CLEANUP_HOUR", "23"))
+        while True:
+            now = datetime.now(timezone)
+            if now.hour == cleanup_hour and now.minute >= 50:
+                deleted: list[int] = []
+                for message_id in db.get_disposable_chat_messages(ADMIN_ID):
+                    try:
+                        await bot.delete_message(ADMIN_ID, message_id)
+                        deleted.append(message_id)
+                    except Exception:
+                        # Telegram can refuse old/service messages; they remain for a later manual cleanup.
+                        continue
+                db.forget_chat_messages(ADMIN_ID, deleted)
+            await asyncio.sleep(60)
+
+    async def archive_cleanup_loop() -> None:
+        archive_days = int(os.getenv("ARCHIVE_RETENTION_DAYS", "30"))
+        timezone = ZoneInfo("Europe/Moscow")
+        while True:
+            now = datetime.now(timezone)
+            claim = f"archive-cleanup:{now.date().isoformat()}"
+            if now.hour == 3 and db.claim_daily_reminder(claim):
+                owner = db.add_or_update_user(ADMIN_ID, "CRM owner", None)
+                counts = db.count_archived(owner, older_than_days=archive_days)
+                if sum(counts.values()) > 0:
+                    try:
+                        backup_path = await asyncio.to_thread(
+                            create_backup, BASE_DIR / "workshop.sqlite3", backup_dir, retention_days
+                        )
+                        await asyncio.to_thread(verify_backup, backup_path)
+                        db.purge_archived(owner, older_than_days=archive_days)
+                    except Exception as error:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            "⚠️ Автоочистка архива отменена: не удалось создать или проверить "
+                            f"резервную копию ({type(error).__name__}: {error}).",
+                        )
+            await asyncio.sleep(60)
 
     async def unfinished_orders_reminder_loop() -> None:
         timezone = ZoneInfo("Europe/Moscow")
         while True:
             now = datetime.now(timezone)
+            service_claim = f"service:{now.date().isoformat()}"
+            if now.hour == 9 and db.claim_daily_reminder(service_claim):
+                owner = db.add_or_update_user(ADMIN_ID, "CRM owner", None)
+                due = db.get_due_services(owner)
+                if due:
+                    lines = ["🔔 Ближайшее ТО:"]
+                    for item in due:
+                        car = f"{item['brand']} {item['model']}" + (
+                            f" · {item['plate_number']}" if item["plate_number"] else ""
+                        )
+                        reason = []
+                        if item["next_service_date"]:
+                            reason.append(f"дата {str(item['next_service_date'])[:10]}")
+                        if item["next_service_mileage"]:
+                            reason.append(f"пробег {item['next_service_mileage']} км")
+                        lines.append(f"• {item['customer_name'] or 'Клиент не указан'} · {car} · {', '.join(reason)}")
+                    await bot.send_message(ADMIN_ID, "\n".join(lines))
             if now.hour == 20 and db.claim_daily_reminder(now.date().isoformat()):
                 orders = [
                     order
@@ -1515,10 +1758,14 @@ async def main() -> None:
             await asyncio.sleep(60)
 
     bot = Bot(token=token)
+    bot.session.middleware(OutgoingMessageTracker())
     dispatcher = Dispatcher()
+    router.message.outer_middleware(IncomingMessageTracker())
     dispatcher.include_router(router)
     asyncio.create_task(backup_loop())
     asyncio.create_task(unfinished_orders_reminder_loop())
+    asyncio.create_task(chat_cleanup_loop())
+    asyncio.create_task(archive_cleanup_loop())
     await dispatcher.start_polling(bot)
 
 
