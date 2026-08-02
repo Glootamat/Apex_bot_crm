@@ -43,6 +43,22 @@ class DatabaseTest(unittest.TestCase):
             car = db.find_car(user_id, "kia", "rio", "а123аа77")
             self.assertEqual(car.id, car_id)
 
+    def test_phone_only_customer_can_be_named_after_first_visit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(457, "Мастер", None)
+
+            provisional = db.find_or_add_customer_by_phone(user_id, "8 (988) 601-26-50")
+            self.assertEqual(provisional.full_name, "Клиент +79886012650")
+
+            enriched = db.find_or_add_customer_by_phone(
+                user_id, "+7 988 601 26 50", "Алексей"
+            )
+            self.assertEqual(enriched.id, provisional.id)
+            self.assertEqual(enriched.full_name, "Алексей")
+            self.assertEqual(len(db.get_customers_for_telegram_user(457)), 1)
+
     def test_existing_order_can_be_completed_later(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -149,6 +165,45 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(appointment.customer_name, "Sergey")
             self.assertEqual(appointment.brand, "Lada")
 
+    def test_flexible_appointment_is_marked_as_all_day(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4011, "Master", None)
+            car_id = db.add_car(user_id, "Opel", "Astra")
+            db.add_appointment(
+                car_id, "Замена масла", "2026-08-03T12:00:00+03:00", is_flexible=True
+            )
+
+            appointment = db.get_upcoming_appointments_for_telegram_user(4011)[0]
+            self.assertEqual(appointment.is_flexible, 1)
+
+    def test_duplicate_active_appointment_returns_existing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4012, "Master", None)
+            car_id = db.add_car(user_id, "Nissan", "Teana")
+
+            first_id = db.add_appointment(
+                car_id, "Диагностика", "2026-08-03T12:00:00+03:00"
+            )
+            repeated_id = db.add_appointment(
+                car_id, "диагностика", "2026-08-03T12:00:00+03:00"
+            )
+
+            self.assertEqual(repeated_id, first_id)
+            self.assertEqual(len(db.get_upcoming_appointments_for_telegram_user(4012)), 1)
+            repeated = db.save_appointment(
+                car_id, "Диагностика", "2026-08-03T12:00:00+03:00"
+            )
+            self.assertFalse(repeated.created)
+            self.assertEqual(repeated.id, first_id)
+            self.assertEqual(
+                db.find_active_appointment_id(car_id, "2026-08-03T12:00:00+03:00"),
+                first_id,
+            )
+
     def test_completed_order_is_hidden_from_appointments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -185,6 +240,30 @@ class DatabaseTest(unittest.TestCase):
             ready = db.set_order_status(order.id, "ready", user_id)
             self.assertEqual(ready.status, "ready")
             self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4003), [])
+
+    def test_appointment_no_show_is_kept_in_history_and_excluded_from_finances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4010, "Master", None)
+            customer_id = db.add_customer(user_id, "Repeat No-show", "+79990000010")
+            car_id = db.add_car(user_id, "Lada", "Vesta", customer_id=customer_id)
+            appointment_id = db.add_appointment(
+                car_id, "Диагностика", "2026-08-02T11:00:00+03:00", agreed_amount=5000
+            )
+
+            no_show = db.mark_appointment_no_show(user_id, appointment_id)
+
+            self.assertIsNotNone(no_show)
+            self.assertEqual(no_show.status, "no_show")
+            self.assertEqual(no_show.labor_revenue, 0)
+            self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4010), [])
+            self.assertEqual(db.get_car_service_history(car_id)[0].status, "no_show")
+            report = db.get_report_for_telegram_user(4010)
+            self.assertEqual(report.orders, 0)
+            self.assertEqual(report.revenue, 0)
+            self.assertEqual(report.no_shows, 1)
+            self.assertIsNone(db.mark_appointment_no_show(user_id, appointment_id))
 
     def test_archive_and_audit_keep_order_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

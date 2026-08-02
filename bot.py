@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.methods import SendMessage, SendPhoto, SendDocument
 from aiogram.filters import CommandStart
@@ -42,7 +44,7 @@ class OutgoingMessageTracker(BaseRequestMiddleware):
     IMPORTANT_PREFIXES = (
         "📋 Заказ-наряд", "✅ Заказ-наряд", "🤖 Запись создана",
         "✅ Запись #", "🚘 Машина приехала", "✅ Стоимость сохранена",
-        "✅ Статус заказ-наряда",
+        "✅ Статус заказ-наряда", "Запись #", "🚫 Клиент не приехал", "#",
     )
 
     async def __call__(self, make_request, bot, method):
@@ -255,16 +257,88 @@ def money(value: int) -> str:
     return f"{value:,}".replace(",", "\u00a0") + "\u00a0₽"
 
 
+def fill_contact_and_appointment_from_text(
+    command: WorkshopCommand, text: str
+) -> WorkshopCommand:
+    """Recover phone/date fields deterministically when the AI parser misses them."""
+    values = {name: getattr(command, name) for name in command.__dataclass_fields__}
+
+    if not command.customer_phone:
+        phone_match = re.search(r"(?<!\d)(?:\+?7|8)[\s()\-]*\d{3}[\s()\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)", text)
+        if phone_match:
+            values["customer_phone"] = phone_match.group(0).strip()
+
+    if not command.appointment_start:
+        date_match = re.search(
+            r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2}|\d{4})"
+            r"(?:\s*(?:г(?:ода)?\.?)?)?\s*(?:к|в)?\s*(\d{1,2})[:.](\d{2})(?!\d)",
+            text.casefold(),
+        )
+        if date_match:
+            day, month, year, hour, minute = map(int, date_match.groups())
+            if year < 100:
+                year += 2000
+            try:
+                starts_at = datetime(
+                    year, month, day, hour, minute, tzinfo=ZoneInfo("Europe/Moscow")
+                )
+            except ValueError:
+                pass
+            else:
+                values["appointment_start"] = starts_at.isoformat()
+                if command.intent in {"unknown", "upsert_customer", "create_order"}:
+                    values["intent"] = "create_appointment"
+
+        if not values["appointment_start"]:
+            normalized = text.casefold().replace("ё", "е")
+            date_only = re.search(
+                r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2}|\d{4})(?!\d)",
+                normalized,
+            )
+            if date_only:
+                day, month, year = map(int, date_only.groups())
+                if year < 100:
+                    year += 2000
+                try:
+                    target = datetime(
+                        year, month, day, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                    )
+                except ValueError:
+                    pass
+                else:
+                    values["appointment_start"] = target.isoformat()
+                    if command.intent in {"unknown", "upsert_customer", "create_order"}:
+                        values["intent"] = "create_appointment"
+
+            weekday_names = {
+                "понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3,
+                "пятниц": 4, "суббот": 5, "воскресень": 6,
+            }
+            target_weekday = next(
+                (number for name, number in weekday_names.items() if name in normalized), None
+            )
+            if not values["appointment_start"] and target_weekday is not None:
+                now = datetime.now(ZoneInfo("Europe/Moscow"))
+                days_ahead = (target_weekday - now.weekday()) % 7 or 7
+                target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+                values["appointment_start"] = (target + timedelta(days=days_ahead)).isoformat()
+                if command.intent in {"unknown", "upsert_customer", "create_order"}:
+                    values["intent"] = "create_appointment"
+
+    return WorkshopCommand(**values)
+
+
 def order_status_label(status: str) -> str:
     return {
         "planned": "🗓 Запланирован",
         "in_progress": "🟡 В работе",
         "ready": "✅ Готов",
         "completed": "✅ Готов",
+        "no_show": "🚫 Не приехал",
     }.get(status, status)
 
 
-def appointment_datetime_label(value: datetime) -> str:
+def appointment_datetime_label(value: datetime, is_flexible: bool = False) -> str:
     weekdays = (
         "понедельник",
         "вторник",
@@ -274,7 +348,8 @@ def appointment_datetime_label(value: datetime) -> str:
         "суббота",
         "воскресенье",
     )
-    return f"{value:%d.%m.%Y}, {weekdays[value.weekday()]}, {value:%H:%M}"
+    time_label = "в течение дня" if is_flexible else f"{value:%H:%M}"
+    return f"{value:%d.%m.%Y}, {weekdays[value.weekday()]}, {time_label}"
 
 
 def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд сохранён") -> str:
@@ -298,10 +373,16 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
 
 
 def appointment_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text="🚘 Машина приехала · В работу",
-        callback_data=f"appointment:start:{appointment_id}",
-    )]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🚘 Машина приехала · В работу",
+            callback_data=f"appointment:start:{appointment_id}",
+        )],
+        [InlineKeyboardButton(
+            text="🚫 Клиент не приехал",
+            callback_data=f"appointment:no_show:{appointment_id}",
+        )],
+    ])
 
 
 def openrouter_settings() -> tuple[str, str, str, str, str] | None:
@@ -562,7 +643,9 @@ async def show_search_result(message: Message, query: str) -> None:
         )
 
 
-async def apply_command(message: Message, command: WorkshopCommand, state: FSMContext) -> None:
+async def apply_command(
+    message: Message, command: WorkshopCommand, state: FSMContext, source_text: str = ""
+) -> None:
     if command.intent == "list_orders":
         await show_orders(message)
         return
@@ -605,8 +688,13 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
                     )
                     return
         if not has_car_identity or not command.description:
+            missing = []
+            if not has_car_identity:
+                missing.append("автомобиль — укажите марку и модель, госномер или VIN")
+            if not command.description:
+                missing.append("выполненные работы")
             await message.answer(
-                "Не удалось надёжно выделить автомобиль или работы. Ничего не сохранено — отправьте сообщение ещё раз."
+                "Заказ-наряд не создан. Не хватает данных:\n• " + "\n• ".join(missing)
             )
             return
 
@@ -673,8 +761,13 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
         )
         return
     customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
-    if customer is None and command.customer_name:
-        customer_id = db.add_customer(owner_id, command.customer_name, command.customer_phone)
+    if command.customer_phone:
+        customer = db.find_or_add_customer_by_phone(
+            owner_id, command.customer_phone, command.customer_name
+        )
+        customer_id = customer.id
+    elif customer is None and command.customer_name:
+        customer_id = db.add_customer(owner_id, command.customer_name, None)
     elif customer is not None:
         customer_id = customer.id
         db.update_customer(customer_id, command.customer_name, command.customer_phone)
@@ -694,27 +787,64 @@ async def apply_command(message: Message, command: WorkshopCommand, state: FSMCo
         car_id = None
 
     if command.intent == "create_appointment":
-        if car_id is None or not command.description or not command.appointment_start:
+        appointment_reason = command.concern or command.description
+        starts_at = None
+        if command.appointment_start:
+            try:
+                starts_at = datetime.fromisoformat(command.appointment_start)
+            except ValueError:
+                await message.answer(
+                    "Запись не создана: дата имеет неверный формат. Например: «03.08.2026 в 12:00» "
+                    "или «в понедельник в течение дня»."
+                )
+                return
+
+        is_flexible = not bool(
+            re.search(r"(?<!\d)\d{1,2}[:.]\d{2}(?!\d)", source_text)
+        )
+        if car_id is not None and starts_at is not None:
+            existing_id = db.find_active_appointment_id(car_id, starts_at.isoformat())
+            if existing_id is not None:
+                await message.answer(
+                    f"⚠️ Повторная запись не создана. Запись #{existing_id} для этого автомобиля "
+                    f"на {appointment_datetime_label(starts_at, is_flexible)} уже существует.",
+                    reply_markup=appointment_keyboard(existing_id),
+                )
+                return
+
+        if car_id is None or not appointment_reason or not command.appointment_start:
+            missing = []
+            if car_id is None:
+                missing.append("автомобиль — укажите марку и модель, госномер или VIN")
+            if not appointment_reason:
+                missing.append("причина визита или планируемые работы")
+            if not command.appointment_start:
+                missing.append("дата визита — можно указать точное время или «в течение дня»")
             await message.answer(
-                "Не удалось надёжно определить автомобиль, работы или дату записи. Ничего не сохранено."
+                "Запись не создана. Не хватает данных:\n• " + "\n• ".join(missing)
             )
             return
-        try:
-            starts_at = datetime.fromisoformat(command.appointment_start)
-        except ValueError:
-            await message.answer("Не удалось разобрать дату и время записи. Ничего не сохранено.")
-            return
-        appointment_id = db.add_appointment(
-            car_id, command.concern or command.description, starts_at.isoformat(),
+        assert starts_at is not None
+        saved = db.save_appointment(
+            car_id, appointment_reason, starts_at.isoformat(),
             agreed_amount=command.agreed_amount,
+            is_flexible=is_flexible,
         )
+        appointment_id = saved.id
+        if not saved.created:
+            await message.answer(
+                f"⚠️ Повторная запись не создана. Запись #{appointment_id} для этого автомобиля "
+                f"на {appointment_datetime_label(starts_at, is_flexible)} уже существует.",
+                reply_markup=appointment_keyboard(appointment_id),
+            )
+            return
         await message.answer(
             f"✅ Запись #{appointment_id} создана\n"
-            f"Когда: {appointment_datetime_label(starts_at)}\n"
-            f"Клиент: {command.customer_name or 'не указан'}\n"
+            f"Когда: {appointment_datetime_label(starts_at, is_flexible)}\n"
+            f"Клиент: {(customer.full_name if customer else command.customer_name) or 'не указан'}\n"
             f"Автомобиль: {command.car_brand or ''} {command.car_model or ''}"
             + (f" · {plate}" if plate else "")
-            + f"\nПричина обращения: {command.concern or command.description}"
+            + f"\nПричина обращения: {appointment_reason}"
             + (f"\nСогласовано: {money(command.agreed_amount)}" if command.agreed_amount is not None else ""),
             reply_markup=appointment_keyboard(appointment_id),
         )
@@ -817,12 +947,26 @@ async def orders_button(message: Message) -> None:
 
 @router.message(F.text == APPOINTMENTS)
 async def appointments_button(message: Message) -> None:
+    await show_appointments(message)
+
+
+async def show_appointments(message: Message, target_date: datetime | None = None) -> None:
     assert message.from_user is not None
     appointments = db.get_upcoming_appointments_for_telegram_user(message.from_user.id)
+    if target_date is not None:
+        appointments = [
+            item for item in appointments
+            if datetime.fromisoformat(item.starts_at).date() == target_date.date()
+        ]
     if not appointments:
-        await message.answer("Предстоящих записей пока нет.", reply_markup=main_keyboard)
+        period = "на выбранную дату" if target_date is not None else ""
+        await message.answer(f"Предстоящих записей {period} пока нет.".replace("  ", " "), reply_markup=main_keyboard)
         return
-    await message.answer("📅 Предстоящие записи:", reply_markup=main_keyboard)
+    title = (
+        f"📅 Записи на {target_date:%d.%m.%Y}:"
+        if target_date is not None else "📅 Предстоящие записи:"
+    )
+    await message.answer(title, reply_markup=main_keyboard)
     for appointment in appointments:
         starts_at = datetime.fromisoformat(appointment.starts_at)
         car = f"{appointment.brand} {appointment.model}" + (
@@ -830,7 +974,7 @@ async def appointments_button(message: Message) -> None:
         )
         await message.answer(
             f"Запись #{appointment.id}\n"
-            f"🗓 {appointment_datetime_label(starts_at)}\n"
+            f"🗓 {appointment_datetime_label(starts_at, bool(appointment.is_flexible))}\n"
             f"👤 {appointment.customer_name or 'Клиент не указан'}"
             + (f" · {appointment.customer_phone}" if appointment.customer_phone else "")
             + f"\n🚘 {car}\n"
@@ -855,6 +999,25 @@ async def start_appointment(callback: CallbackQuery) -> None:
         await callback.message.answer(
             order_summary(order, "🚘 Машина приехала · заказ создан"),
             reply_markup=order_detail_keyboard(order.id),
+        )
+
+
+@router.callback_query(F.data.startswith("appointment:no_show:"))
+async def appointment_no_show(callback: CallbackQuery) -> None:
+    appointment_id = int(callback.data.rsplit(":", 1)[1])
+    owner_id = db.add_or_update_user(
+        callback.from_user.id, callback.from_user.full_name, callback.from_user.username
+    )
+    order = db.mark_appointment_no_show(owner_id, appointment_id)
+    if order is None:
+        await callback.answer("Запись не найдена или уже обработана.", show_alert=True)
+        return
+    await callback.answer("Отмечено: клиент не приехал")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            order_summary(order, "🚫 Клиент не приехал · время освобождено"),
+            reply_markup=main_keyboard,
         )
 
 
@@ -1469,6 +1632,7 @@ async def report(message: Message) -> None:
     await message.answer(
         f"📊 Финансы\n\n"
         f"Заказ-нарядов: {data.orders}\n"
+        f"Не приехали (No-show): {data.no_shows}\n"
         f"Стоимость работ: {data.labor_revenue:,} ₽\n"
         f"Прибыль с запчастей: {data.parts_margin:,} ₽\n"
         f"💰 Общая прибыль: {data.profit:,} ₽".replace(",", " ")
@@ -1491,6 +1655,14 @@ async def process_text(message: Message, text: str, state: FSMContext) -> None:
     assert message.from_user is not None
     normalized_request = text.casefold().replace("ё", "е")
     owner_id = current_user_id(message)
+    if "кто записан" in normalized_request or "записи на" in normalized_request:
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        if "завтра" in normalized_request:
+            await show_appointments(message, now + timedelta(days=1))
+            return
+        if "сегодня" in normalized_request:
+            await show_appointments(message, now)
+            return
     if "очист" in normalized_request and "архив" in normalized_request:
         counts = db.count_archived(owner_id)
         total = sum(counts.values())
@@ -1619,9 +1791,17 @@ async def process_text(message: Message, text: str, state: FSMContext) -> None:
                 }
             )
 
-        await apply_command(message, command, state)
+        command = fill_contact_and_appointment_from_text(command, text)
+
+        await apply_command(message, command, state, text)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать запрос: {error}")
+    except Exception:
+        logging.exception("Unexpected error while processing CRM text request")
+        await message.answer(
+            "Не удалось обработать запрос: сервис распознавания временно недоступен. "
+            "Повторите попытку позже; данные не были изменены."
+        )
 
 
 @router.message(F.voice)
@@ -1677,18 +1857,32 @@ async def main() -> None:
             return
         timezone = ZoneInfo("Europe/Moscow")
         cleanup_hour = int(os.getenv("CHAT_CLEANUP_HOUR", "23"))
+        configured_chat_ids = os.getenv("CHAT_CLEANUP_CHAT_IDS", "")
+        cleanup_chat_ids = {ADMIN_ID}
+        for value in configured_chat_ids.split(","):
+            if value.strip():
+                try:
+                    cleanup_chat_ids.add(int(value.strip()))
+                except ValueError:
+                    logging.warning("Invalid CHAT_CLEANUP_CHAT_IDS value: %s", value)
         while True:
             now = datetime.now(timezone)
             if now.hour == cleanup_hour and now.minute >= 50:
-                deleted: list[int] = []
-                for message_id in db.get_disposable_chat_messages(ADMIN_ID):
-                    try:
-                        await bot.delete_message(ADMIN_ID, message_id)
-                        deleted.append(message_id)
-                    except Exception:
-                        # Telegram can refuse old/service messages; they remain for a later manual cleanup.
-                        continue
-                db.forget_chat_messages(ADMIN_ID, deleted)
+                for chat_id in cleanup_chat_ids:
+                    deleted: list[int] = []
+                    for message_id in db.get_disposable_chat_messages(chat_id):
+                        try:
+                            await bot.delete_message(chat_id, message_id)
+                            deleted.append(message_id)
+                        except TelegramBadRequest as error:
+                            if "message to delete not found" in str(error).casefold():
+                                deleted.append(message_id)
+                            # The bot may lack delete rights or Telegram may reject service messages.
+                            continue
+                        except Exception:
+                            # The bot may lack delete rights or Telegram may reject old/service messages.
+                            continue
+                    db.forget_chat_messages(chat_id, deleted)
             await asyncio.sleep(60)
 
     async def archive_cleanup_loop() -> None:

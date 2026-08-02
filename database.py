@@ -71,6 +71,7 @@ class ServiceOrder:
 @dataclass(frozen=True)
 class Report:
     orders: int
+    no_shows: int
     labor_revenue: int
     parts_revenue: int
     parts_cost: int
@@ -153,6 +154,13 @@ class AppointmentOverview:
     customer_name: str | None
     customer_phone: str | None
     agreed_amount: int | None = None
+    is_flexible: int = 0
+
+
+@dataclass(frozen=True)
+class AppointmentSaveResult:
+    id: int
+    created: bool
 
 
 class Database:
@@ -390,6 +398,8 @@ class Database:
                 )
             if "agreed_amount" not in appointment_columns:
                 connection.execute("ALTER TABLE appointments ADD COLUMN agreed_amount INTEGER")
+            if "is_flexible" not in appointment_columns:
+                connection.execute("ALTER TABLE appointments ADD COLUMN is_flexible INTEGER NOT NULL DEFAULT 0")
             incoming_columns = {row["name"] for row in connection.execute("PRAGMA table_info(incoming_messages)")}
             if "message_id" not in incoming_columns:
                 connection.execute("ALTER TABLE incoming_messages ADD COLUMN message_id INTEGER")
@@ -403,6 +413,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_orders_car_status ON service_orders(car_id, status, archived_at);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON service_orders(created_at);
                 CREATE INDEX IF NOT EXISTS idx_appointments_start_status ON appointments(starts_at, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_appointments_unique_active_slot
+                    ON appointments(car_id, starts_at)
+                    WHERE status IN ('scheduled', 'in_progress');
                 CREATE INDEX IF NOT EXISTS idx_parts_order ON part_items(service_order_id);
                 CREATE INDEX IF NOT EXISTS idx_receipts_order ON receipts(service_order_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id, created_at);
@@ -503,29 +516,73 @@ class Database:
         finally:
             connection.close()
 
-    def add_appointment(
+    def save_appointment(
         self, car_id: int, description: str, starts_at: str, service_order_id: int | None = None,
-        agreed_amount: int | None = None,
-    ) -> int:
+        agreed_amount: int | None = None, is_flexible: bool = False,
+    ) -> AppointmentSaveResult:
         connection = self.connect()
         try:
+            existing = connection.execute(
+                """SELECT id FROM appointments
+                   WHERE car_id = ? AND starts_at = ?
+                     AND status IN ('scheduled', 'in_progress')
+                   ORDER BY id LIMIT 1""",
+                (car_id, starts_at),
+            ).fetchone()
+            if existing is not None:
+                return AppointmentSaveResult(int(existing["id"]), False)
+
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(appointments)")}
             if "ends_at" in columns:
                 ends_at = (datetime.fromisoformat(starts_at) + timedelta(hours=1)).isoformat()
                 cursor = connection.execute(
-                    """INSERT INTO appointments
-                       (car_id, service_order_id, description, starts_at, ends_at, agreed_amount)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (car_id, service_order_id, description, starts_at, ends_at, agreed_amount),
+                    """INSERT OR IGNORE INTO appointments
+                       (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, is_flexible)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, int(is_flexible)),
                 )
             else:
                 cursor = connection.execute(
-                    """INSERT INTO appointments (car_id, service_order_id, description, starts_at, agreed_amount)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (car_id, service_order_id, description, starts_at, agreed_amount),
+                    """INSERT OR IGNORE INTO appointments (car_id, service_order_id, description, starts_at, agreed_amount, is_flexible)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at, agreed_amount, int(is_flexible)),
                 )
+            if cursor.rowcount == 0:
+                existing = connection.execute(
+                    """SELECT id FROM appointments
+                       WHERE car_id = ? AND starts_at = ?
+                         AND status IN ('scheduled', 'in_progress')
+                       ORDER BY id LIMIT 1""",
+                    (car_id, starts_at),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("Appointment insert was ignored without an active duplicate")
+                return AppointmentSaveResult(int(existing["id"]), False)
             connection.commit()
-            return int(cursor.lastrowid)
+            return AppointmentSaveResult(int(cursor.lastrowid), True)
+        finally:
+            connection.close()
+
+    def add_appointment(
+        self, car_id: int, description: str, starts_at: str, service_order_id: int | None = None,
+        agreed_amount: int | None = None, is_flexible: bool = False,
+    ) -> int:
+        """Backward-compatible appointment creation returning only the record id."""
+        return self.save_appointment(
+            car_id, description, starts_at, service_order_id, agreed_amount, is_flexible
+        ).id
+
+    def find_active_appointment_id(self, car_id: int, starts_at: str) -> int | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT id FROM appointments
+                   WHERE car_id = ? AND starts_at = ?
+                     AND status IN ('scheduled', 'in_progress')
+                   ORDER BY id LIMIT 1""",
+                (car_id, starts_at),
+            ).fetchone()
+            return int(row["id"]) if row is not None else None
         finally:
             connection.close()
 
@@ -537,7 +594,7 @@ class Database:
             rows = connection.execute(
                 """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at, a.status,
                           c.brand, c.model, c.plate_number, cu.full_name AS customer_name,
-                          cu.phone AS customer_phone, a.agreed_amount
+                          cu.phone AS customer_phone, a.agreed_amount, a.is_flexible
                    FROM appointments a
                    JOIN cars c ON c.id = a.car_id
                    JOIN users u ON u.id = c.user_id
@@ -569,6 +626,25 @@ class Database:
             connection.close()
         return self.add_customer(user_id, full_name, phone)
 
+    def find_or_add_customer_by_phone(
+        self, user_id: int, phone: str, full_name: str | None = None
+    ) -> Customer:
+        """Create a provisional customer from a phone number and enrich it with a name later."""
+        customer = self.find_customer(user_id, full_name, phone)
+        if customer is not None:
+            if full_name and customer.full_name != full_name:
+                self.update_customer(customer.id, full_name, phone)
+                updated = self.find_customer(user_id, full_name, phone)
+                assert updated is not None
+                return updated
+            return customer
+
+        normalized = self.normalize_phone(phone) or phone
+        customer_id = self.add_customer(user_id, full_name or f"Клиент +{normalized}", phone)
+        created = self.find_customer(user_id, full_name, phone)
+        assert created is not None and created.id == customer_id
+        return created
+
     def find_customer(self, user_id: int, full_name: str | None, phone: str | None) -> Customer | None:
         connection = self.connect()
         try:
@@ -578,7 +654,7 @@ class Database:
             for row in rows:
                 if full_name and row["full_name"].casefold() == full_name.casefold():
                     return Customer(**dict(row))
-                if phone and row["phone"] and row["phone"].replace(" ", "") == phone.replace(" ", ""):
+                if phone and row["phone"] and self.normalize_phone(row["phone"]) == self.normalize_phone(phone):
                     return Customer(**dict(row))
             return None
         finally:
@@ -1200,12 +1276,17 @@ class Database:
         connection = self.connect()
         try:
             row = connection.execute(
-                """SELECT COUNT(o.id) AS orders, COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
+                """SELECT COUNT(o.id) AS orders,
+                          (SELECT COUNT(*) FROM appointments a
+                           JOIN cars ac ON ac.id = a.car_id
+                           JOIN users au ON au.id = ac.user_id
+                           WHERE au.telegram_id = ? AND a.status = 'no_show') AS no_shows,
+                          COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
                           COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost,
                           COALESCE(SUM(o.parts_profit), 0) AS parts_profit
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
-                   WHERE u.telegram_id = ?""",
-                (telegram_id,),
+                   WHERE u.telegram_id = ? AND o.status != 'no_show'""",
+                (telegram_id, telegram_id),
             ).fetchone()
             return Report(**dict(row))
         finally:
@@ -1244,6 +1325,50 @@ class Database:
         finally:
             connection.close()
         return self.get_service_order(int(order_id))
+
+    def mark_appointment_no_show(self, user_id: int, appointment_id: int) -> ServiceOrder | None:
+        """Close a scheduled slot as a no-show and retain a zero-value client history entry."""
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.agreed_amount
+                   FROM appointments a JOIN cars c ON c.id = a.car_id
+                   WHERE a.id = ? AND c.user_id = ? AND a.status = 'scheduled'""",
+                (appointment_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+
+            order_id = row["service_order_id"]
+            if order_id is None:
+                cursor = connection.execute(
+                    """INSERT INTO service_orders
+                       (car_id, description, concern, agreed_amount, labor_revenue, parts_cost,
+                        parts_revenue, parts_profit, status)
+                       VALUES (?, ?, ?, ?, 0, 0, 0, 0, 'no_show')""",
+                    (row["car_id"], "Клиент не приехал", row["description"], row["agreed_amount"]),
+                )
+                order_id = int(cursor.lastrowid)
+            else:
+                connection.execute(
+                    """UPDATE service_orders
+                       SET status = 'no_show', labor_revenue = 0, parts_cost = 0,
+                           parts_revenue = 0, parts_profit = 0
+                       WHERE id = ?""",
+                    (order_id,),
+                )
+            connection.execute(
+                "UPDATE appointments SET status = 'no_show', service_order_id = ? WHERE id = ?",
+                (order_id, appointment_id),
+            )
+            self._write_audit(
+                connection, user_id, "appointment", appointment_id, "no_show",
+                f"service_order #{order_id}",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
 
     def update_order_crm_fields(
         self, order_id: int, user_id: int | None = None, *, concern: str | None = None,
@@ -1413,7 +1538,7 @@ class Database:
         try:
             return [int(row[0]) for row in connection.execute(
                 """SELECT message_id FROM chat_messages WHERE chat_id = ? AND important = 0
-                   AND datetime(created_at) >= datetime('now', '-2 days') ORDER BY message_id""",
+                   AND datetime(created_at) >= datetime('now', '-47 hours') ORDER BY message_id""",
                 (chat_id,),
             ).fetchall()]
         finally:
