@@ -25,6 +25,9 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(db.get_customers_for_telegram_user(123)[0].full_name, "Пётр Петров")
             db.add_order_photo(order.id, "telegram-file-id", "После ремонта")
             self.assertEqual(db.count_order_photos(order.id), 1)
+            duplicate_id = db.add_order_photo(order.id, "telegram-file-id", "Повтор")
+            self.assertEqual(duplicate_id, db.get_order_photos(order.id)[0]["id"])
+            self.assertEqual(db.count_order_photos(order.id), 1)
             photos = db.get_order_photos(order.id)
             self.assertEqual(photos[0]["telegram_file_id"], "telegram-file-id")
             self.assertEqual(db.search(123, "после ремонта")["orders"][0]["id"], order.id)
@@ -73,6 +76,24 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(updated.parts_revenue, 650)
             self.assertEqual(updated.profit, 1750)
 
+    def test_real_work_replaces_placeholder_instead_of_appending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(790, "Мастер", None)
+            car_id = db.add_car(user_id, "Lada", "Kalina")
+            order = db.add_service_order(car_id, "Работы уточняются", 0, 0, 0)
+
+            updated = db.update_service_order(
+                order.id, "Замена передних стоек", None, None, None, None, add_amounts=True
+            )
+            repeated = db.update_service_order(
+                order.id, "Замена передних стоек", None, None, None, None, add_amounts=True
+            )
+
+            self.assertEqual(updated.description, "Замена передних стоек")
+            self.assertEqual(repeated.description, "Замена передних стоек")
+
     def test_vin_mileage_and_direct_parts_profit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -86,6 +107,9 @@ class DatabaseTest(unittest.TestCase):
 
             self.assertEqual(order.parts_margin, 500)
             self.assertEqual(order.profit, 500)
+            self.assertEqual(order.mileage_at_visit, 126000)
+            db.update_car(car_id, None, None, None, None, None, None, 130000)
+            self.assertEqual(db.get_service_order(order.id).mileage_at_visit, 126000)
 
     def test_customer_overview_status_and_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -104,6 +128,59 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(overview.cars[0].completed, 1)
             self.assertTrue(db.delete_customer(user_id, customer_id))
             self.assertEqual(db.get_recent_orders_for_telegram_user(1001), [])
+
+    def test_unassigned_car_remains_visible_in_customer_section(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(1005, "Мастер", None)
+            car_id = db.add_car(user_id, "Лада", "Калина", plate_number="В965СС")
+            order = db.add_service_order(
+                car_id, "Замена передних амортизаторов", 4000, 0, 0
+            )
+            db.set_order_status(order.id, "ready")
+
+            cars = db.get_unassigned_cars_for_telegram_user(1005)
+
+            self.assertEqual(len(cars), 1)
+            self.assertEqual(cars[0]["model"], "Калина")
+            self.assertEqual(cars[0]["latest_order_id"], order.id)
+            self.assertEqual(cars[0]["completed"], 1)
+
+    def test_manual_chat_cleanup_can_include_important_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(1006, "Мастер", None)
+            car_id = db.add_car(user_id, "Nissan", "Teana")
+            order = db.add_service_order(car_id, "Диагностика ходовой", 500, 0, 0)
+            db.remember_chat_message(-1001, 10, important=False)
+            db.remember_chat_message(-1001, 11, important=True)
+            db.remember_chat_message(-1001, 12, important=False)
+            db.remember_service_message_card(
+                -1001, 12, service_order_id=order.id
+            )
+
+            self.assertEqual(db.get_disposable_chat_messages(-1001), [10])
+            self.assertEqual(db.get_chat_messages(-1001, include_important=True), [10, 11])
+            self.assertEqual(
+                db.get_service_message_cards_for_order(order.id),
+                [{"chat_id": -1001, "message_id": 12}],
+            )
+            self.assertEqual(
+                db.get_chat_messages_for_cleanup(
+                    -1001, today_only=True,
+                    keep_card_statuses={"in_progress"},
+                ),
+                [10, 11],
+            )
+            self.assertEqual(
+                db.get_chat_messages_for_cleanup(
+                    -1001, today_only=True,
+                    keep_card_statuses={"ready"},
+                ),
+                [10, 11, 12],
+            )
 
     def test_new_plate_falls_back_to_existing_brand_and_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +207,28 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(len(db.search(2001, "+7999")["customers"]), 1)
             backup = create_backup(directory_path / "test.sqlite3", directory_path / "backups")
             self.assertTrue(backup.exists())
+
+    def test_semantic_crm_snapshot_contains_linked_work_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2002, "Мастер", None)
+            customer_id = db.add_customer(user_id, "Алексей", "+79990000002")
+            car_id = db.add_car(
+                user_id, "Opel", "Astra", customer_id=customer_id
+            )
+            db.add_service_order(car_id, "Замена масла", 1000, 0, 0)
+            db.log_incoming_message(2002, "Покажи клиентов в работе", 10)
+
+            snapshot = db.get_crm_snapshot(2002)
+
+            self.assertEqual(snapshot["customers"][0]["full_name"], "Алексей")
+            self.assertEqual(snapshot["orders"][0]["status"], "in_progress")
+            self.assertEqual(snapshot["orders"][0]["customer_name"], "Алексей")
+            self.assertEqual(
+                db.get_recent_incoming_texts(2002),
+                ["Покажи клиентов в работе"],
+            )
 
     def test_ai_usage_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -177,6 +276,29 @@ class DatabaseTest(unittest.TestCase):
 
             appointment = db.get_upcoming_appointments_for_telegram_user(4011)[0]
             self.assertEqual(appointment.is_flexible, 1)
+
+    def test_customer_parts_source_moves_from_appointment_to_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4013, "Master", None)
+            customer_id = db.add_customer(user_id, "Коля", None)
+            car_id = db.add_car(user_id, "Honda", "Stepwgn", customer_id=customer_id)
+            appointment_id = db.add_appointment(
+                car_id,
+                "Замена масла",
+                "2026-08-03T15:09:00+03:00",
+                parts_source="customer",
+            )
+
+            appointment = db.get_upcoming_appointments_for_telegram_user(4013)[0]
+            self.assertEqual(appointment.parts_source, "customer")
+            order = db.start_appointment(user_id, appointment_id)
+            self.assertIsNotNone(order)
+            self.assertEqual(order.parts_source, "customer")
+            self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4013), [])
+            updated = db.update_order_parts_source(order.id, "workshop", user_id)
+            self.assertEqual(updated.parts_source, "workshop")
 
     def test_duplicate_active_appointment_returns_existing_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -230,13 +352,21 @@ class DatabaseTest(unittest.TestCase):
             appointment_id = db.add_appointment(
                 car_id, "Стук спереди", "2026-08-02T11:00:00+03:00", agreed_amount=5000
             )
+            db.remember_service_message_card(
+                -1001, 50, appointment_id=appointment_id
+            )
 
             order = db.start_appointment(user_id, appointment_id)
+            db.bind_appointment_card_to_order(appointment_id, order.id)
 
             self.assertIsNotNone(order)
             self.assertEqual(order.status, "in_progress")
             self.assertEqual(order.concern, "Стук спереди")
             self.assertEqual(order.agreed_amount, 5000)
+            self.assertEqual(
+                db.get_service_message_cards_for_order(order.id),
+                [{"chat_id": -1001, "message_id": 50}],
+            )
             ready = db.set_order_status(order.id, "ready", user_id)
             self.assertEqual(ready.status, "ready")
             self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4003), [])
@@ -247,7 +377,9 @@ class DatabaseTest(unittest.TestCase):
             db.initialize()
             user_id = db.add_or_update_user(4010, "Master", None)
             customer_id = db.add_customer(user_id, "Repeat No-show", "+79990000010")
-            car_id = db.add_car(user_id, "Lada", "Vesta", customer_id=customer_id)
+            car_id = db.add_car(
+                user_id, "Lada", "Vesta", mileage=84000, customer_id=customer_id
+            )
             appointment_id = db.add_appointment(
                 car_id, "Диагностика", "2026-08-02T11:00:00+03:00", agreed_amount=5000
             )
@@ -257,6 +389,7 @@ class DatabaseTest(unittest.TestCase):
             self.assertIsNotNone(no_show)
             self.assertEqual(no_show.status, "no_show")
             self.assertEqual(no_show.labor_revenue, 0)
+            self.assertEqual(no_show.mileage_at_visit, 84000)
             self.assertEqual(db.get_upcoming_appointments_for_telegram_user(4010), [])
             self.assertEqual(db.get_car_service_history(car_id)[0].status, "no_show")
             report = db.get_report_for_telegram_user(4010)

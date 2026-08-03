@@ -54,6 +54,8 @@ class ServiceOrder:
     recommendations: str | None = None
     completed_at: str | None = None
     archived_at: str | None = None
+    parts_source: str | None = None
+    mileage_at_visit: int | None = None
 
     @property
     def profit(self) -> int:
@@ -155,6 +157,7 @@ class AppointmentOverview:
     customer_phone: str | None
     agreed_amount: int | None = None
     is_flexible: int = 0
+    parts_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +237,8 @@ class Database:
                     recommendations TEXT,
                     completed_at TEXT,
                     archived_at TEXT,
+                    parts_source TEXT,
+                    mileage_at_visit INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE
                 );
@@ -311,6 +316,7 @@ class Database:
                     starts_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'scheduled',
                     agreed_amount INTEGER CHECK (agreed_amount IS NULL OR agreed_amount >= 0),
+                    parts_source TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE SET NULL
@@ -332,6 +338,17 @@ class Database:
                     important INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (chat_id, message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS service_message_cards (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    appointment_id INTEGER,
+                    service_order_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, message_id),
+                    FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE CASCADE,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -366,10 +383,17 @@ class Database:
                 ("recommendations", "TEXT"),
                 ("completed_at", "TEXT"),
                 ("archived_at", "TEXT"),
+                ("parts_source", "TEXT"),
+                ("mileage_at_visit", "INTEGER"),
             ):
                 if name not in order_columns:
                     connection.execute(f"ALTER TABLE service_orders ADD COLUMN {name} {declaration}")
             connection.execute("UPDATE service_orders SET status = 'ready' WHERE status = 'completed'")
+            connection.execute(
+                """UPDATE service_orders
+                   SET mileage_at_visit = (SELECT mileage FROM cars WHERE cars.id = service_orders.car_id)
+                   WHERE mileage_at_visit IS NULL"""
+            )
             customer_columns = {row["name"] for row in connection.execute("PRAGMA table_info(customers)")}
             if "archived_at" not in customer_columns:
                 connection.execute("ALTER TABLE customers ADD COLUMN archived_at TEXT")
@@ -400,6 +424,14 @@ class Database:
                 connection.execute("ALTER TABLE appointments ADD COLUMN agreed_amount INTEGER")
             if "is_flexible" not in appointment_columns:
                 connection.execute("ALTER TABLE appointments ADD COLUMN is_flexible INTEGER NOT NULL DEFAULT 0")
+            if "parts_source" not in appointment_columns:
+                connection.execute("ALTER TABLE appointments ADD COLUMN parts_source TEXT")
+            connection.execute(
+                """UPDATE appointments SET status = 'completed'
+                   WHERE status = 'in_progress' AND service_order_id IN (
+                       SELECT id FROM service_orders WHERE status IN ('ready', 'completed')
+                   )"""
+            )
             incoming_columns = {row["name"] for row in connection.execute("PRAGMA table_info(incoming_messages)")}
             if "message_id" not in incoming_columns:
                 connection.execute("ALTER TABLE incoming_messages ADD COLUMN message_id INTEGER")
@@ -417,9 +449,17 @@ class Database:
                     ON appointments(car_id, starts_at)
                     WHERE status IN ('scheduled', 'in_progress');
                 CREATE INDEX IF NOT EXISTS idx_parts_order ON part_items(service_order_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_order_photos_unique_file
+                    ON order_photos(service_order_id, telegram_file_id, photo_type);
                 CREATE INDEX IF NOT EXISTS idx_receipts_order ON receipts(service_order_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_chat_cleanup ON chat_messages(created_at, important);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_service_card_appointment
+                    ON service_message_cards(chat_id, appointment_id)
+                    WHERE appointment_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_service_card_order
+                    ON service_message_cards(chat_id, service_order_id)
+                    WHERE service_order_id IS NOT NULL;
                 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
                 """
             )
@@ -516,9 +556,82 @@ class Database:
         finally:
             connection.close()
 
+    def get_recent_incoming_texts(
+        self, telegram_id: int, limit: int = 7
+    ) -> list[str]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT message_text FROM incoming_messages
+                   WHERE telegram_id = ? ORDER BY id DESC LIMIT ?""",
+                (telegram_id, limit),
+            ).fetchall()
+            return [str(row["message_text"]) for row in reversed(rows)]
+        finally:
+            connection.close()
+
+    def get_crm_snapshot(self, telegram_id: int) -> dict[str, object]:
+        """Build a bounded read-only snapshot for semantic CRM questions."""
+        connection = self.connect()
+        try:
+            customers = [dict(row) for row in connection.execute(
+                """SELECT cu.id, cu.full_name, cu.phone
+                   FROM customers cu JOIN users u ON u.id = cu.user_id
+                   WHERE u.telegram_id = ? AND cu.archived_at IS NULL
+                   ORDER BY cu.id DESC LIMIT 100""",
+                (telegram_id,),
+            ).fetchall()]
+            cars = [dict(row) for row in connection.execute(
+                """SELECT c.id, c.customer_id, c.brand, c.model, c.year, c.plate_number,
+                          c.vin, c.mileage, c.next_service_date, c.next_service_mileage,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone
+                   FROM cars c JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL
+                   ORDER BY c.id DESC LIMIT 150""",
+                (telegram_id,),
+            ).fetchall()]
+            orders = [dict(row) for row in connection.execute(
+                """SELECT o.id, o.car_id, o.status, o.description, o.concern,
+                          o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_source,
+                          o.recommendations, o.created_at, o.completed_at,
+                          c.brand, c.model, c.plate_number, c.vin,
+                          cu.id AS customer_id, cu.full_name AS customer_name, cu.phone,
+                          (SELECT GROUP_CONCAT(pi.name, '; ')
+                           FROM part_items pi WHERE pi.service_order_id = o.id) AS parts,
+                          (SELECT COUNT(*) FROM order_photos op
+                           WHERE op.service_order_id = o.id AND op.photo_type = 'work') AS work_photos
+                   FROM service_orders o JOIN cars c ON c.id = o.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND o.archived_at IS NULL
+                   ORDER BY o.id DESC LIMIT 150""",
+                (telegram_id,),
+            ).fetchall()]
+            appointments = [dict(row) for row in connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at,
+                          a.status, a.is_flexible, c.brand, c.model, c.plate_number,
+                          cu.id AS customer_id, cu.full_name AS customer_name, cu.phone
+                   FROM appointments a JOIN cars c ON c.id = a.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL
+                   ORDER BY a.id DESC LIMIT 150""",
+                (telegram_id,),
+            ).fetchall()]
+            return {
+                "customers": customers,
+                "cars": cars,
+                "orders": orders,
+                "appointments": appointments,
+            }
+        finally:
+            connection.close()
+
     def save_appointment(
         self, car_id: int, description: str, starts_at: str, service_order_id: int | None = None,
         agreed_amount: int | None = None, is_flexible: bool = False,
+        parts_source: str | None = None,
     ) -> AppointmentSaveResult:
         connection = self.connect()
         try:
@@ -537,15 +650,15 @@ class Database:
                 ends_at = (datetime.fromisoformat(starts_at) + timedelta(hours=1)).isoformat()
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO appointments
-                       (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, is_flexible)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, int(is_flexible)),
+                       (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, is_flexible, parts_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at, ends_at, agreed_amount, int(is_flexible), parts_source),
                 )
             else:
                 cursor = connection.execute(
-                    """INSERT OR IGNORE INTO appointments (car_id, service_order_id, description, starts_at, agreed_amount, is_flexible)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (car_id, service_order_id, description, starts_at, agreed_amount, int(is_flexible)),
+                    """INSERT OR IGNORE INTO appointments (car_id, service_order_id, description, starts_at, agreed_amount, is_flexible, parts_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (car_id, service_order_id, description, starts_at, agreed_amount, int(is_flexible), parts_source),
                 )
             if cursor.rowcount == 0:
                 existing = connection.execute(
@@ -566,10 +679,11 @@ class Database:
     def add_appointment(
         self, car_id: int, description: str, starts_at: str, service_order_id: int | None = None,
         agreed_amount: int | None = None, is_flexible: bool = False,
+        parts_source: str | None = None,
     ) -> int:
         """Backward-compatible appointment creation returning only the record id."""
         return self.save_appointment(
-            car_id, description, starts_at, service_order_id, agreed_amount, is_flexible
+            car_id, description, starts_at, service_order_id, agreed_amount, is_flexible, parts_source
         ).id
 
     def find_active_appointment_id(self, car_id: int, starts_at: str) -> int | None:
@@ -594,19 +708,30 @@ class Database:
             rows = connection.execute(
                 """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at, a.status,
                           c.brand, c.model, c.plate_number, cu.full_name AS customer_name,
-                          cu.phone AS customer_phone, a.agreed_amount, a.is_flexible
+                          cu.phone AS customer_phone, a.agreed_amount, a.is_flexible, a.parts_source
                    FROM appointments a
                    JOIN cars c ON c.id = a.car_id
                    JOIN users u ON u.id = c.user_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id
                    LEFT JOIN service_orders o ON o.id = a.service_order_id
                    WHERE u.telegram_id = ?
-                     AND a.status IN ('scheduled', 'in_progress')
-                     AND (a.service_order_id IS NULL OR o.status NOT IN ('ready', 'completed'))
+                     AND a.status = 'scheduled'
                    ORDER BY a.starts_at LIMIT ?""",
                 (telegram_id, limit),
             ).fetchall()
             return [AppointmentOverview(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def get_appointment_for_order(self, service_order_id: int) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT id, starts_at, is_flexible, description, status
+                   FROM appointments WHERE service_order_id = ? ORDER BY id LIMIT 1""",
+                (service_order_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
         finally:
             connection.close()
 
@@ -649,7 +774,8 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT id, user_id, full_name, phone FROM customers WHERE user_id = ? ORDER BY id DESC", (user_id,)
+                """SELECT id, user_id, full_name, phone FROM customers
+                   WHERE user_id = ? AND archived_at IS NULL ORDER BY id DESC""", (user_id,)
             ).fetchall()
             for row in rows:
                 if full_name and row["full_name"].casefold() == full_name.casefold():
@@ -657,6 +783,24 @@ class Database:
                 if phone and row["phone"] and self.normalize_phone(row["phone"]) == self.normalize_phone(phone):
                     return Customer(**dict(row))
             return None
+        finally:
+            connection.close()
+
+    def find_customer_by_unique_first_name(
+        self, user_id: int, first_name: str
+    ) -> Customer | None:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT id, user_id, full_name, phone FROM customers
+                   WHERE user_id = ? AND archived_at IS NULL ORDER BY id DESC""",
+                (user_id,),
+            ).fetchall()
+            matches = [
+                Customer(**dict(row)) for row in rows
+                if row["full_name"].split()[0].casefold() == first_name.casefold()
+            ]
+            return matches[0] if len(matches) == 1 else None
         finally:
             connection.close()
 
@@ -684,7 +828,9 @@ class Database:
             for row in customer_rows:
                 customer = Customer(**dict(row))
                 car_rows = connection.execute(
-                    """SELECT c.id, c.user_id, c.customer_id, c.brand, c.model, c.year, c.plate_number, c.vin, c.mileage,
+                    """SELECT c.id, c.user_id, c.customer_id, c.brand, c.model, c.year,
+                              c.plate_number, c.vin, c.mileage, c.next_service_date,
+                              c.next_service_mileage,
                               COUNT(o.id) AS orders_total,
                               COALESCE(SUM(CASE WHEN o.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress,
                               COALESCE(SUM(CASE WHEN o.status IN ('ready', 'completed') THEN 1 ELSE 0 END), 0) AS completed
@@ -694,13 +840,40 @@ class Database:
                 ).fetchall()
                 cars = [
                     CustomerCarOverview(
-                        car=Car(**{key: row[key] for key in ("id", "user_id", "customer_id", "brand", "model", "year", "plate_number", "vin", "mileage")} ),
+                        car=Car(**{key: row[key] for key in (
+                            "id", "user_id", "customer_id", "brand", "model", "year",
+                            "plate_number", "vin", "mileage", "next_service_date",
+                            "next_service_mileage",
+                        )}),
                         orders_total=int(row["orders_total"]), in_progress=int(row["in_progress"]), completed=int(row["completed"]),
                     )
                     for row in car_rows
                 ]
                 result.append(CustomerOverview(customer, cars))
             return result
+        finally:
+            connection.close()
+
+    def get_unassigned_cars_for_telegram_user(
+        self, telegram_id: int
+    ) -> list[dict[str, object]]:
+        """Return visible vehicles that are not yet linked to a customer card."""
+        connection = self.connect()
+        try:
+            return [dict(row) for row in connection.execute(
+                """SELECT c.id, c.brand, c.model, c.year, c.plate_number, c.vin, c.mileage,
+                          COUNT(o.id) AS orders_total,
+                          COALESCE(SUM(CASE WHEN o.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress,
+                          COALESCE(SUM(CASE WHEN o.status IN ('ready', 'completed') THEN 1 ELSE 0 END), 0) AS completed,
+                          (SELECT so.id FROM service_orders so
+                           WHERE so.car_id = c.id AND so.archived_at IS NULL
+                           ORDER BY so.id DESC LIMIT 1) AS latest_order_id
+                   FROM cars c JOIN users u ON u.id = c.user_id
+                   LEFT JOIN service_orders o ON o.car_id = c.id AND o.archived_at IS NULL
+                   WHERE u.telegram_id = ? AND c.customer_id IS NULL AND c.archived_at IS NULL
+                   GROUP BY c.id ORDER BY c.id DESC""",
+                (telegram_id,),
+            ).fetchall()]
         finally:
             connection.close()
 
@@ -714,7 +887,8 @@ class Database:
                    WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             cars = [dict(row) for row in connection.execute(
-                """SELECT c.id, c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
+                """SELECT c.id, c.customer_id, c.brand, c.model, c.plate_number, c.vin, c.mileage,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone
                    FROM cars c JOIN users u ON u.id = c.user_id LEFT JOIN customers cu ON cu.id = c.customer_id
                    WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
@@ -736,7 +910,7 @@ class Database:
 
         return {
             "customers": [row for row in customers if matches([row["full_name"], row["phone"]])][:10],
-            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"]])][:10],
+            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"], row["customer_phone"]])][:10],
             "orders": [row for row in orders if matches([
                 row["description"], row["brand"], row["model"], row["plate_number"],
                 row["customer_name"], row["photo_captions"],
@@ -866,16 +1040,17 @@ class Database:
         self, car_id: int, description: str, labor_revenue: int, parts_cost: int,
         parts_revenue: int, parts_profit: int = 0, concern: str | None = None,
         agreed_amount: int | None = None, recommendations: str | None = None,
+        parts_source: str | None = None,
     ) -> ServiceOrder:
         connection = self.connect()
         try:
             cursor = connection.execute(
                 """INSERT INTO service_orders
                    (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
-                    concern, agreed_amount, recommendations)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    concern, agreed_amount, recommendations, parts_source, mileage_at_visit)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT mileage FROM cars WHERE id = ?))""",
                 (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
-                 concern, agreed_amount, recommendations),
+                 concern, agreed_amount, recommendations, parts_source, car_id),
             )
             order_id = int(cursor.lastrowid)
             connection.commit()
@@ -889,7 +1064,8 @@ class Database:
             row = connection.execute(
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
-                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at
+                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at,
+                          o.parts_source, o.mileage_at_visit
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id WHERE o.id = ?""",
                 (order_id,),
@@ -906,7 +1082,7 @@ class Database:
             rows = connection.execute(
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
-                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at
+                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at, o.parts_source
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? AND o.archived_at IS NULL AND c.archived_at IS NULL ORDER BY o.id DESC LIMIT ?""",
@@ -931,7 +1107,7 @@ class Database:
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost,
                           o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name,
-                          o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at
+                          o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at, o.parts_source
                    FROM service_orders o
                    JOIN cars c ON c.id = o.car_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id
@@ -949,7 +1125,16 @@ class Database:
             current = connection.execute("SELECT * FROM service_orders WHERE id = ?", (order_id,)).fetchone()
             if current is None:
                 raise ValueError(f"Service order {order_id} does not exist")
-            new_description = current["description"] if not description else f"{current['description']}; {description}"
+            current_description = str(current["description"] or "").strip()
+            placeholder = current_description.casefold() == "работы уточняются"
+            if not description:
+                new_description = current_description
+            elif placeholder or not current_description or not add_amounts:
+                new_description = description
+            elif description.casefold().strip(" .") in current_description.casefold():
+                new_description = current_description
+            else:
+                new_description = f"{current_description}; {description}"
             def value(field: str, incoming: int | None) -> int:
                 if incoming is None:
                     return int(current[field])
@@ -961,6 +1146,25 @@ class Database:
             self._write_audit(
                 connection, None, "order", order_id, "updated",
                 f"description={description!r}; labor={labor_revenue!r}; parts_cost={parts_cost!r}; parts_revenue={parts_revenue!r}; parts_profit={parts_profit!r}",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
+
+    def update_order_parts_source(
+        self, order_id: int, parts_source: str, user_id: int | None = None
+    ) -> ServiceOrder:
+        if parts_source not in {"customer", "workshop"}:
+            raise ValueError("Unknown parts source")
+        connection = self.connect()
+        try:
+            connection.execute(
+                "UPDATE service_orders SET parts_source = ? WHERE id = ?",
+                (parts_source, order_id),
+            )
+            self._write_audit(
+                connection, user_id, "order", order_id, "parts_source_changed", parts_source
             )
             connection.commit()
         finally:
@@ -982,7 +1186,7 @@ class Database:
             if status == "ready":
                 connection.execute(
                     """UPDATE appointments SET status = 'completed'
-                       WHERE service_order_id = ? AND status = 'scheduled'""",
+                       WHERE service_order_id = ? AND status IN ('scheduled', 'in_progress')""",
                     (order_id,),
                 )
             self._write_audit(connection, user_id, "order", order_id, "status_changed", f"{previous['status'] if previous else '?'} -> {status}")
@@ -1040,12 +1244,28 @@ class Database:
             raise ValueError("Unknown order photo type")
         connection = self.connect()
         try:
+            existing = connection.execute(
+                """SELECT id FROM order_photos
+                   WHERE service_order_id = ? AND telegram_file_id = ? AND photo_type = ?""",
+                (service_order_id, telegram_file_id, photo_type),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
             cursor = connection.execute(
-                """INSERT INTO order_photos
+                """INSERT OR IGNORE INTO order_photos
                    (service_order_id, telegram_file_id, caption, photo_type)
                    VALUES (?, ?, ?, ?)""",
                 (service_order_id, telegram_file_id, caption, photo_type),
             )
+            if cursor.rowcount == 0:
+                existing = connection.execute(
+                    """SELECT id FROM order_photos
+                       WHERE service_order_id = ? AND telegram_file_id = ? AND photo_type = ?""",
+                    (service_order_id, telegram_file_id, photo_type),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("Photo insert was ignored without a duplicate")
+                return int(existing["id"])
             connection.commit()
             return int(cursor.lastrowid)
         finally:
@@ -1297,7 +1517,7 @@ class Database:
         connection = self.connect()
         try:
             row = connection.execute(
-                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.agreed_amount
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.agreed_amount, a.parts_source
                    FROM appointments a JOIN cars c ON c.id = a.car_id
                    WHERE a.id = ? AND c.user_id = ? AND a.status IN ('scheduled', 'in_progress')""",
                 (appointment_id, user_id),
@@ -1308,9 +1528,14 @@ class Database:
             if order_id is None:
                 cursor = connection.execute(
                     """INSERT INTO service_orders
-                       (car_id, description, concern, agreed_amount, labor_revenue, parts_cost, parts_revenue, parts_profit, status)
-                       VALUES (?, ?, ?, ?, 0, 0, 0, 0, 'in_progress')""",
-                    (row["car_id"], "Работы уточняются", row["description"], row["agreed_amount"]),
+                       (car_id, description, concern, agreed_amount, labor_revenue, parts_cost,
+                        parts_revenue, parts_profit, status, parts_source, mileage_at_visit)
+                       VALUES (?, ?, ?, ?, 0, 0, 0, 0, 'in_progress', ?,
+                               (SELECT mileage FROM cars WHERE id = ?))""",
+                    (
+                        row["car_id"], row["description"], row["description"],
+                        row["agreed_amount"], row["parts_source"], row["car_id"],
+                    ),
                 )
                 order_id = int(cursor.lastrowid)
                 connection.execute(
@@ -1344,9 +1569,13 @@ class Database:
                 cursor = connection.execute(
                     """INSERT INTO service_orders
                        (car_id, description, concern, agreed_amount, labor_revenue, parts_cost,
-                        parts_revenue, parts_profit, status)
-                       VALUES (?, ?, ?, ?, 0, 0, 0, 0, 'no_show')""",
-                    (row["car_id"], "Клиент не приехал", row["description"], row["agreed_amount"]),
+                        parts_revenue, parts_profit, status, mileage_at_visit)
+                       VALUES (?, ?, ?, ?, 0, 0, 0, 0, 'no_show',
+                               (SELECT mileage FROM cars WHERE id = ?))""",
+                    (
+                        row["car_id"], "Клиент не приехал", row["description"],
+                        row["agreed_amount"], row["car_id"],
+                    ),
                 )
                 order_id = int(cursor.lastrowid)
             else:
@@ -1402,7 +1631,8 @@ class Database:
                           o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number, c.vin, c.mileage,
                           cu.full_name AS customer_name, o.concern, o.agreed_amount,
-                          o.recommendations, o.completed_at, o.archived_at
+                          o.recommendations, o.completed_at, o.archived_at, o.parts_source,
+                          o.mileage_at_visit
                    FROM service_orders o JOIN cars c ON c.id = o.car_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id
                    WHERE o.car_id = ? AND o.archived_at IS NULL ORDER BY o.id DESC LIMIT ?""",
@@ -1533,14 +1763,136 @@ class Database:
         finally:
             connection.close()
 
-    def get_disposable_chat_messages(self, chat_id: int) -> list[int]:
+    def remember_service_message_card(
+        self, chat_id: int, message_id: int, *, appointment_id: int | None = None,
+        service_order_id: int | None = None,
+    ) -> None:
         connection = self.connect()
         try:
+            connection.execute(
+                """INSERT OR IGNORE INTO service_message_cards
+                   (chat_id, message_id, appointment_id, service_order_id)
+                   VALUES (?, ?, ?, ?)""",
+                (chat_id, message_id, appointment_id, service_order_id),
+            )
+            connection.execute(
+                """UPDATE service_message_cards SET
+                       appointment_id = COALESCE(?, appointment_id),
+                       service_order_id = COALESCE(?, service_order_id)
+                   WHERE chat_id = ? AND message_id = ?""",
+                (appointment_id, service_order_id, chat_id, message_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def bind_appointment_card_to_order(
+        self, appointment_id: int, service_order_id: int
+    ) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                """UPDATE service_message_cards SET service_order_id = ?
+                   WHERE appointment_id = ?""",
+                (service_order_id, appointment_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_service_message_cards_for_order(
+        self, service_order_id: int
+    ) -> list[dict[str, int]]:
+        connection = self.connect()
+        try:
+            return [dict(row) for row in connection.execute(
+                """SELECT chat_id, message_id FROM service_message_cards
+                   WHERE service_order_id = ? ORDER BY created_at""",
+                (service_order_id,),
+            ).fetchall()]
+        finally:
+            connection.close()
+
+    def get_service_message_cards_for_appointment(
+        self, appointment_id: int
+    ) -> list[dict[str, int]]:
+        connection = self.connect()
+        try:
+            return [dict(row) for row in connection.execute(
+                """SELECT chat_id, message_id FROM service_message_cards
+                   WHERE appointment_id = ? ORDER BY created_at""",
+                (appointment_id,),
+            ).fetchall()]
+        finally:
+            connection.close()
+
+    def forget_service_message_card(self, chat_id: int, message_id: int) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "DELETE FROM service_message_cards WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_disposable_chat_messages(self, chat_id: int) -> list[int]:
+        return self.get_chat_messages(chat_id, include_important=False)
+
+    def get_chat_messages(self, chat_id: int, include_important: bool = False) -> list[int]:
+        connection = self.connect()
+        try:
+            importance_filter = "" if include_important else "AND important = 0"
             return [int(row[0]) for row in connection.execute(
-                """SELECT message_id FROM chat_messages WHERE chat_id = ? AND important = 0
-                   AND datetime(created_at) >= datetime('now', '-47 hours') ORDER BY message_id""",
+                f"""SELECT message_id FROM chat_messages cm WHERE chat_id = ? {importance_filter}
+                    AND datetime(created_at) >= datetime('now', '-47 hours')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM service_message_cards sc
+                        WHERE sc.chat_id = cm.chat_id AND sc.message_id = cm.message_id
+                    )
+                    ORDER BY message_id""",
                 (chat_id,),
             ).fetchall()]
+        finally:
+            connection.close()
+
+    def get_chat_messages_for_cleanup(
+        self, chat_id: int, *, today_only: bool = False,
+        keep_card_statuses: set[str] | None = None,
+    ) -> list[int]:
+        """Select temporary messages while optionally retaining chosen card statuses."""
+        connection = self.connect()
+        try:
+            date_filter = (
+                "date(cm.created_at) = date('now')"
+                if today_only else
+                "datetime(cm.created_at) >= datetime('now', '-47 hours')"
+            )
+            rows = connection.execute(
+                f"""SELECT cm.message_id, sc.service_order_id, sc.appointment_id,
+                           o.status AS order_status, a.status AS appointment_status
+                    FROM chat_messages cm
+                    LEFT JOIN service_message_cards sc
+                      ON sc.chat_id = cm.chat_id AND sc.message_id = cm.message_id
+                    LEFT JOIN service_orders o ON o.id = sc.service_order_id
+                    LEFT JOIN appointments a ON a.id = sc.appointment_id
+                    WHERE cm.chat_id = ? AND {date_filter}
+                    ORDER BY cm.message_id""",
+                (chat_id,),
+            ).fetchall()
+            result: list[int] = []
+            for row in rows:
+                is_card = row["service_order_id"] is not None or row["appointment_id"] is not None
+                if not is_card:
+                    result.append(int(row["message_id"]))
+                    continue
+                if keep_card_statuses is None:
+                    continue
+                status = row["order_status"] or row["appointment_status"]
+                if status not in keep_card_statuses:
+                    result.append(int(row["message_id"]))
+            return result
         finally:
             connection.close()
 

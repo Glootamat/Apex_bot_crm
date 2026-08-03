@@ -17,11 +17,11 @@ from aiogram.methods import SendMessage, SendPhoto, SendDocument
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from backup import create_backup, verify_backup
-from database import Database, ServiceOrder
+from database import AppointmentOverview, Database, ServiceOrder
 from openrouter import OpenRouterError, WorkshopCommand, analyze_receipt_image, parse_workshop_command, transcribe_voice
 
 
@@ -41,18 +41,12 @@ class IncomingMessageTracker(BaseMiddleware):
 
 
 class OutgoingMessageTracker(BaseRequestMiddleware):
-    IMPORTANT_PREFIXES = (
-        "📋 Заказ-наряд", "✅ Заказ-наряд", "🤖 Запись создана",
-        "✅ Запись #", "🚘 Машина приехала", "✅ Стоимость сохранена",
-        "✅ Статус заказ-наряда", "Запись #", "🚫 Клиент не приехал", "#",
-    )
-
     async def __call__(self, make_request, bot, method):
         result = await make_request(bot, method)
         if isinstance(result, Message) and isinstance(method, (SendMessage, SendPhoto, SendDocument)):
-            text = (getattr(method, "text", None) or getattr(method, "caption", None) or "")
-            important = isinstance(method, (SendPhoto, SendDocument)) or text.startswith(self.IMPORTANT_PREFIXES)
-            db.remember_chat_message(result.chat.id, result.message_id, important=important)
+            # Permanent visit cards are tracked explicitly in service_message_cards.
+            # Everything else is temporary UI output and may be removed by cleanup.
+            db.remember_chat_message(result.chat.id, result.message_id, important=False)
         return result
 
 try:
@@ -126,6 +120,10 @@ class CloseOrderCost(StatesGroup):
     waiting = State()
 
 
+class OrderRecommendations(StatesGroup):
+    waiting = State()
+
+
 def action_keyboard(kind: str, record_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -151,6 +149,10 @@ def order_detail_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 Текст для клиента", callback_data=f"order:client-text:{order_id}")],
+            [InlineKeyboardButton(
+                text="🩺 Дефектовка и рекомендации",
+                callback_data=f"order:recommendations:{order_id}",
+            )],
             [
                 InlineKeyboardButton(text="🖼 Фото работ", callback_data=f"order:photos:{order_id}"),
                 InlineKeyboardButton(text="➕ Добавить фото", callback_data=f"order:add-photo:{order_id}"),
@@ -163,10 +165,45 @@ def order_detail_keyboard(order_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def customer_action_keyboard(customer_id: int, has_phone: bool) -> InlineKeyboardMarkup:
+def customer_action_keyboard(
+    customer_id: int, has_phone: bool, vins: list[tuple[str, str]] | None = None
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if has_phone:
-        rows.append([InlineKeyboardButton(text="📱 Открыть контакт", callback_data=f"customer:contact:{customer_id}")])
+    rows.append([
+        InlineKeyboardButton(
+            text="📋 Полная карточка", callback_data=f"customer:open:{customer_id}"
+        )
+    ])
+    for label, vin in vins or []:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📋 Копировать VIN · {label}",
+                copy_text=CopyTextButton(text=vin),
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:customer:{customer_id}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:customer:{customer_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def customer_full_keyboard(
+    customer_id: int, phone: str | None, vins: list[tuple[str, str]]
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for label, vin in vins:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📋 VIN · {label}", copy_text=CopyTextButton(text=vin)
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text="📚 История обслуживания",
+            callback_data=f"customer:history:{customer_id}",
+        )
+    ])
     rows.append([
         InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:customer:{customer_id}"),
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:customer:{customer_id}"),
@@ -262,6 +299,36 @@ def fill_contact_and_appointment_from_text(
 ) -> WorkshopCommand:
     """Recover phone/date fields deterministically when the AI parser misses them."""
     values = {name: getattr(command, name) for name in command.__dataclass_fields__}
+    normalized_text = text.casefold().replace("ё", "е")
+
+    if any(phrase in normalized_text for phrase in (
+        "запчасти клиента", "запчасти клиентские", "со своими запчастями",
+        "с запчастями клиента", "детали клиента",
+    )):
+        values["parts_source"] = "customer"
+    elif any(phrase in normalized_text for phrase in (
+        "наши запчасти", "запчасти наши", "запчасти сервиса",
+        "на запчастях сервиса", "детали сервиса",
+    )):
+        values["parts_source"] = "workshop"
+
+    vin_match = re.search(
+        r"(?<![A-Z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Z0-9])", text.upper()
+    )
+    if vin_match:
+        values["vin"] = vin_match.group(0)
+
+    if command.customer_name:
+        clean_name = re.split(
+            r"\s*[,;.]?\s*(?:запчаст|детал|\bvin\b|вин(?:\s*код)?)",
+            command.customer_name,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" ,;.-")
+        if clean_name.casefold() in {"vin", "вин", "вин код"} or not clean_name:
+            values["customer_name"] = None
+        else:
+            values["customer_name"] = clean_name
 
     if not command.customer_phone:
         phone_match = re.search(r"(?<!\d)(?:\+?7|8)[\s()\-]*\d{3}[\s()\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)", text)
@@ -338,6 +405,54 @@ def order_status_label(status: str) -> str:
     }.get(status, status)
 
 
+def parts_source_label(parts_source: str | None) -> str:
+    return {
+        "customer": "👤 Запчасти клиента",
+        "workshop": "🔧 Запчасти сервиса",
+    }.get(parts_source, "Источник запчастей не указан")
+
+
+def recommendations_block(value: str, indent: str = "") -> str:
+    items = [
+        re.sub(r"^(?:[-•—]|\d+[.)])\s*", "", item.strip())
+        for item in re.split(r"[\r\n]+", value)
+        if item.strip()
+    ]
+    uncertain_words = ("под вопрос", "провер", "диагност", "наблюд")
+    replacement = [
+        item for item in items
+        if not any(word in item.casefold() for word in uncertain_words)
+    ]
+    inspection = [item for item in items if item not in replacement]
+    lines = [f"{indent}🩺 Дефектовка и рекомендации"]
+    if replacement:
+        lines.append(f"{indent}К замене:")
+        lines.extend(f"{indent}• {item}" for item in replacement)
+    if inspection:
+        lines.append(f"{indent}⚠️ Дополнительно проверить:")
+        lines.extend(f"{indent}• {item}" for item in inspection)
+    return "\n".join(lines)
+
+
+def split_telegram_text(lines: list[str], limit: int = 3800) -> list[str]:
+    """Split a long card without exceeding Telegram's message length limit."""
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        pieces = [line[index:index + limit] for index in range(0, len(line), limit)] or [""]
+        for piece in pieces:
+            candidate = f"{current}\n{piece}" if current else piece
+            if len(candidate) > limit:
+                if current:
+                    chunks.append(current)
+                current = piece
+            else:
+                current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 def appointment_datetime_label(value: datetime, is_flexible: bool = False) -> str:
     weekdays = (
         "понедельник",
@@ -361,7 +476,8 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
         + (f"Причина обращения: {order.concern}\n" if order.concern else "")
         + f"🔧 {order.description}\n"
         + (f"Согласовано с клиентом: {money(order.agreed_amount)}\n" if order.agreed_amount is not None else "")
-        + (f"Рекомендация: {order.recommendations}\n" if order.recommendations else "")
+        + (f"{recommendations_block(order.recommendations)}\n" if order.recommendations else "")
+        + f"{parts_source_label(order.parts_source)}\n"
         + "\n"
         f"Работы: {money(order.labor_revenue)}\n"
         f"Закупка: {money(order.parts_cost)}\n"
@@ -369,6 +485,116 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
         f"Прибыль с запчастей: {money(order.parts_margin)}\n"
         f"💰 Итого: {money(order.profit)}\n"
         f"Статус: {order_status_label(order.status)}"
+    )
+
+
+def service_order_card_text(order: ServiceOrder) -> str:
+    car = f"{order.brand} {order.model}" + (
+        f" · {order.plate_number}" if order.plate_number else ""
+    )
+    lines = [
+        f"📋 Основная карточка визита · заказ #{order.id}",
+        f"Статус: {order_status_label(order.status)}",
+    ]
+    appointment = db.get_appointment_for_order(order.id)
+    if appointment is not None:
+        starts_at = datetime.fromisoformat(str(appointment["starts_at"]))
+        lines.append(
+            f"🗓 {appointment_datetime_label(starts_at, bool(appointment['is_flexible']))}"
+        )
+    lines.extend([
+        f"👤 {order.customer_name or 'Клиент не указан'}",
+        f"🚘 {car}",
+    ])
+    if order.mileage_at_visit:
+        lines.append(f"Пробег: {order.mileage_at_visit:,} км".replace(",", " "))
+    if order.concern:
+        lines.append(f"Причина обращения: {order.concern}")
+    lines.extend(["", "🔧 Работы:"])
+    lines.extend(
+        f"• {work.strip()}" for work in re.split(r"[;\n]+", order.description)
+        if work.strip()
+    )
+    lines.append(f"Стоимость работ: {money(order.labor_revenue)}")
+    lines.extend(["", f"⚙️ {parts_source_label(order.parts_source)}"])
+    parts = db.get_part_items(order.id)
+    if parts:
+        for part in parts[:12]:
+            quantity = f" × {part.quantity:g}" if part.quantity is not None else ""
+            article = f" · арт. {part.article}" if part.article else ""
+            part_line = f"• {part.name}{quantity}{article}"
+            purchase = int(part.total_cost or 0)
+            if part.markup_percent is not None:
+                client_price = purchase + int(
+                    purchase * float(part.markup_percent) / 100 + 0.5
+                )
+                part_line += f" — клиенту {money(client_price)}"
+            lines.append(part_line)
+        if len(parts) > 12:
+            lines.append(f"• Ещё позиций: {len(parts) - 12}")
+    elif order.parts_source == "customer":
+        lines.append("• Запчасти предоставил клиент")
+    else:
+        lines.append("• Запчасти пока не добавлены")
+    lines.extend([
+        f"Закупка запчастей: {money(order.parts_cost)}",
+        f"Запчасти клиенту: {money(order.parts_revenue)}",
+        "",
+        f"💰 Итого к оплате: {money(order.labor_revenue + order.parts_revenue)}",
+    ])
+    if order.recommendations:
+        lines.extend(["", recommendations_block(order.recommendations[:1200])])
+    lines.append(f"🖼 Фото работ: {db.count_order_photos(order.id)}")
+    return "\n".join(lines)
+
+
+async def sync_service_order_cards(bot: Bot, order: ServiceOrder) -> int:
+    cards = db.get_service_message_cards_for_order(order.id)
+    updated = 0
+    for card in cards:
+        chat_id = int(card["chat_id"])
+        message_id = int(card["message_id"])
+        try:
+            await bot.edit_message_text(
+                service_order_card_text(order),
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=order_detail_keyboard(order.id),
+            )
+            updated += 1
+        except TelegramBadRequest as error:
+            error_text = str(error).casefold()
+            if "message is not modified" in error_text:
+                updated += 1
+            elif "message to edit not found" in error_text:
+                db.forget_service_message_card(chat_id, message_id)
+            else:
+                logging.warning(
+                    "Could not update service card %s/%s: %s",
+                    chat_id, message_id, error,
+                )
+        except Exception:
+            logging.exception("Could not update service card %s/%s", chat_id, message_id)
+    return updated
+
+
+async def publish_or_sync_service_order_card(
+    message: Message, bot: Bot, order: ServiceOrder
+) -> None:
+    cards = db.get_service_message_cards_for_order(order.id)
+    if cards:
+        await sync_service_order_cards(bot, order)
+        await message.answer(
+            f"✅ Основная карточка заказа #{order.id} обновлена.",
+            reply_markup=main_keyboard,
+        )
+        return
+    sent = await message.answer(
+        service_order_card_text(order),
+        reply_markup=order_detail_keyboard(order.id),
+    )
+    db.remember_service_message_card(
+        sent.chat.id, sent.message_id, service_order_id=order.id
     )
 
 
@@ -385,6 +611,26 @@ def appointment_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def appointment_card_text(appointment: AppointmentOverview) -> str:
+    starts_at = datetime.fromisoformat(appointment.starts_at)
+    car = f"{appointment.brand} {appointment.model}" + (
+        f" · {appointment.plate_number}" if appointment.plate_number else ""
+    )
+    return (
+        f"📋 Основная карточка визита · запись #{appointment.id}\n"
+        f"Статус: {order_status_label('planned')}\n"
+        f"🗓 {appointment_datetime_label(starts_at, bool(appointment.is_flexible))}\n"
+        f"👤 {appointment.customer_name or 'Клиент не указан'}\n"
+        f"🚘 {car}\n"
+        f"Причина обращения: {appointment.description}\n"
+        f"{parts_source_label(appointment.parts_source)}"
+        + (
+            f"\nСогласовано: {money(appointment.agreed_amount)}"
+            if appointment.agreed_amount is not None else ""
+        )
+    )
+
+
 def openrouter_settings() -> tuple[str, str, str, str, str] | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key or api_key == "your_openrouter_api_key":
@@ -396,6 +642,235 @@ def openrouter_settings() -> tuple[str, str, str, str, str] | None:
         os.getenv("OPENROUTER_ADVANCED_MODEL", "anthropic/claude-sonnet-4.5"),
         os.getenv("OPENROUTER_TRANSCRIBE_MODEL", "openai/gpt-4o-mini-transcribe"),
     )
+
+
+def infer_order_list_scope(text: str) -> str | None:
+    normalized = text.casefold().replace("ё", "е")
+    if any(word in normalized for word in ("не приех", "неяв", "no-show", "ноу шоу")):
+        return "no_show"
+    if any(word in normalized for word in (
+        "закрыт", "заверш", "готов", "выполненн", "истори",
+    )):
+        return "closed"
+    if any(word in normalized for word in ("в работе", "активн", "текущ")):
+        return "in_progress"
+    if any(word in normalized for word in ("все заказ", "весь список", "за все время")):
+        return "all"
+    return None
+
+
+def is_order_list_request(text: str) -> bool:
+    normalized = text.casefold().replace("ё", "е")
+    wants_output = any(word in normalized for word in (
+        "покаж", "вывед", "список", "какие", "найд", "отобраз",
+    ))
+    mentions_orders = "заказ" in normalized or "наряд" in normalized
+    return wants_output and mentions_orders
+
+
+def is_semantic_crm_read_request(text: str) -> bool:
+    normalized = text.casefold().replace("ё", "е")
+    if normalized.strip().startswith(("как ", "как мне ", "можно ли ")):
+        return False
+    read_words = (
+        "покаж", "вывед", "кто", "какие", "сколько", "найд", "у кого",
+        "есть ли", "сравни", "посчитай", "проанализ",
+    )
+    crm_words = (
+        "клиент", "машин", "автомоб", "заказ", "наряд", "запис",
+        "не приех", "рекомендац", "выруч", "прибыл", "работ",
+    )
+    if not any(word in normalized for word in read_words):
+        return False
+    if not any(word in normalized for word in crm_words):
+        return False
+    orders_only = (
+        ("заказ" in normalized or "наряд" in normalized)
+        and not any(word in normalized for word in (
+            "клиент", "машин", "автомоб", "сколько", "у кого", "сравни", "посчитай",
+        ))
+    )
+    return not orders_only
+
+
+def safe_conversation_context(text: str) -> str:
+    """Remove direct identifiers before a prior message is sent for intent parsing."""
+    value = re.sub(
+        r"(?<!\d)(?:\+?7|8)[\d\s()\-]{9,18}\d(?!\d)", "[телефон]", text
+    )
+    value = re.sub(r"(?i)\b[A-HJ-NPR-Z0-9]{17}\b", "[VIN]", value)
+    return value[:500]
+
+
+def configured_chat_cleanup_ids() -> set[int]:
+    chat_ids = {ADMIN_ID}
+    for value in os.getenv("CHAT_CLEANUP_CHAT_IDS", "").split(","):
+        if not value.strip():
+            continue
+        try:
+            chat_ids.add(int(value.strip()))
+        except ValueError:
+            logging.warning("Invalid CHAT_CLEANUP_CHAT_IDS value: %s", value)
+    return chat_ids
+
+
+def is_chat_cleanup_request(text: str) -> bool:
+    normalized = text.casefold().replace("ё", "е")
+    cleanup = any(word in normalized for word in ("очист", "почист", "убери сообщ", "удали сообщ"))
+    chat = any(word in normalized for word in ("чат", "групп", "сообщени"))
+    return cleanup and chat and "архив" not in normalized
+
+
+def requested_cleanup_chat_ids(text: str, current_chat_id: int) -> set[int]:
+    normalized = text.casefold().replace("ё", "е")
+    configured = configured_chat_cleanup_ids()
+    private_ids = {ADMIN_ID}
+    group_ids = {chat_id for chat_id in configured if chat_id != ADMIN_ID}
+    mentions_group = any(word in normalized for word in ("рабоч", "групп", "apex auto"))
+    mentions_private = any(word in normalized for word in ("личн", "в боте", "с ботом"))
+    mentions_all = any(word in normalized for word in ("оба", "обоих", "все чат", "чаты"))
+    if mentions_all or (mentions_group and mentions_private):
+        return configured
+    if mentions_group:
+        return group_ids or ({current_chat_id} if current_chat_id < 0 else set())
+    if mentions_private:
+        return private_ids
+    return {current_chat_id}
+
+
+def requested_cleanup_card_statuses(text: str) -> set[str] | None:
+    normalized = text.casefold().replace("ё", "е")
+    if not any(word in normalized for word in ("остав", "сохран", "не удал")):
+        return None
+    statuses: set[str] = set()
+    if any(word in normalized for word in ("в работе", "рабочие машин", "активн")):
+        statuses.add("in_progress")
+    if any(word in normalized for word in ("готов", "закрыт", "заверш")):
+        statuses.update({"ready", "completed"})
+    if any(word in normalized for word in ("записан", "записи", "ожидают", "ожидающ")):
+        statuses.add("scheduled")
+    if any(word in normalized for word in ("не приех", "неяв", "no-show", "ноу шоу")):
+        statuses.add("no_show")
+    return statuses or None
+
+
+async def ensure_cleanup_service_cards(
+    bot: Bot, chat_ids: set[int], keep_statuses: set[str] | None
+) -> None:
+    if keep_statuses is None:
+        return
+    orders = [
+        order for order in db.get_recent_orders_for_telegram_user(ADMIN_ID, limit=100)
+        if order.status in keep_statuses
+    ]
+    for order in orders:
+        await sync_service_order_cards(bot, order)
+        cards = db.get_service_message_cards_for_order(order.id)
+        for chat_id in chat_ids:
+            if any(int(card["chat_id"]) == chat_id for card in cards):
+                continue
+            sent = await bot.send_message(
+                chat_id,
+                service_order_card_text(order),
+                reply_markup=order_detail_keyboard(order.id),
+            )
+            db.remember_service_message_card(
+                sent.chat.id, sent.message_id, service_order_id=order.id
+            )
+            cards.append({"chat_id": sent.chat.id, "message_id": sent.message_id})
+
+    if "scheduled" not in keep_statuses:
+        return
+    appointments = db.get_upcoming_appointments_for_telegram_user(ADMIN_ID, limit=100)
+    for appointment in appointments:
+        cards = db.get_service_message_cards_for_appointment(appointment.id)
+        for chat_id in chat_ids:
+            if any(int(card["chat_id"]) == chat_id for card in cards):
+                continue
+            sent = await bot.send_message(
+                chat_id,
+                appointment_card_text(appointment),
+                reply_markup=appointment_keyboard(appointment.id),
+            )
+            db.remember_service_message_card(
+                sent.chat.id, sent.message_id, appointment_id=appointment.id
+            )
+            cards.append({"chat_id": sent.chat.id, "message_id": sent.message_id})
+
+
+async def delete_tracked_chat_messages(
+    bot: Bot, chat_ids: set[int], *, today_only: bool = False,
+    keep_card_statuses: set[str] | None = None,
+) -> tuple[int, int]:
+    deleted_total = 0
+    failed_total = 0
+    for chat_id in chat_ids:
+        deleted: list[int] = []
+        for message_id in db.get_chat_messages_for_cleanup(
+            chat_id,
+            today_only=today_only,
+            keep_card_statuses=keep_card_statuses,
+        ):
+            try:
+                await bot.delete_message(chat_id, message_id)
+                deleted.append(message_id)
+                deleted_total += 1
+            except TelegramBadRequest as error:
+                if "message to delete not found" in str(error).casefold():
+                    deleted.append(message_id)
+                else:
+                    failed_total += 1
+            except Exception:
+                failed_total += 1
+        for message_id in deleted:
+            db.forget_service_message_card(chat_id, message_id)
+        db.forget_chat_messages(chat_id, deleted)
+    return deleted_total, failed_total
+
+
+async def run_manual_chat_cleanup(
+    message: Message, bot: Bot, state: FSMContext, source_text: str
+) -> None:
+    targets = requested_cleanup_chat_ids(source_text, message.chat.id)
+    if not targets:
+        await message.answer(
+            "Рабочая группа не настроена для очистки. Добавьте её ID в CHAT_CLEANUP_CHAT_IDS."
+        )
+        return
+    await state.clear()
+    keep_statuses = requested_cleanup_card_statuses(source_text)
+    await ensure_cleanup_service_cards(bot, targets, keep_statuses)
+    deleted, failed = await delete_tracked_chat_messages(
+        bot,
+        targets,
+        today_only=any(word in source_text.casefold() for word in ("сегодня", "сегодняш")),
+        keep_card_statuses=keep_statuses,
+    )
+    scope = "личном и рабочем чатах" if len(targets) > 1 else "указанном чате"
+    result = f"🧹 Очистка выполнена сразу в {scope}. Удалено сообщений: {deleted}."
+    if failed:
+        result += f" Не удалось удалить: {failed} (ограничение Telegram или права бота)."
+    confirmation = await bot.send_message(
+        message.chat.id, result, reply_markup=main_keyboard
+    )
+    if keep_statuses is not None and "только" in source_text.casefold():
+        await asyncio.sleep(3)
+        try:
+            await bot.delete_message(confirmation.chat.id, confirmation.message_id)
+        except TelegramBadRequest:
+            pass
+        db.forget_chat_messages(confirmation.chat.id, [confirmation.message_id])
+
+
+async def chat_cleanup_text_filter(message: Message) -> bool:
+    return bool(message.text and is_chat_cleanup_request(message.text))
+
+
+@router.message(chat_cleanup_text_filter)
+async def manual_chat_cleanup_text(
+    message: Message, bot: Bot, state: FSMContext
+) -> None:
+    await run_manual_chat_cleanup(message, bot, state, message.text or "")
 
 
 def ai_budget_available() -> bool:
@@ -410,13 +885,52 @@ def record_ai_usage(task_type: str, response: object) -> None:
     db.log_ai_usage(task_type, response.model, response.input_tokens, response.output_tokens, response.cost_usd)  # type: ignore[attr-defined]
 
 
-async def show_orders(message: Message) -> None:
+async def show_orders(
+    message: Message, scope: str = "in_progress", command: WorkshopCommand | None = None
+) -> None:
     assert message.from_user is not None
-    orders = db.get_recent_orders_for_telegram_user(message.from_user.id, limit=15)
+    orders = db.get_recent_orders_for_telegram_user(message.from_user.id, limit=100)
+    if scope == "closed":
+        orders = [order for order in orders if order.status in {"ready", "completed"}]
+    elif scope == "no_show":
+        orders = [order for order in orders if order.status == "no_show"]
+    elif scope == "all":
+        pass
+    else:
+        scope = "in_progress"
+        orders = [order for order in orders if order.status == "in_progress"]
+
+    if command is not None:
+        if command.order_id is not None:
+            orders = [order for order in orders if order.id == command.order_id]
+        if command.customer_name:
+            needle = command.customer_name.casefold()
+            orders = [order for order in orders if needle in (order.customer_name or "").casefold()]
+        if command.car_brand:
+            needle = command.car_brand.casefold()
+            orders = [order for order in orders if needle in order.brand.casefold()]
+        if command.car_model:
+            needle = command.car_model.casefold()
+            orders = [order for order in orders if needle in order.model.casefold()]
+        if command.plate_number:
+            plate = db.normalize_plate(command.plate_number)
+            orders = [order for order in orders if db.normalize_plate(order.plate_number) == plate]
+        if command.vin:
+            vin = command.vin.replace(" ", "").upper()
+            orders = [order for order in orders if (order.vin or "").replace(" ", "").upper() == vin]
+
+    scope_labels = {
+        "in_progress": "в работе",
+        "closed": "закрытых",
+        "no_show": "с неявкой клиента",
+        "all": "за всё время",
+    }
     if not orders:
-        await message.answer("Заказ-нарядов пока нет.")
+        await message.answer(f"Заказ-нарядов {scope_labels[scope]} не найдено.")
         return
-    await message.answer("🧾 Последние заказ-наряды:", reply_markup=main_keyboard)
+    await message.answer(
+        f"🧾 Заказ-наряды {scope_labels[scope]}:", reply_markup=main_keyboard
+    )
     for order in orders:
         car = f"{order.brand} {order.model}" + (f" · {order.plate_number}" if order.plate_number else "")
         status = order_status_label(order.status)
@@ -427,6 +941,188 @@ async def show_orders(message: Message) -> None:
             f"{status} · Прибыль {money(order.profit)}"
         )
         await message.answer(text, reply_markup=order_list_keyboard(order.id))
+
+
+def semantic_status_matches(status: str, requested: str) -> bool:
+    return {
+        "in_progress": status == "in_progress",
+        "closed": status in {"ready", "completed"},
+        "scheduled": status == "scheduled",
+        "no_show": status == "no_show",
+        "all": True,
+    }.get(requested, True)
+
+
+def semantic_period_matches(value: object, period: str) -> bool:
+    if period == "all" or not value:
+        return True
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    target = moment.date()
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    if period == "today":
+        return target == today
+    if period == "tomorrow":
+        return target == today + timedelta(days=1)
+    if period == "week":
+        return today <= target <= today + timedelta(days=7)
+    return True
+
+
+async def show_semantic_crm_query(
+    message: Message, command: WorkshopCommand, source_text: str
+) -> None:
+    assert message.from_user is not None
+    normalized = source_text.casefold().replace("ё", "е")
+    entity = command.query_entity
+    if entity is None:
+        if "клиент" in normalized or "кто" in normalized or "у кого" in normalized:
+            entity = "customers"
+        elif "машин" in normalized or "автомоб" in normalized:
+            entity = "cars"
+        elif "запис" in normalized:
+            entity = "appointments"
+        else:
+            entity = "orders"
+    status = command.query_status
+    if status is None:
+        status = infer_order_list_scope(source_text)
+    if status is None and entity == "appointments":
+        status = "scheduled"
+    status = status or "all"
+    mode = command.query_mode or ("count" if "сколько" in normalized else "list")
+    period = command.query_period or (
+        "tomorrow" if "завтра" in normalized else
+        "today" if "сегодня" in normalized else
+        "week" if "недел" in normalized else "all"
+    )
+    snapshot = db.get_crm_snapshot(message.from_user.id)
+    orders = [
+        item for item in snapshot["orders"]
+        if semantic_status_matches(str(item["status"]), status)
+        and semantic_period_matches(
+            item["completed_at"] or item["created_at"], period
+        )
+    ]
+    appointments = [
+        item for item in snapshot["appointments"]
+        if semantic_status_matches(str(item["status"]), status)
+        and semantic_period_matches(item["starts_at"], period)
+    ]
+    if command.query_has_recommendations:
+        orders = [item for item in orders if str(item["recommendations"] or "").strip()]
+
+    def matches_identity(item: dict[str, object]) -> bool:
+        if command.customer_name and command.customer_name.casefold() not in str(item.get("customer_name") or "").casefold():
+            return False
+        if command.car_brand and command.car_brand.casefold() not in str(item.get("brand") or "").casefold():
+            return False
+        if command.car_model and command.car_model.casefold() not in str(item.get("model") or "").casefold():
+            return False
+        if command.plate_number and db.normalize_plate(str(item.get("plate_number") or "")) != db.normalize_plate(command.plate_number):
+            return False
+        if command.vin and command.vin.replace(" ", "").upper() != str(item.get("vin") or "").replace(" ", "").upper():
+            return False
+        return True
+
+    orders = [item for item in orders if matches_identity(item)]
+    appointments = [item for item in appointments if matches_identity(item)]
+    source_rows = appointments if status == "scheduled" or entity == "appointments" else orders
+    if entity == "cars" and status == "all":
+        source_rows = [
+            item for item in snapshot["cars"] if matches_identity(item)
+        ]
+    if entity == "customers" and status == "all" and not command.query_has_recommendations:
+        cars_by_customer: dict[int, dict[str, object]] = {}
+        for car in snapshot["cars"]:
+            if car["customer_id"] is not None:
+                cars_by_customer.setdefault(int(car["customer_id"]), car)
+        source_rows = []
+        for customer in snapshot["customers"]:
+            customer_id = int(customer["id"])
+            car = cars_by_customer.get(customer_id, {})
+            row = {
+                **customer,
+                **car,
+                "customer_id": customer_id,
+                "customer_name": customer["full_name"],
+                "car_id": car.get("id", customer_id),
+                "brand": car.get("brand", "Автомобиль"),
+                "model": car.get("model", "не указан"),
+                "plate_number": car.get("plate_number"),
+            }
+            if matches_identity(row):
+                source_rows.append(row)
+
+    if entity == "orders":
+        unique = {int(item["id"]): item for item in source_rows}
+        title = "Заказ-наряды"
+    elif entity == "appointments":
+        unique = {int(item["id"]): item for item in appointments}
+        title = "Записи"
+    elif entity == "cars":
+        unique = {int(item["car_id"]): item for item in source_rows}
+        title = "Автомобили"
+    else:
+        unique = {}
+        for item in source_rows:
+            customer_key = item.get("customer_id")
+            key = int(customer_key) if customer_key is not None else -int(item["car_id"])
+            unique.setdefault(key, item)
+        title = "Клиенты"
+
+    status_label = {
+        "in_progress": "в работе", "closed": "закрытые", "scheduled": "записанные",
+        "no_show": "не приехали", "all": "по выбранным условиям",
+    }[status]
+    if mode == "count":
+        await message.answer(f"{title} · {status_label}: {len(unique)}", reply_markup=main_keyboard)
+        return
+    if mode == "summary":
+        labor = sum(int(item.get("labor_revenue") or 0) for item in orders)
+        parts = sum(int(item.get("parts_revenue") or 0) for item in orders)
+        await message.answer(
+            f"{title} · {status_label}: {len(unique)}\n"
+            f"Работы: {money(labor)}\nЗапчасти клиенту: {money(parts)}\n"
+            f"Итого: {money(labor + parts)}",
+            reply_markup=main_keyboard,
+        )
+        return
+    if not unique:
+        await message.answer(f"{title} по этому запросу не найдены.", reply_markup=main_keyboard)
+        return
+
+    lines = [f"{title} · {status_label}: {len(unique)}"]
+    for item in list(unique.values())[:30]:
+        car = f"{item['brand']} {item['model']}" + (
+            f" · {item['plate_number']}" if item.get("plate_number") else ""
+        )
+        if entity == "customers":
+            lines.append(
+                f"• {item.get('customer_name') or 'Клиент не указан'} · {car}"
+                + (f" · заказ #{item['id']}" if "description" in item else "")
+            )
+        elif entity == "cars":
+            lines.append(
+                f"• {car} · {item.get('customer_name') or 'Клиент не указан'}"
+            )
+        elif entity == "appointments":
+            starts_at = datetime.fromisoformat(str(item["starts_at"]))
+            lines.append(
+                f"• #{item['id']} · {appointment_datetime_label(starts_at, bool(item['is_flexible']))}"
+                f" · {item.get('customer_name') or 'Клиент не указан'} · {car}"
+            )
+        else:
+            lines.append(
+                f"• #{item['id']} · {item.get('customer_name') or 'Клиент не указан'}"
+                f" · {car} · {item['description']}"
+            )
+        if command.query_has_recommendations and item.get("recommendations"):
+            lines.append("  " + str(item["recommendations"]).replace("\n", "; "))
+    for chunk in split_telegram_text(lines):
+        await message.answer(chunk, reply_markup=main_keyboard)
 
 
 @router.callback_query(F.data.startswith("order:open:"))
@@ -455,6 +1151,7 @@ async def open_order(callback: CallbackQuery) -> None:
         lines.extend(["💬 Причина обращения:", order.concern, ""])
     if order.agreed_amount is not None:
         lines.extend([f"🤝 Согласовано с клиентом: {money(order.agreed_amount)}", ""])
+    lines.extend([parts_source_label(order.parts_source), ""])
     lines.extend([
         "🔧 Работы:",
         f"• {order.description}",
@@ -490,7 +1187,7 @@ async def open_order(callback: CallbackQuery) -> None:
         f"💰 Общая прибыль: {money(order.profit)}",
     ])
     if order.recommendations:
-        lines.extend(["", "📌 На следующий визит:", order.recommendations])
+        lines.extend(["", recommendations_block(order.recommendations)])
     history = [item for item in db.get_car_service_history(order.car_id, limit=6) if item.id != order.id]
     if history:
         lines.extend(["", "🕘 Предыдущие обращения:"])
@@ -501,6 +1198,60 @@ async def open_order(callback: CallbackQuery) -> None:
             if previous_parts:
                 lines.append("  Детали: " + ", ".join(item.name for item in previous_parts[:6]))
     await callback.message.answer("\n".join(lines), reply_markup=order_detail_keyboard(order.id))
+
+
+@router.callback_query(F.data.startswith("order:recommendations:"))
+async def order_recommendations_start(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    order_id = int(callback.data.rsplit(":", 1)[1])
+    allowed = db.get_recent_orders_for_telegram_user(callback.from_user.id, limit=100)
+    order = next((item for item in allowed if item.id == order_id), None)
+    if order is None:
+        await callback.answer("Заказ-наряд не найден.", show_alert=True)
+        return
+    await state.set_state(OrderRecommendations.waiting)
+    await state.update_data(recommendations_order_id=order_id)
+    await callback.answer()
+    if callback.message:
+        current = (
+            f"\n\nСейчас записано:\n{order.recommendations}"
+            if order.recommendations else ""
+        )
+        await callback.message.answer(
+            "🩺 Введите результаты дефектовки и рекомендации одним сообщением.\n"
+            "Например:\n"
+            "«Заменить передние рычаги, втулки стабилизатора и левый рулевой наконечник»."
+            + current,
+            reply_markup=cancel_keyboard,
+        )
+
+
+@router.message(OrderRecommendations.waiting, F.text)
+async def order_recommendations_save(
+    message: Message, bot: Bot, state: FSMContext
+) -> None:
+    if message.text == CANCEL:
+        await state.clear()
+        await message.answer("Добавление рекомендаций отменено.", reply_markup=main_keyboard)
+        return
+    recommendation = message.text.strip()
+    if len(recommendation) < 3:
+        await message.answer("Опишите дефектовку подробнее или нажмите «Отмена».")
+        return
+    data = await state.get_data()
+    order_id = int(data["recommendations_order_id"])
+    assert message.from_user is not None
+    allowed = db.get_recent_orders_for_telegram_user(message.from_user.id, limit=100)
+    if not any(item.id == order_id for item in allowed):
+        await state.clear()
+        await message.answer("Заказ-наряд не найден.", reply_markup=main_keyboard)
+        return
+    updated = db.update_order_crm_fields(
+        order_id, current_user_id(message), recommendations=recommendation
+    )
+    await state.clear()
+    await publish_or_sync_service_order_card(message, bot, updated)
 
 
 @router.callback_query(F.data.startswith("order:photos:"))
@@ -622,20 +1373,56 @@ async def show_search_result(message: Message, query: str) -> None:
         await message.answer("Ничего не найдено.")
         return
     lines = [f"🔎 Результаты: {query}"]
+    vin_buttons: list[list[InlineKeyboardButton]] = []
+    customer_buttons: list[list[InlineKeyboardButton]] = []
+    linked_customers: set[int] = set()
     for item in result["customers"]:
-        lines.append(f"\nКлиент: {item['full_name']}" + (f" · {item['phone']}" if item["phone"] else ""))
+        lines.append(
+            f"\n👤 {item['full_name']}\n📞 {item['phone'] or 'телефон не указан'}"
+        )
+        customer_id = int(item["id"])
+        linked_customers.add(customer_id)
+        customer_buttons.append([
+            InlineKeyboardButton(
+                text=f"📋 Карточка · {item['full_name']}",
+                callback_data=f"customer:open:{customer_id}",
+            )
+        ])
     for item in result["cars"]:
         title = f"{item['brand']} {item['model']}" + (f" · {item['plate_number']}" if item["plate_number"] else "")
         details = []
         if item["vin"]:
-            details.append(f"VIN {item['vin']}")
+            details.append(f"VIN: {item['vin']}")
+            vin_buttons.append([
+                InlineKeyboardButton(
+                    text=f"📋 Копировать VIN · {item['brand']} {item['model']}",
+                    copy_text=CopyTextButton(text=str(item["vin"])),
+                )
+            ])
         if item["mileage"]:
             details.append(f"{item['mileage']} км")
-        lines.append(f"\nАвтомобиль: {title}" + (f" · {item['customer_name']}" if item["customer_name"] else "") + (f"\n{' · '.join(details)}" if details else ""))
+        owner = f"\nКлиент: {item['customer_name']}" if item["customer_name"] else ""
+        phone = f"\nТелефон: {item['customer_phone']}" if item["customer_phone"] else ""
+        lines.append(f"\nАвтомобиль: {title}" + owner + phone + (f"\n{' · '.join(details)}" if details else ""))
+        if item["customer_id"] is not None and int(item["customer_id"]) not in linked_customers:
+            customer_id = int(item["customer_id"])
+            linked_customers.add(customer_id)
+            customer_buttons.append([
+                InlineKeyboardButton(
+                    text=f"📋 Карточка · {item['customer_name']}",
+                    callback_data=f"customer:open:{customer_id}",
+                )
+            ])
     for item in result["orders"]:
         status = order_status_label(str(item["status"]))
         lines.append(f"\nЗаказ #{item['id']}: {item['brand']} {item['model']} · {item['description']}\nСтатус: {status}")
-    await message.answer("\n".join(lines), reply_markup=main_keyboard)
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=(
+            InlineKeyboardMarkup(inline_keyboard=customer_buttons + vin_buttons)
+            if customer_buttons or vin_buttons else main_keyboard
+        ),
+    )
     for item in result["orders"]:
         await message.answer(
             f"Заказ #{item['id']} · открыть карточку и фото работ",
@@ -644,16 +1431,41 @@ async def show_search_result(message: Message, query: str) -> None:
 
 
 async def apply_command(
-    message: Message, command: WorkshopCommand, state: FSMContext, source_text: str = ""
+    message: Message, command: WorkshopCommand, state: FSMContext, bot: Bot,
+    source_text: str = "",
 ) -> None:
-    if command.intent == "list_orders":
-        await show_orders(message)
+    if command.intent == "list_orders" or is_order_list_request(source_text):
+        scope = infer_order_list_scope(source_text) or command.order_list_scope or "all"
+        await show_orders(message, scope, command)
         return
     if command.intent == "unknown":
         await message.answer("Я могу записать или изменить клиента, автомобиль и заказ-наряд. Напишите или скажите это обычными словами.")
         return
 
     owner_id = current_user_id(message)
+
+    if command.parts_source and not command.appointment_start:
+        source_car = db.find_car_by_details(
+            owner_id, command.car_brand, command.car_model, command.plate_number, command.vin
+        )
+        source_order = db.get_latest_order_for_car(source_car.id) if source_car else None
+        if source_order is None and command.customer_name:
+            source_customer = db.find_customer(
+                owner_id, command.customer_name, command.customer_phone
+            )
+            if source_customer is None:
+                source_customer = db.find_customer_by_unique_first_name(
+                    owner_id, command.customer_name.split()[0]
+                )
+            if source_customer is not None:
+                active_orders = db.get_active_orders_for_customer(owner_id, source_customer.id)
+                source_order = active_orders[0] if len(active_orders) == 1 else None
+        if source_order is not None:
+            updated = db.update_order_parts_source(
+                source_order.id, command.parts_source, owner_id
+            )
+            await publish_or_sync_service_order_card(message, bot, updated)
+            return
 
     if command.intent == "create_order":
         has_car_identity = bool(
@@ -682,10 +1494,7 @@ async def apply_command(
                         command.parts_profit,
                         add_amounts=False,
                     )
-                    await message.answer(
-                        order_summary(updated, "✅ Активный заказ клиента обновлён"),
-                        reply_markup=order_detail_keyboard(updated.id),
-                    )
+                    await publish_or_sync_service_order_card(message, bot, updated)
                     return
         if not has_car_identity or not command.description:
             missing = []
@@ -709,10 +1518,10 @@ async def apply_command(
             await message.answer("Укажите номер заказ-наряда или автомобиль и статус: «в работе» либо «готов».")
             return
         if command.order_status == "ready" and order.labor_revenue <= 0:
-            await close_order_or_request_cost(message, state, order)
+            await close_order_or_request_cost(message, state, order, bot)
             return
         updated = db.set_order_status(order.id, command.order_status, owner_id)
-        await message.answer(order_summary(updated, "✅ Статус заказ-наряда обновлён"), reply_markup=main_keyboard)
+        await publish_or_sync_service_order_card(message, bot, updated)
         return
     if command.intent == "markup_parts":
         car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
@@ -725,13 +1534,7 @@ async def apply_command(
             await message.answer("В этом заказе нет новых позиций из чеков или корзины для наценки. Повторно одни и те же позиции не нацениваю.")
             return
         updated = db.update_service_order(order.id, None, None, None, purchase_cost + profit, None, add_amounts=True)
-        await message.answer(
-            f"✅ Наценка {command.parts_markup_percent:g}% применена к {count} позициям.\n"
-            f"Цена запчастей клиенту: {purchase_cost + profit:,} ₽.\n"
-            f"В прибыль по запчастям добавлено: {profit:,} ₽.\n"
-            f"Текущая прибыль по запчастям: {updated.parts_margin:,} ₽.".replace(",", " "),
-            reply_markup=main_keyboard,
-        )
+        await publish_or_sync_service_order_card(message, bot, updated)
         return
     if command.intent == "update_order" and command.order_id is not None:
         assert message.from_user is not None
@@ -755,10 +1558,7 @@ async def apply_command(
                 agreed_amount=command.agreed_amount,
                 recommendations=command.recommendations,
             )
-        await message.answer(
-            order_summary(updated, "✅ Заказ-наряд изменён"),
-            reply_markup=action_keyboard("order", updated.id),
-        )
+        await publish_or_sync_service_order_card(message, bot, updated)
         return
     customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
     if command.customer_phone:
@@ -829,6 +1629,7 @@ async def apply_command(
             car_id, appointment_reason, starts_at.isoformat(),
             agreed_amount=command.agreed_amount,
             is_flexible=is_flexible,
+            parts_source=command.parts_source,
         )
         appointment_id = saved.id
         if not saved.created:
@@ -838,15 +1639,20 @@ async def apply_command(
                 reply_markup=appointment_keyboard(appointment_id),
             )
             return
-        await message.answer(
-            f"✅ Запись #{appointment_id} создана\n"
+        sent = await message.answer(
+            f"📋 Основная карточка визита · запись #{appointment_id}\n"
+            f"Статус: {order_status_label('planned')}\n"
             f"Когда: {appointment_datetime_label(starts_at, is_flexible)}\n"
             f"Клиент: {(customer.full_name if customer else command.customer_name) or 'не указан'}\n"
             f"Автомобиль: {command.car_brand or ''} {command.car_model or ''}"
             + (f" · {plate}" if plate else "")
             + f"\nПричина обращения: {appointment_reason}"
+            + f"\n{parts_source_label(command.parts_source)}"
             + (f"\nСогласовано: {money(command.agreed_amount)}" if command.agreed_amount is not None else ""),
             reply_markup=appointment_keyboard(appointment_id),
+        )
+        db.remember_service_message_card(
+            sent.chat.id, sent.message_id, appointment_id=appointment_id
         )
         return
 
@@ -854,6 +1660,9 @@ async def apply_command(
         if customer_id is None and car_id is None:
             await message.answer("Не понял, какую карточку изменить. Укажите хотя бы имя клиента, телефон или автомобиль.")
         else:
+            if car_id is not None:
+                for order in db.get_car_service_history(car_id, limit=20):
+                    await sync_service_order_cards(bot, order)
             await message.answer("✅ Карточка клиента и автомобиля обновлена.", reply_markup=main_keyboard)
         return
 
@@ -871,8 +1680,9 @@ async def apply_command(
             command.parts_profit or 0, concern=command.concern,
             agreed_amount=command.agreed_amount,
             recommendations=command.recommendations,
+            parts_source=command.parts_source,
         )
-        await message.answer(order_summary(order, "🤖 Запись создана автоматически"), reply_markup=main_keyboard)
+        await publish_or_sync_service_order_card(message, bot, order)
         return
 
     if command.intent == "update_order":
@@ -881,13 +1691,15 @@ async def apply_command(
             await message.answer("У этого автомобиля пока нет заказ-нарядов. Опишите выполненные работы, и я создам первый.")
             return
         updated = db.update_service_order(order.id, command.description, command.labor_revenue, command.parts_cost, command.parts_revenue, command.parts_profit, add_amounts=True)
+        if command.parts_source:
+            updated = db.update_order_parts_source(updated.id, command.parts_source, owner_id)
         if command.concern or command.agreed_amount is not None or command.recommendations:
             updated = db.update_order_crm_fields(
                 updated.id, owner_id, concern=command.concern,
                 agreed_amount=command.agreed_amount,
                 recommendations=command.recommendations,
             )
-        await message.answer(order_summary(updated, "✅ Заказ-наряд дополнен"), reply_markup=main_keyboard)
+        await publish_or_sync_service_order_card(message, bot, updated)
 
 
 async def request_delete(message: Message, command: WorkshopCommand, owner_id: int, state: FSMContext) -> None:
@@ -979,13 +1791,14 @@ async def show_appointments(message: Message, target_date: datetime | None = Non
             + (f" · {appointment.customer_phone}" if appointment.customer_phone else "")
             + f"\n🚘 {car}\n"
             f"Причина обращения: {appointment.description}"
+            + f"\n{parts_source_label(appointment.parts_source)}"
             + (f"\nСогласовано: {money(appointment.agreed_amount)}" if appointment.agreed_amount is not None else ""),
             reply_markup=appointment_keyboard(appointment.id) if appointment.status == "scheduled" else None,
         )
 
 
 @router.callback_query(F.data.startswith("appointment:start:"))
-async def start_appointment(callback: CallbackQuery) -> None:
+async def start_appointment(callback: CallbackQuery, bot: Bot) -> None:
     appointment_id = int(callback.data.rsplit(":", 1)[1])
     owner_id = db.add_or_update_user(
         callback.from_user.id, callback.from_user.full_name, callback.from_user.username
@@ -996,14 +1809,16 @@ async def start_appointment(callback: CallbackQuery) -> None:
         return
     await callback.answer("Машина принята в работу")
     if callback.message:
-        await callback.message.answer(
-            order_summary(order, "🚘 Машина приехала · заказ создан"),
-            reply_markup=order_detail_keyboard(order.id),
+        db.remember_service_message_card(
+            callback.message.chat.id, callback.message.message_id,
+            appointment_id=appointment_id,
         )
+        db.bind_appointment_card_to_order(appointment_id, order.id)
+        await sync_service_order_cards(bot, order)
 
 
 @router.callback_query(F.data.startswith("appointment:no_show:"))
-async def appointment_no_show(callback: CallbackQuery) -> None:
+async def appointment_no_show(callback: CallbackQuery, bot: Bot) -> None:
     appointment_id = int(callback.data.rsplit(":", 1)[1])
     owner_id = db.add_or_update_user(
         callback.from_user.id, callback.from_user.full_name, callback.from_user.username
@@ -1014,15 +1829,16 @@ async def appointment_no_show(callback: CallbackQuery) -> None:
         return
     await callback.answer("Отмечено: клиент не приехал")
     if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer(
-            order_summary(order, "🚫 Клиент не приехал · время освобождено"),
-            reply_markup=main_keyboard,
+        db.remember_service_message_card(
+            callback.message.chat.id, callback.message.message_id,
+            appointment_id=appointment_id,
         )
+        db.bind_appointment_card_to_order(appointment_id, order.id)
+        await sync_service_order_cards(bot, order)
 
 
 async def close_order_or_request_cost(
-    message: Message, state: FSMContext, order: ServiceOrder
+    message: Message, state: FSMContext, order: ServiceOrder, bot: Bot
 ) -> None:
     if order.labor_revenue <= 0:
         await state.set_state(CloseOrderCost.waiting)
@@ -1035,7 +1851,7 @@ async def close_order_or_request_cost(
         return
     closed = db.set_order_status(order.id, "ready")
     await state.clear()
-    await message.answer(order_summary(closed, "✅ Заказ-наряд закрыт"), reply_markup=main_keyboard)
+    await publish_or_sync_service_order_card(message, bot, closed)
 
 
 @router.message(F.text == COMPLETE_ORDER)
@@ -1052,7 +1868,9 @@ async def complete_order_start(message: Message, state: FSMContext) -> None:
 
 
 @router.message(CompleteOrder.select, F.text)
-async def complete_order_selected(message: Message, state: FSMContext) -> None:
+async def complete_order_selected(
+    message: Message, bot: Bot, state: FSMContext
+) -> None:
     if message.text == CANCEL:
         await state.clear()
         await message.answer("Закрытие заказа отменено.", reply_markup=main_keyboard)
@@ -1063,11 +1881,11 @@ async def complete_order_selected(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите номер из списка или нажмите «Отмена».")
         return
     order = db.get_service_order(data["active_orders"][selected])
-    await close_order_or_request_cost(message, state, order)
+    await close_order_or_request_cost(message, state, order, bot)
 
 
 @router.message(CloseOrderCost.waiting, F.text)
-async def close_order_cost(message: Message, state: FSMContext) -> None:
+async def close_order_cost(message: Message, bot: Bot, state: FSMContext) -> None:
     if message.text == CANCEL:
         await state.clear()
         await message.answer("Закрытие заказа отменено. Заказ остаётся в работе.", reply_markup=main_keyboard)
@@ -1083,30 +1901,64 @@ async def close_order_cost(message: Message, state: FSMContext) -> None:
     )
     closed = db.set_order_status(updated.id, "ready")
     await state.clear()
-    await message.answer(order_summary(closed, "✅ Стоимость сохранена, заказ закрыт"), reply_markup=main_keyboard)
+    await publish_or_sync_service_order_card(message, bot, closed)
 
 
 @router.message(F.text == CUSTOMERS)
 async def customers_button(message: Message) -> None:
     assert message.from_user is not None
     customers = db.get_customer_overviews(message.from_user.id)
-    if not customers:
+    unassigned_cars = db.get_unassigned_cars_for_telegram_user(message.from_user.id)
+    if not customers and not unassigned_cars:
         await message.answer("Клиентов пока нет.")
         return
     await message.answer("👥 Клиенты:", reply_markup=main_keyboard)
     for overview in customers[:20]:
         customer = overview.customer
-        lines = [customer.full_name + (f" · {customer.phone}" if customer.phone else " · телефон не указан")]
+        lines = [f"👤 {customer.full_name}", f"📞 {customer.phone or 'телефон не указан'}"]
+        vins: list[tuple[str, str]] = []
         if not overview.cars:
             lines.append("Автомобили не добавлены")
         for item in overview.cars:
             car = item.car
             title = f"{car.brand} {car.model}" + (f" · {car.plate_number}" if car.plate_number else " · без номера")
-            lines.append(f"{title}\nЗаказов: {item.orders_total} · В работе: {item.in_progress} · Готово: {item.completed}")
+            car_lines = [title]
+            if car.vin:
+                car_lines.append(f"VIN: {car.vin}")
+                vins.append((f"{car.brand} {car.model}", car.vin))
+            car_lines.append(f"Заказов: {item.orders_total} · В работе: {item.in_progress} · Готово: {item.completed}")
+            lines.append("\n".join(car_lines))
         await message.answer(
             "\n".join(lines),
-            reply_markup=customer_action_keyboard(customer.id, has_phone=bool(customer.phone)),
+            reply_markup=customer_action_keyboard(
+                customer.id, has_phone=bool(customer.phone), vins=vins
+            ),
         )
+    if unassigned_cars:
+        await message.answer(
+            "🚘 Автомобили без привязанного клиента\n"
+            "Они сохранены, но имя и телефон владельца ещё не указаны."
+        )
+        for car in unassigned_cars[:20]:
+            lines = [
+                f"🚘 {car['brand']} {car['model']}"
+                + (f" · {car['plate_number']}" if car["plate_number"] else " · без номера"),
+                "👤 Клиент не указан",
+            ]
+            if car["vin"]:
+                lines.append(f"VIN: {car['vin']}")
+            if car["mileage"]:
+                lines.append(f"Пробег: {int(car['mileage']):,} км".replace(",", " "))
+            lines.append(
+                f"Заказов: {car['orders_total']} · В работе: {car['in_progress']} · "
+                f"Готово: {car['completed']}"
+            )
+            latest_order_id = car["latest_order_id"]
+            keyboard = (
+                order_list_keyboard(int(latest_order_id))
+                if latest_order_id is not None else main_keyboard
+            )
+            await message.answer("\n".join(lines), reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("customer:contact:"))
@@ -1125,8 +1977,201 @@ async def open_customer_contact(callback: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(F.data.startswith("customer:open:"))
+async def open_customer_card(callback: CallbackQuery) -> None:
+    customer_id = int(callback.data.rsplit(":", 1)[1])
+    customer = db.get_customer_for_telegram_user(callback.from_user.id, customer_id)
+    await callback.answer()
+    if callback.message is None:
+        return
+    if customer is None:
+        await callback.message.answer("Карточка клиента не найдена.")
+        return
+
+    overview = next(
+        (
+            item for item in db.get_customer_overviews(callback.from_user.id)
+            if item.customer.id == customer_id
+        ),
+        None,
+    )
+    lines = [
+        "👤 Карточка клиента",
+        "",
+        f"Имя: {customer.full_name}",
+        f"Телефон: {customer.phone or 'не указан'}",
+    ]
+    vins: list[tuple[str, str]] = []
+    if overview is None or not overview.cars:
+        lines.extend(["", "🚘 Автомобили не добавлены"])
+    else:
+        lines.extend(["", f"🚘 Автомобили: {len(overview.cars)}"])
+        for number, item in enumerate(overview.cars, start=1):
+            car = item.car
+            lines.extend([
+                "",
+                f"{number}. {car.brand} {car.model}" + (f" · {car.year} г." if car.year else ""),
+                f"Госномер: {car.plate_number or 'не указан'}",
+                f"VIN: {car.vin or 'не указан'}",
+                f"Пробег: {car.mileage:,} км".replace(",", " ") if car.mileage else "Пробег: не указан",
+                f"Заказов: {item.orders_total} · В работе: {item.in_progress} · Готово: {item.completed}",
+            ])
+            if car.vin:
+                vins.append((f"{car.brand} {car.model}", car.vin))
+            if car.next_service_date or car.next_service_mileage:
+                service = []
+                if car.next_service_date:
+                    service.append(f"дата {car.next_service_date}")
+                if car.next_service_mileage:
+                    service.append(f"пробег {car.next_service_mileage:,} км".replace(",", " "))
+                lines.append("Следующее ТО: " + " · ".join(service))
+
+            active_orders = [
+                order for order in db.get_car_service_history(car.id, limit=10)
+                if order.status == "in_progress"
+            ]
+            for order in active_orders:
+                lines.append(f"Сейчас в работе: заказ #{order.id} · {order.description}")
+                if order.recommendations:
+                    lines.append(recommendations_block(order.recommendations))
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=customer_full_keyboard(customer.id, customer.phone, vins),
+    )
+
+
+@router.callback_query(F.data.startswith("customer:history:"))
+async def open_customer_history(callback: CallbackQuery) -> None:
+    customer_id = int(callback.data.rsplit(":", 1)[1])
+    customer = db.get_customer_for_telegram_user(callback.from_user.id, customer_id)
+    await callback.answer()
+    if callback.message is None:
+        return
+    if customer is None:
+        await callback.message.answer("Карточка клиента не найдена.")
+        return
+    overview = next(
+        (
+            item for item in db.get_customer_overviews(callback.from_user.id)
+            if item.customer.id == customer_id
+        ),
+        None,
+    )
+    lines = ["📚 История клиента", "", f"👤 {customer.full_name}"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    history_count = 0
+    if overview is not None:
+        for item in overview.cars:
+            if history_count >= 10:
+                break
+            car = item.car
+            history = [
+                order for order in db.get_car_service_history(car.id, limit=20)
+                if order.status != "in_progress"
+            ]
+            if not history:
+                continue
+            lines.extend([
+                "",
+                f"🚘 {car.brand} {car.model}"
+                + (f" · {car.plate_number}" if car.plate_number else ""),
+            ])
+            for order in history:
+                if history_count >= 10:
+                    break
+                history_count += 1
+                raw_date = (order.completed_at or order.created_at)[:10]
+                try:
+                    visit_date = datetime.fromisoformat(raw_date).strftime("%d.%m.%Y")
+                except ValueError:
+                    visit_date = raw_date
+                lines.extend([
+                    "",
+                    f"📋 Заказ #{order.id} · {visit_date}",
+                    f"Статус: {order_status_label(order.status)}",
+                    (
+                        f"Пробег: {order.mileage_at_visit:,} км".replace(",", " ")
+                        if order.mileage_at_visit else "Пробег: не указан"
+                    ),
+                ])
+                if order.concern:
+                    lines.append(f"Причина обращения: {order.concern}")
+                lines.append("🔧 Работы:")
+                lines.extend(
+                    f"• {work.strip()}"
+                    for work in order.description.split(";") if work.strip()
+                )
+                lines.append(f"Стоимость работ: {money(order.labor_revenue)}")
+
+                parts = db.get_part_items(order.id)
+                lines.append(f"⚙️ {parts_source_label(order.parts_source)}")
+                if parts:
+                    for part in parts:
+                        quantity = f" × {part.quantity:g}" if part.quantity is not None else ""
+                        article = f" · арт. {part.article}" if part.article else ""
+                        part_line = f"• {part.name}{quantity}{article}"
+                        purchase = int(part.total_cost or 0)
+                        if part.markup_percent is not None:
+                            client_price = purchase + int(
+                                purchase * float(part.markup_percent) / 100 + 0.5
+                            )
+                            part_line += f" — клиенту {money(client_price)}"
+                        elif order.parts_source != "customer":
+                            part_line += " — цена клиенту не указана"
+                        lines.append(part_line)
+                elif order.parts_source == "customer":
+                    lines.append("• Детали предоставил клиент")
+                else:
+                    lines.append("• Запчасти не добавлены")
+                lines.extend([
+                    f"Запчасти клиенту: {money(order.parts_revenue)}",
+                    f"💰 Итого: {money(order.labor_revenue + order.parts_revenue)}",
+                ])
+                if order.recommendations:
+                    lines.append(recommendations_block(order.recommendations))
+                if car.next_service_date or car.next_service_mileage:
+                    next_service = []
+                    if car.next_service_date:
+                        next_service.append(f"дата {car.next_service_date}")
+                    if car.next_service_mileage:
+                        next_service.append(
+                            f"пробег {car.next_service_mileage:,} км".replace(",", " ")
+                        )
+                    lines.append("📅 Следующее ТО: " + " · ".join(next_service))
+                photo_count = db.count_order_photos(order.id)
+                lines.append(f"🖼 Фотографий работ: {photo_count}")
+                order_buttons = [
+                    InlineKeyboardButton(
+                        text=f"📋 Заказ #{order.id}", callback_data=f"order:open:{order.id}"
+                    )
+                ]
+                if photo_count:
+                    order_buttons.append(
+                        InlineKeyboardButton(
+                            text=f"🖼 Фото ({photo_count})",
+                            callback_data=f"order:photos:{order.id}",
+                        )
+                    )
+                buttons.append(order_buttons)
+    if history_count == 0:
+        lines.extend(["", "Завершённых заказ-нарядов пока нет."])
+    messages = split_telegram_text(lines)
+    final_keyboard = (
+        InlineKeyboardMarkup(inline_keyboard=buttons)
+        if buttons else customer_full_keyboard(customer.id, customer.phone, [])
+    )
+    for index, text in enumerate(messages):
+        await callback.message.answer(
+            text,
+            reply_markup=final_keyboard if index == len(messages) - 1 else None,
+        )
+
+
 @router.callback_query(F.data.startswith("reminder:"))
-async def handle_order_reminder(callback: CallbackQuery, state: FSMContext) -> None:
+async def handle_order_reminder(
+    callback: CallbackQuery, bot: Bot, state: FSMContext
+) -> None:
     _, action, raw_id = callback.data.split(":", 2)
     order_id = int(raw_id)
     allowed = db.get_recent_orders_for_telegram_user(callback.from_user.id, limit=100)
@@ -1140,7 +2185,7 @@ async def handle_order_reminder(callback: CallbackQuery, state: FSMContext) -> N
             return
         if callback.message:
             await callback.answer()
-            await close_order_or_request_cost(callback.message, state, order)
+            await close_order_or_request_cost(callback.message, state, order, bot)
     else:
         await callback.answer(f"Заказ #{order.id} оставлен в работе.")
         if callback.message:
@@ -1167,7 +2212,7 @@ async def edit_record(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(EditRecord.waiting, F.text)
-async def edit_record_value(message: Message, state: FSMContext) -> None:
+async def edit_record_value(message: Message, bot: Bot, state: FSMContext) -> None:
     if message.text == CANCEL:
         await state.clear()
         await message.answer("Изменение отменено.", reply_markup=main_keyboard)
@@ -1251,6 +2296,17 @@ async def edit_record_value(message: Message, state: FSMContext) -> None:
         ]
         if car_changed:
             result.append("Автомобиль также обновлён.")
+        overview = next(
+            (
+                item for item in db.get_customer_overviews(message.from_user.id)
+                if item.customer.id == record_id
+            ),
+            None,
+        )
+        if overview is not None:
+            for item in overview.cars:
+                for order in db.get_car_service_history(item.car.id, limit=20):
+                    await sync_service_order_cards(bot, order)
         await message.answer("\n".join(result), reply_markup=main_keyboard)
     elif kind == "receipt":
         try:
@@ -1265,7 +2321,7 @@ async def edit_record_value(message: Message, state: FSMContext) -> None:
         await message.answer("✅ Сумма чека изменена." if changed else "Чек не найден.", reply_markup=main_keyboard)
     else:
         await state.clear()
-        await process_text(message, f"Измени заказ #{record_id}: {message.text}", state)
+        await process_text(message, f"Измени заказ #{record_id}: {message.text}", state, bot)
 
 
 @router.callback_query(F.data.startswith("delete:"))
@@ -1283,7 +2339,7 @@ async def delete_record(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("markup40:receipt:"))
-async def markup_receipt_40(callback: CallbackQuery) -> None:
+async def markup_receipt_40(callback: CallbackQuery, bot: Bot) -> None:
     receipt_id = int(callback.data.rsplit(":", 1)[1])
     assert callback.from_user is not None
     owner_id = db.add_or_update_user(
@@ -1301,6 +2357,7 @@ async def markup_receipt_40(callback: CallbackQuery) -> None:
         await callback.message.answer("Наценка на этот чек уже была применена.")
         return
     updated = db.get_service_order(order_id)
+    await sync_service_order_cards(bot, updated)
     await callback.message.edit_reply_markup(reply_markup=receipt_action_keyboard(receipt_id, can_markup=False))
     await callback.message.answer(
         f"✅ Наценка 40% применена к {count} позициям.\n"
@@ -1568,7 +2625,9 @@ async def save_order_photo(message: Message, state: FSMContext, bot: Bot) -> Non
     if data.get("recognize_image"):
         await recognize_order_image(message, state, bot, message.photo[-1].file_id, "image/jpeg")
         return
-    db.add_order_photo(int(data["order_id"]), message.photo[-1].file_id, message.caption)
+    order_id = int(data["order_id"])
+    db.add_order_photo(order_id, message.photo[-1].file_id, message.caption)
+    await sync_service_order_cards(bot, db.get_service_order(order_id))
     await message.answer(f"✅ Фото работы сохранено. Всего: {db.count_order_photos(data['order_id'])}.")
 
 
@@ -1605,13 +2664,14 @@ async def direct_receipt_photo(message: Message, state: FSMContext, bot: Bot) ->
 
 
 @router.message(ConfirmReceipt.waiting, F.text == CONFIRM_RECEIPT)
-async def confirm_receipt(message: Message, state: FSMContext) -> None:
+async def confirm_receipt(message: Message, bot: Bot, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = int(data["receipt_order_id"])
     items = data.get("receipt_items", [])
     total_cost = int(data["receipt_total"])
     receipt = db.add_receipt(order_id, total_cost, [(str(name), article, quantity, unit_cost, item_total) for name, article, quantity, unit_cost, item_total in items])
     updated = db.get_service_order(order_id)
+    await sync_service_order_cards(bot, updated)
     await state.clear()
     await message.answer(
         f"✅ В заказ #{order_id} добавлены запчасти и себестоимость {total_cost:,} ₽.\n"
@@ -1651,10 +2711,15 @@ async def ai_usage(message: Message) -> None:
     )
 
 
-async def process_text(message: Message, text: str, state: FSMContext) -> None:
+async def process_text(
+    message: Message, text: str, state: FSMContext, bot: Bot
+) -> None:
     assert message.from_user is not None
     normalized_request = text.casefold().replace("ё", "е")
     owner_id = current_user_id(message)
+    if is_chat_cleanup_request(text):
+        await run_manual_chat_cleanup(message, bot, state, text)
+        return
     if "кто записан" in normalized_request or "записи на" in normalized_request:
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         if "завтра" in normalized_request:
@@ -1721,10 +2786,27 @@ async def process_text(message: Message, text: str, state: FSMContext) -> None:
         await message.answer("Достигнут лимит расходов ИИ. Обычные кнопки и поиск продолжают работать.")
         return
     api_key, model, _, _, _ = settings
+    recent_messages = db.get_recent_incoming_texts(message.from_user.id, limit=8)
+    ignored_context = {
+        SEARCH, CUSTOMERS, APPOINTMENTS, ORDERS, COMPLETE_ORDER, WORK_PHOTO,
+        RECEIPT_PHOTO, REPORT, AI_USAGE, CANCEL, "[медиа/голосовое]",
+    }
+    if recent_messages and recent_messages[-1].strip() in {text.strip(), "[медиа/голосовое]"}:
+        recent_messages = recent_messages[:-1]
+    conversation_context = [
+        safe_conversation_context(item) for item in recent_messages
+        if item.strip() not in ignored_context and not item.strip().isdigit()
+    ][-4:]
     try:
-        response = await parse_workshop_command(api_key, text, model)
+        response = await parse_workshop_command(
+            api_key, text, model, conversation_context
+        )
         record_ai_usage("text", response)
         command = response.value
+
+        if command.intent == "query_crm" or is_semantic_crm_read_request(text):
+            await show_semantic_crm_query(message, command, text)
+            return
 
         order_words = (
             "работ", "замен", "ремонт", "диагност", "стоим", "руб", "₽",
@@ -1744,7 +2826,9 @@ async def process_text(message: Message, text: str, state: FSMContext) -> None:
 
         if missing_order_data or suspicious_customer_only:
             advanced_model = settings[3]
-            advanced_response = await parse_workshop_command(api_key, text, advanced_model)
+            advanced_response = await parse_workshop_command(
+                api_key, text, advanced_model, conversation_context
+            )
             record_ai_usage("text_advanced_retry", advanced_response)
             advanced = advanced_response.value
             merged: dict[str, object] = {}
@@ -1793,7 +2877,7 @@ async def process_text(message: Message, text: str, state: FSMContext) -> None:
 
         command = fill_contact_and_appointment_from_text(command, text)
 
-        await apply_command(message, command, state, text)
+        await apply_command(message, command, state, bot, text)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать запрос: {error}")
     except Exception:
@@ -1820,14 +2904,14 @@ async def voice_to_crm(message: Message, bot: Bot, state: FSMContext) -> None:
             raise OpenRouterError("Не удалось скачать голосовое из Telegram.")
         transcript_response = await transcribe_voice(api_key, audio.getvalue(), transcription_model)
         record_ai_usage("transcription", transcript_response)
-        await process_text(message, transcript_response.value, state)
+        await process_text(message, transcript_response.value, state, bot)
     except OpenRouterError as error:
         await message.answer(f"Не удалось обработать голосовое: {error}")
 
 
 @router.message(F.text)
-async def text_to_crm(message: Message, state: FSMContext) -> None:
-    await process_text(message, message.text, state)
+async def text_to_crm(message: Message, bot: Bot, state: FSMContext) -> None:
+    await process_text(message, message.text, state, bot)
 
 
 async def main() -> None:
@@ -1857,20 +2941,15 @@ async def main() -> None:
             return
         timezone = ZoneInfo("Europe/Moscow")
         cleanup_hour = int(os.getenv("CHAT_CLEANUP_HOUR", "23"))
-        configured_chat_ids = os.getenv("CHAT_CLEANUP_CHAT_IDS", "")
-        cleanup_chat_ids = {ADMIN_ID}
-        for value in configured_chat_ids.split(","):
-            if value.strip():
-                try:
-                    cleanup_chat_ids.add(int(value.strip()))
-                except ValueError:
-                    logging.warning("Invalid CHAT_CLEANUP_CHAT_IDS value: %s", value)
+        cleanup_chat_ids = configured_chat_cleanup_ids()
         while True:
             now = datetime.now(timezone)
             if now.hour == cleanup_hour and now.minute >= 50:
                 for chat_id in cleanup_chat_ids:
                     deleted: list[int] = []
-                    for message_id in db.get_disposable_chat_messages(chat_id):
+                    for message_id in db.get_chat_messages(
+                        chat_id, include_important=True
+                    ):
                         try:
                             await bot.delete_message(chat_id, message_id)
                             deleted.append(message_id)

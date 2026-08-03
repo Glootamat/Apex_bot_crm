@@ -41,9 +41,16 @@ class WorkshopCommand:
     parts_cost: int | None
     parts_revenue: int | None
     parts_profit: int | None
+    parts_source: str | None
     parts_markup_percent: float | None
     order_id: int | None
     order_status: str | None
+    order_list_scope: str | None
+    query_entity: str | None
+    query_status: str | None
+    query_mode: str | None
+    query_period: str | None
+    query_has_recommendations: bool | None
     appointment_start: str | None
     concern: str | None
     agreed_amount: int | None
@@ -74,7 +81,7 @@ COMMAND_SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "create_appointment", "update_order", "markup_parts", "set_order_status", "list_orders", "delete_customer", "delete_car", "delete_order", "unknown"]},
+            "intent": {"type": "string", "enum": ["upsert_customer", "create_order", "create_appointment", "update_order", "markup_parts", "set_order_status", "list_orders", "query_crm", "delete_customer", "delete_car", "delete_order", "unknown"]},
             "customer_name": {"type": ["string", "null"]},
             "customer_phone": {"type": ["string", "null"]},
             "car_brand": {"type": ["string", "null"]},
@@ -88,6 +95,13 @@ COMMAND_SCHEMA = {
             "parts_cost": {"type": ["integer", "null"]},
             "parts_revenue": {"type": ["integer", "null"]},
             "parts_profit": {"type": ["integer", "null"], "description": "Явно указанная прибыль на запчастях, без выручки за работы."},
+            "parts_source": {
+                "anyOf": [
+                    {"type": "string", "enum": ["customer", "workshop"]},
+                    {"type": "null"},
+                ],
+                "description": "customer — запчасти привёз клиент; workshop — запчасти предоставляет сервис.",
+            },
             "parts_markup_percent": {"type": ["number", "null"]},
             "order_id": {"type": ["integer", "null"]},
             "order_status": {
@@ -96,6 +110,38 @@ COMMAND_SCHEMA = {
                     {"type": "null"},
                 ]
             },
+            "order_list_scope": {
+                "anyOf": [
+                    {"type": "string", "enum": ["in_progress", "closed", "no_show", "all"]},
+                    {"type": "null"},
+                ],
+                "description": "Какие заказы показать при intent=list_orders: в работе, закрытые, неявки или все.",
+            },
+            "query_entity": {
+                "anyOf": [
+                    {"type": "string", "enum": ["customers", "cars", "orders", "appointments"]},
+                    {"type": "null"},
+                ]
+            },
+            "query_status": {
+                "anyOf": [
+                    {"type": "string", "enum": ["in_progress", "closed", "scheduled", "no_show", "all"]},
+                    {"type": "null"},
+                ]
+            },
+            "query_mode": {
+                "anyOf": [
+                    {"type": "string", "enum": ["list", "count", "summary"]},
+                    {"type": "null"},
+                ]
+            },
+            "query_period": {
+                "anyOf": [
+                    {"type": "string", "enum": ["today", "tomorrow", "week", "all"]},
+                    {"type": "null"},
+                ]
+            },
+            "query_has_recommendations": {"type": ["boolean", "null"]},
             "appointment_start": {"type": ["string", "null"]},
             "concern": {"type": ["string", "null"], "description": "Причина обращения или жалоба клиента до начала работ."},
             "agreed_amount": {"type": ["integer", "null"], "minimum": 0, "description": "Сумма, заранее озвученная или согласованная с клиентом."},
@@ -103,7 +149,7 @@ COMMAND_SCHEMA = {
             "next_service_date": {"type": ["string", "null"], "description": "Дата следующего ТО в ISO 8601, если названа."},
             "next_service_mileage": {"type": ["integer", "null"], "description": "Пробег следующего ТО, если назван."},
         },
-        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_markup_percent", "order_id", "order_status", "appointment_start", "concern", "agreed_amount", "recommendations", "next_service_date", "next_service_mileage"],
+        "required": ["intent", "customer_name", "customer_phone", "car_brand", "car_model", "car_year", "plate_number", "vin", "mileage", "description", "labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "parts_source", "parts_markup_percent", "order_id", "order_status", "order_list_scope", "query_entity", "query_status", "query_mode", "query_period", "query_has_recommendations", "appointment_start", "concern", "agreed_amount", "recommendations", "next_service_date", "next_service_mileage"],
         "additionalProperties": False,
     },
 }
@@ -203,21 +249,42 @@ async def transcribe_voice(api_key: str, audio: bytes, model: str) -> AIResponse
     return AIResponse(text, actual_model, input_tokens, output_tokens, cost_usd)
 
 
-async def parse_workshop_command(api_key: str, text: str, model: str) -> AIResponse[WorkshopCommand]:
+async def parse_workshop_command(
+    api_key: str, text: str, model: str, context: list[str] | None = None
+) -> AIResponse[WorkshopCommand]:
     prompt = """Ты помощник CRM автосервиса. Разбери русское сообщение в структуру.
 intent:
 - upsert_customer: добавляют или меняют имя, телефон либо данные автомобиля, без работ;
 - create_order: описывают новый визит, выполненные работы, оплату или запчасти;
 - update_order: дополняют уже существующий заказ для указанной машины (например «добавь фильтр»); суммы должны быть только добавляемыми суммами;
 - set_order_status: меняют статус заказа. Фразы «закрой заказ», «заверши заказ», «машина готова», «ремонт закончен», «Kia Rio готова» означают order_status=ready. Фразы «машина приехала», «принял машину», «в работу», «снова в работе» означают order_status=in_progress. Если назван номер заказа, заполни order_id;
-- list_orders: просят показать заказ-наряды/историю;
+- list_orders: просят показать заказ-наряды или историю. Обязательно учитывай смысл запроса:
+  «в работе/активные» -> order_list_scope=in_progress,
+  «закрытые/завершённые/готовые/выполненные» -> order_list_scope=closed,
+  «не приехали/неявки/no-show» -> order_list_scope=no_show,
+  «все» -> order_list_scope=all. Если ограничение не названо, используй all;
+- query_crm: любой нестандартный запрос на просмотр, поиск, подсчёт, сравнение или анализ
+  данных CRM, который не сводится только к списку заказ-нарядов. Примеры: «покажи клиентов
+  в работе» -> query_entity=customers, query_status=in_progress, query_mode=list;
+  «сколько машин ожидается» -> cars/scheduled/count; «кто из них уже готов» -> customers/closed/list;
+  «у кого есть рекомендации» -> customers/all/list и query_has_recommendations=true.
+  Периоды: сегодня=today, завтра=tomorrow, ближайшие 7 дней=week, без периода=all;
 - delete_customer, delete_car, delete_order: просят удалить клиента, автомобиль или заказ; извлеки максимум идентификаторов;
 - unknown: запрос не относится к CRM.
-Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Имя клиента необязательно: запись с телефоном и автомобилем без ФИО допустима, поэтому не подставляй вымышленное имя. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет. Причину первоначального обращения положи в concern. Фразы «озвучил», «согласовали», «предварительно будет стоить» относятся к agreed_amount. Советы на следующий визит положи в recommendations. Дату или пробег следующего ТО положи в next_service_date/next_service_mileage."""
+Сначала определи фактическую цель пользователя и ограничения запроса, даже если фраза нестандартная
+или не совпадает с названием кнопки CRM. Не подменяй запрошенную выборку ближайшей доступной функцией.
+Не придумывай данные: отсутствующие значения ставь null. Номер телефона, имя, марку, модель, госномер, VIN и пробег извлекай независимо от порядка слов. Никогда не включай в customer_name VIN, адрес/местность, описание работ или фразы о запчастях. Фразы «запчасти клиента», «со своими запчастями» означают parts_source=customer; «наши запчасти», «запчасти сервиса» означают parts_source=workshop. Имя клиента необязательно: запись с телефоном и автомобилем без ФИО допустима, поэтому не подставляй вымышленное имя. Суммы указывай в рублях. Если сказано «на масле/запчастях заработали 500», укажи parts_profit=500, а labor_revenue не заполняй. Описание оставляй null, если работ нет. Причину первоначального обращения положи в concern. Фразы «озвучил», «согласовали», «предварительно будет стоить» относятся к agreed_amount. Советы на следующий визит положи в recommendations. Дату или пробег следующего ТО положи в next_service_date/next_service_mileage."""
     now = datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="minutes")
+    context_text = ""
+    if context:
+        context_text = (
+            "\nКонтекст предыдущих сообщений пользователя, от старых к новым:\n- "
+            + "\n- ".join(context[-6:])
+            + "\nУчитывай его для местоимений и продолжений, но текущая команда важнее."
+        )
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": prompt + f"""
+        "messages": [{"role": "system", "content": prompt + context_text + f"""
 - create_appointment: клиент записывается на будущую дату или время, а работы ещё не выполнены. Заполни appointment_start в ISO 8601 с часовым поясом +03:00. Текущее московское время: {now}.
 - markup_parts: user asks to mark up parts from a receipt/cart by a percentage. Set parts_markup_percent, and extract order_id or vehicle details. Do not set parts_profit for this intent."""}, {"role": "user", "content": text}],
         "response_format": {"type": "json_schema", "json_schema": COMMAND_SCHEMA},
