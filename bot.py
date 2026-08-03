@@ -1943,7 +1943,9 @@ async def customers_button(message: Message) -> None:
     await message.answer("👥 Клиенты:", reply_markup=main_keyboard)
     for overview in customers[:20]:
         customer = overview.customer
-        lines = [f"👤 {customer.full_name}", f"📞 {customer.phone or 'телефон не указан'}"]
+        customer_phones = db.get_customer_phones(customer.id)
+        phone_text = " · ".join(customer_phones) if customer_phones else "телефон не указан"
+        lines = [f"👤 {customer.full_name}", f"📞 {phone_text}"]
         vins: list[tuple[str, str]] = []
         if not overview.cars:
             lines.append("Автомобили не добавлены")
@@ -2027,8 +2029,13 @@ async def open_customer_card(callback: CallbackQuery) -> None:
         "👤 Карточка клиента",
         "",
         f"Имя: {customer.full_name}",
-        f"Телефон: {customer.phone or 'не указан'}",
+        f"Телефоны: {' · '.join(db.get_customer_phones(customer.id)) or 'не указан'}",
     ]
+    imported_notes = db.get_customer_notes(customer.id, limit=5)
+    if imported_notes:
+        lines.extend(["", "📝 Импортированные заметки:"])
+        for note in imported_notes:
+            lines.append(str(note["note_text"]))
     vins: list[tuple[str, str]] = []
     if overview is None or not overview.cars:
         lines.extend(["", "🚘 Автомобили не добавлены"])

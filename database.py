@@ -254,6 +254,40 @@ class Database:
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS customer_notes (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER NOT NULL,
+                    note_text TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+                    UNIQUE(customer_id, note_text, source)
+                );
+
+                CREATE TABLE IF NOT EXISTS customer_phones (
+                    id INTEGER PRIMARY KEY,
+                    customer_id INTEGER NOT NULL,
+                    phone TEXT NOT NULL,
+                    phone_normalized TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+                    UNIQUE(customer_id, phone_normalized)
+                );
+
+                CREATE TABLE IF NOT EXISTS contact_imports (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    source_index INTEGER NOT NULL,
+                    customer_id INTEGER NOT NULL,
+                    car_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+                    FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE SET NULL,
+                    UNIQUE(user_id, source_fingerprint, source_index)
+                );
+
                 CREATE TABLE IF NOT EXISTS order_photos (
                     id INTEGER PRIMARY KEY,
                     service_order_id INTEGER NOT NULL,
@@ -439,6 +473,10 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_customers_user_active ON customers(user_id, archived_at);
                 CREATE INDEX IF NOT EXISTS idx_customers_phone_normalized ON customers(user_id, phone_normalized);
+                CREATE INDEX IF NOT EXISTS idx_customer_notes_customer ON customer_notes(customer_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_customer_phones_customer ON customer_phones(customer_id);
+                CREATE INDEX IF NOT EXISTS idx_customer_phones_normalized ON customer_phones(phone_normalized);
+                CREATE INDEX IF NOT EXISTS idx_contact_imports_customer ON contact_imports(customer_id);
                 CREATE INDEX IF NOT EXISTS idx_cars_user_active ON cars(user_id, archived_at);
                 CREATE INDEX IF NOT EXISTS idx_cars_customer ON cars(customer_id);
                 CREATE INDEX IF NOT EXISTS idx_cars_plate_normalized ON cars(user_id, plate_normalized);
@@ -529,6 +567,70 @@ class Database:
                 (telegram_id, customer_id),
             ).fetchone()
             return Customer(**dict(row)) if row is not None else None
+        finally:
+            connection.close()
+
+    def get_customer_notes(self, customer_id: int, limit: int = 10) -> list[dict[str, object]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT note_text, source, created_at FROM customer_notes
+                   WHERE customer_id = ? ORDER BY id DESC LIMIT ?""",
+                (customer_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def get_customer_phones(self, customer_id: int) -> list[str]:
+        connection = self.connect()
+        try:
+            customer = connection.execute(
+                "SELECT phone, phone_normalized FROM customers WHERE id = ?", (customer_id,)
+            ).fetchone()
+            if customer is None:
+                return []
+            phones: list[str] = []
+            normalized: set[str] = set()
+            if customer["phone"]:
+                phones.append(str(customer["phone"]))
+                key = str(customer["phone_normalized"] or self.normalize_phone(customer["phone"]) or "")
+                normalized.add(key)
+            rows = connection.execute(
+                """SELECT phone, phone_normalized FROM customer_phones
+                   WHERE customer_id = ? ORDER BY id""",
+                (customer_id,),
+            ).fetchall()
+            for row in rows:
+                key = str(row["phone_normalized"])
+                if key not in normalized:
+                    phones.append(str(row["phone"]))
+                    normalized.add(key)
+            return phones
+        finally:
+            connection.close()
+
+    def add_customer_phone(self, customer_id: int, phone: str) -> bool:
+        normalized = self.normalize_phone(phone)
+        if not normalized:
+            return False
+        connection = self.connect()
+        try:
+            primary = connection.execute(
+                "SELECT phone_normalized, phone FROM customers WHERE id = ?", (customer_id,)
+            ).fetchone()
+            if primary is None:
+                return False
+            primary_normalized = primary["phone_normalized"] or self.normalize_phone(primary["phone"])
+            if primary_normalized == normalized:
+                return False
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO customer_phones (customer_id, phone, phone_normalized)
+                   VALUES (?, ?, ?)""",
+                (customer_id, phone, normalized),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
         finally:
             connection.close()
 
@@ -773,14 +875,26 @@ class Database:
     def find_customer(self, user_id: int, full_name: str | None, phone: str | None) -> Customer | None:
         connection = self.connect()
         try:
+            normalized_phone = self.normalize_phone(phone)
+            if normalized_phone:
+                row = connection.execute(
+                    """SELECT c.id, c.user_id, c.full_name, c.phone FROM customers c
+                       WHERE c.user_id = ? AND c.archived_at IS NULL
+                         AND (c.phone_normalized = ? OR EXISTS (
+                             SELECT 1 FROM customer_phones cp
+                             WHERE cp.customer_id = c.id AND cp.phone_normalized = ?
+                         ))
+                       ORDER BY c.id DESC LIMIT 1""",
+                    (user_id, normalized_phone, normalized_phone),
+                ).fetchone()
+                if row is not None:
+                    return Customer(**dict(row))
             rows = connection.execute(
                 """SELECT id, user_id, full_name, phone FROM customers
                    WHERE user_id = ? AND archived_at IS NULL ORDER BY id DESC""", (user_id,)
             ).fetchall()
             for row in rows:
                 if full_name and row["full_name"].casefold() == full_name.casefold():
-                    return Customer(**dict(row))
-                if phone and row["phone"] and self.normalize_phone(row["phone"]) == self.normalize_phone(phone):
                     return Customer(**dict(row))
             return None
         finally:
@@ -880,15 +994,21 @@ class Database:
     def search(self, telegram_id: int, query: str) -> dict[str, list[dict[str, object]]]:
         """Search client, car and order data without relying on SQLite's limited Unicode collation."""
         needle = query.casefold().replace(" ", "")
+        needle_digits = re.sub(r"\D", "", query)
         connection = self.connect()
         try:
             customers = [dict(row) for row in connection.execute(
-                """SELECT c.id, c.full_name, c.phone FROM customers c JOIN users u ON u.id = c.user_id
+                """SELECT c.id, c.full_name, c.phone,
+                          (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
+                           WHERE cp.customer_id = c.id) AS extra_phones
+                   FROM customers c JOIN users u ON u.id = c.user_id
                    WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             cars = [dict(row) for row in connection.execute(
                 """SELECT c.id, c.customer_id, c.brand, c.model, c.plate_number, c.vin, c.mileage,
-                          cu.full_name AS customer_name, cu.phone AS customer_phone
+                          cu.full_name AS customer_name, cu.phone AS customer_phone,
+                          (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
+                           WHERE cp.customer_id = cu.id) AS customer_extra_phones
                    FROM cars c JOIN users u ON u.id = c.user_id LEFT JOIN customers cu ON cu.id = c.customer_id
                    WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
@@ -906,11 +1026,17 @@ class Database:
             connection.close()
 
         def matches(values: list[object]) -> bool:
-            return any(needle in str(value or "").casefold().replace(" ", "") for value in values)
+            for value in values:
+                text = str(value or "")
+                if needle in text.casefold().replace(" ", ""):
+                    return True
+                if len(needle_digits) >= 6 and needle_digits in re.sub(r"\D", "", text):
+                    return True
+            return False
 
         return {
-            "customers": [row for row in customers if matches([row["full_name"], row["phone"]])][:10],
-            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"], row["customer_phone"]])][:10],
+            "customers": [row for row in customers if matches([row["full_name"], row["phone"], row["extra_phones"]])][:10],
+            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"], row["customer_phone"], row["customer_extra_phones"]])][:10],
             "orders": [row for row in orders if matches([
                 row["description"], row["brand"], row["model"], row["plate_number"],
                 row["customer_name"], row["photo_captions"],

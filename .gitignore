@@ -6,3 +6,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.log
+contact_import_preview.json
+contact_import_decisions.json

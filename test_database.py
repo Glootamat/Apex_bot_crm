@@ -215,6 +215,24 @@ class DatabaseTest(unittest.TestCase):
             backup = create_backup(directory_path / "test.sqlite3", directory_path / "backups")
             self.assertTrue(backup.exists())
 
+    def test_additional_customer_phone_is_displayed_found_and_searchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2011, "Master", None)
+            customer_id = db.add_customer(user_id, "Vadim Volga", "+7 928 363-12-54")
+            self.assertTrue(db.add_customer_phone(customer_id, "+7 987 069-32-41"))
+            self.assertFalse(db.add_customer_phone(customer_id, "+7 987 069-32-41"))
+            self.assertEqual(
+                db.get_customer_phones(customer_id),
+                ["+7 928 363-12-54", "+7 987 069-32-41"],
+            )
+            found = db.find_customer(user_id, None, "+79870693241")
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual(found.id, customer_id)
+            self.assertEqual(db.search(2011, "9870693241")["customers"][0]["id"], customer_id)
+
     def test_semantic_crm_snapshot_contains_linked_work_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
