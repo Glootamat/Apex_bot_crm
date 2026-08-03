@@ -160,6 +160,13 @@ class DatabaseTest(unittest.TestCase):
             db.remember_service_message_card(
                 -1001, 12, service_order_id=order.id
             )
+            appointment_id = db.add_appointment(
+                car_id, "Повторная диагностика", "2026-08-10T10:00:00+03:00"
+            )
+            db.remember_chat_message(-1001, 13, important=False)
+            db.remember_service_message_card(
+                -1001, 13, appointment_id=appointment_id
+            )
 
             self.assertEqual(db.get_disposable_chat_messages(-1001), [10])
             self.assertEqual(db.get_chat_messages(-1001, include_important=True), [10, 11])
@@ -170,7 +177,7 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(
                 db.get_chat_messages_for_cleanup(
                     -1001, today_only=True,
-                    keep_card_statuses={"in_progress"},
+                    keep_card_statuses={"in_progress", "scheduled"},
                 ),
                 [10, 11],
             )
@@ -179,7 +186,7 @@ class DatabaseTest(unittest.TestCase):
                     -1001, today_only=True,
                     keep_card_statuses={"ready"},
                 ),
-                [10, 11, 12],
+                [10, 11, 12, 13],
             )
 
     def test_new_plate_falls_back_to_existing_brand_and_model(self) -> None:

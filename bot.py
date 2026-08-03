@@ -779,11 +779,31 @@ async def ensure_cleanup_service_cards(
             )
             cards.append({"chat_id": sent.chat.id, "message_id": sent.message_id})
 
-    if "scheduled" not in keep_statuses:
-        return
+
+async def append_upcoming_appointment_cards(
+    bot: Bot, chat_ids: set[int]
+) -> int:
+    """Move current scheduled appointments to the bottom after a manual cleanup."""
     appointments = db.get_upcoming_appointments_for_telegram_user(ADMIN_ID, limit=100)
+    appended = 0
     for appointment in appointments:
         cards = db.get_service_message_cards_for_appointment(appointment.id)
+        for card in list(cards):
+            chat_id = int(card["chat_id"])
+            message_id = int(card["message_id"])
+            if chat_id not in chat_ids:
+                continue
+            removed = False
+            try:
+                await bot.delete_message(chat_id, message_id)
+                removed = True
+            except TelegramBadRequest as error:
+                if "message to delete not found" in str(error).casefold():
+                    removed = True
+            if removed:
+                db.forget_service_message_card(chat_id, message_id)
+                db.forget_chat_messages(chat_id, [message_id])
+                cards.remove(card)
         for chat_id in chat_ids:
             if any(int(card["chat_id"]) == chat_id for card in cards):
                 continue
@@ -796,6 +816,8 @@ async def ensure_cleanup_service_cards(
                 sent.chat.id, sent.message_id, appointment_id=appointment.id
             )
             cards.append({"chat_id": sent.chat.id, "message_id": sent.message_id})
+            appended += 1
+    return appended
 
 
 async def delete_tracked_chat_messages(
@@ -840,14 +862,20 @@ async def run_manual_chat_cleanup(
     await state.clear()
     keep_statuses = requested_cleanup_card_statuses(source_text)
     await ensure_cleanup_service_cards(bot, targets, keep_statuses)
+    upcoming_count = await append_upcoming_appointment_cards(bot, targets)
+    effective_keep_statuses = (
+        None if keep_statuses is None else {*keep_statuses, "scheduled"}
+    )
     deleted, failed = await delete_tracked_chat_messages(
         bot,
         targets,
         today_only=any(word in source_text.casefold() for word in ("сегодня", "сегодняш")),
-        keep_card_statuses=keep_statuses,
+        keep_card_statuses=effective_keep_statuses,
     )
     scope = "личном и рабочем чатах" if len(targets) > 1 else "указанном чате"
     result = f"🧹 Очистка выполнена сразу в {scope}. Удалено сообщений: {deleted}."
+    if upcoming_count:
+        result += f" Предстоящие записи добавлены в конец: {upcoming_count}."
     if failed:
         result += f" Не удалось удалить: {failed} (ограничение Telegram или права бота)."
     confirmation = await bot.send_message(
