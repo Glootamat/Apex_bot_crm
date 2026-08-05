@@ -1,0 +1,12 @@
+{
+  "name": "Apex Auto CRM",
+  "short_name": "Apex CRM",
+  "description": "Записи, заказ-наряды и клиенты автосервиса Apex Auto",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f2f4f7",
+  "theme_color": "#101828",
+  "icons": [
+    {"src": "/assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}

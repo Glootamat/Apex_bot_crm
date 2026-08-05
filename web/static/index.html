@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101828">
+  <meta name="description" content="Apex CRM — управление записями и заказ-нарядами автосервиса">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <title>Apex CRM</title>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-mark">A</div>
+      <div>
+        <div class="eyebrow">APEX AUTO</div>
+        <h1>CRM сервиса</h1>
+      </div>
+      <button id="refreshButton" class="icon-button" aria-label="Обновить">↻</button>
+    </header>
+
+    <main id="dashboard" hidden>
+      <section class="welcome">
+        <p id="todayLabel" class="muted"></p>
+        <h2>Рабочий день</h2>
+      </section>
+
+      <section class="metrics" aria-label="Показатели">
+        <article class="metric metric-primary">
+          <span>Заработок сегодня</span>
+          <strong id="todayProfit">—</strong>
+        </article>
+        <article class="metric">
+          <span>В работе</span>
+          <strong id="activeOrders">—</strong>
+        </article>
+        <article class="metric">
+          <span>Записей впереди</span>
+          <strong id="appointmentsCount">—</strong>
+        </article>
+      </section>
+
+      <section class="search-card">
+        <label for="searchInput">Поиск по всей CRM</label>
+        <div class="search-row">
+          <input id="searchInput" type="search" placeholder="Имя, телефон, авто, VIN, номер…" autocomplete="off">
+          <button id="searchButton" class="primary-button">Найти</button>
+        </div>
+        <div id="searchResults" class="results" hidden></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div><span class="eyebrow">РАСПИСАНИЕ</span><h2>Ближайшие записи</h2></div>
+        </div>
+        <div id="appointments" class="card-list"></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div><span class="eyebrow">СЕРВИС</span><h2>Заказ-наряды в работе</h2></div>
+        </div>
+        <div id="orders" class="card-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="loginScreen" class="login-screen">
+    <form id="loginForm" class="login-card">
+      <div class="login-logo">A</div>
+      <span class="eyebrow">APEX AUTO</span>
+      <h2>Вход в CRM</h2>
+      <p class="muted">Данные клиентов доступны только авторизованным сотрудникам.</p>
+      <label>Логин<input id="username" name="username" autocomplete="username" required></label>
+      <label>Пароль<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="error" role="alert"></p>
+      <button class="primary-button wide" type="submit">Войти</button>
+    </form>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

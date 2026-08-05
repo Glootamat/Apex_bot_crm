@@ -1,0 +1,64 @@
+:root {
+  color-scheme: light;
+  --ink: #101828;
+  --muted: #667085;
+  --line: #e4e7ec;
+  --paper: #ffffff;
+  --canvas: #f2f4f7;
+  --accent: #d64a2f;
+  --accent-dark: #a83220;
+  --success: #067647;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--canvas); color: var(--ink); min-height: 100vh; }
+button, input { font: inherit; }
+button { cursor: pointer; }
+.app-shell { width: min(760px, 100%); margin: 0 auto; min-height: 100vh; background: var(--paper); }
+.topbar { display: flex; align-items: center; gap: 12px; padding: max(18px, env(safe-area-inset-top)) 20px 16px; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; background: rgba(255,255,255,.94); backdrop-filter: blur(12px); }
+.brand-mark, .login-logo { display: grid; place-items: center; background: var(--ink); color: white; font-weight: 800; border-radius: 14px; width: 46px; height: 46px; font-size: 24px; }
+.topbar h1 { margin: 1px 0 0; font-size: 19px; }
+.eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: .14em; }
+.icon-button { margin-left: auto; width: 42px; height: 42px; border-radius: 12px; border: 1px solid var(--line); background: white; font-size: 24px; }
+main { padding: 22px 18px 48px; }
+.welcome h2, .section-heading h2 { margin: 3px 0 0; font-size: 25px; }
+.muted { color: var(--muted); margin: 0; }
+.metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0; }
+.metric { min-height: 112px; padding: 16px; border: 1px solid var(--line); border-radius: 18px; display: flex; flex-direction: column; justify-content: space-between; }
+.metric-primary { grid-column: 1 / -1; color: white; background: linear-gradient(135deg, var(--ink), #344054); border: 0; }
+.metric span { font-size: 13px; opacity: .78; }
+.metric strong { font-size: 29px; }
+.search-card { background: #fff7f5; border: 1px solid #f8d6cf; border-radius: 18px; padding: 16px; margin: 22px 0 28px; }
+.search-card label, .login-card label { display: grid; gap: 7px; font-weight: 700; font-size: 13px; }
+.search-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 9px; }
+input { width: 100%; border: 1px solid #d0d5dd; border-radius: 12px; padding: 12px 13px; background: white; outline: none; }
+input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(214,74,47,.12); }
+.primary-button { border: 0; border-radius: 12px; padding: 12px 17px; color: white; background: var(--accent); font-weight: 800; }
+.primary-button:hover { background: var(--accent-dark); }
+.wide { width: 100%; margin-top: 5px; }
+.section-block { margin-top: 30px; }
+.section-heading { display: flex; align-items: end; justify-content: space-between; margin-bottom: 12px; }
+.card-list, .results { display: grid; gap: 9px; }
+.data-card { border: 1px solid var(--line); border-radius: 16px; padding: 15px; background: white; }
+.data-card h3 { margin: 0 0 6px; font-size: 16px; }
+.data-card p { margin: 4px 0; color: var(--muted); font-size: 14px; }
+.badge { display: inline-flex; padding: 5px 8px; border-radius: 99px; color: var(--success); background: #ecfdf3; font-size: 12px; font-weight: 800; }
+.results { margin-top: 13px; max-height: 460px; overflow: auto; }
+.results h3 { margin: 8px 0 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.empty { padding: 22px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 16px; }
+.login-screen { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: #101828; }
+.login-card { width: min(390px, 100%); display: grid; gap: 15px; background: white; padding: 28px; border-radius: 24px; box-shadow: 0 24px 70px rgba(0,0,0,.3); }
+.login-card h2 { margin: 0; font-size: 27px; }
+.login-logo { margin-bottom: 4px; background: var(--accent); }
+.error { color: #b42318; min-height: 18px; margin: 0; font-size: 13px; }
+.toast { position: fixed; left: 50%; bottom: 25px; transform: translateX(-50%); padding: 11px 16px; border-radius: 99px; color: white; background: var(--ink); z-index: 30; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+@media (min-width: 640px) {
+  .metrics { grid-template-columns: 2fr 1fr 1fr; }
+  .metric-primary { grid-column: auto; }
+  .metric { min-height: 130px; }
+}
+@media (max-width: 420px) {
+  .search-row { grid-template-columns: 1fr; }
+  .primary-button { width: 100%; }
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=Apex Auto CRM Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=apexcrm
+Group=apexcrm
+WorkingDirectory=/opt/apex-crm
+EnvironmentFile=/opt/apex-crm/.env
+ExecStart=/opt/apex-crm/.venv/bin/python /opt/apex-crm/bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apex-crm
+
+[Install]
+WantedBy=multi-user.target
