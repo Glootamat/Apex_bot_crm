@@ -17,7 +17,7 @@ from aiogram.methods import SendMessage, SendPhoto, SendDocument
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from backup import create_backup, verify_backup
@@ -58,6 +58,7 @@ router.message.filter(F.from_user.id == ADMIN_ID)
 router.callback_query.filter(F.from_user.id == ADMIN_ID)
 
 ORDERS = "🧾 Заказ-наряды"
+COMPLETED_ORDERS = "✅ Выполненные заказ-наряды"
 APPOINTMENTS = "📅 Записи"
 COMPLETE_ORDER = "✅ Закрыть заказ"
 CUSTOMERS = "👥 Клиенты"
@@ -72,9 +73,9 @@ CONFIRM_RECEIPT = "Добавить запчасти"
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=SEARCH), KeyboardButton(text=CUSTOMERS)],
-        [KeyboardButton(text=APPOINTMENTS)],
-        [KeyboardButton(text=ORDERS)],
+        [KeyboardButton(text=SEARCH)],
+        [KeyboardButton(text=APPOINTMENTS), KeyboardButton(text=ORDERS)],
+        [KeyboardButton(text=COMPLETED_ORDERS)],
         [KeyboardButton(text=COMPLETE_ORDER), KeyboardButton(text=WORK_PHOTO)],
         [KeyboardButton(text=RECEIPT_PHOTO)],
         [KeyboardButton(text=REPORT), KeyboardButton(text=AI_USAGE)],
@@ -153,16 +154,30 @@ def order_detail_keyboard(order_id: int) -> InlineKeyboardMarkup:
                 text="🩺 Дефектовка и рекомендации",
                 callback_data=f"order:recommendations:{order_id}",
             )],
-            [
-                InlineKeyboardButton(text="🖼 Фото работ", callback_data=f"order:photos:{order_id}"),
-                InlineKeyboardButton(text="➕ Добавить фото", callback_data=f"order:add-photo:{order_id}"),
-            ],
+            [InlineKeyboardButton(
+                text="🖼 Посмотреть фото работ",
+                callback_data=f"order:photos:{order_id}",
+            )],
+            [InlineKeyboardButton(
+                text="➕ Добавить фотографию",
+                callback_data=f"order:add-photo:{order_id}",
+            )],
             [
                 InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:order:{order_id}"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:order:{order_id}"),
             ],
         ]
     )
+
+
+def completed_orders_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Сегодня", callback_data="orders:completed:1"),
+            InlineKeyboardButton(text="3 дня", callback_data="orders:completed:3"),
+        ],
+        [InlineKeyboardButton(text="7 дней", callback_data="orders:completed:7")],
+    ])
 
 
 def customer_action_keyboard(
@@ -260,7 +275,7 @@ async def show_receipts(message: Message) -> None:
     for overview in receipts:
         receipt = overview.receipt
         car = f"{overview.brand} {overview.model}" + (f" · {overview.plate_number}" if overview.plate_number else "")
-        customer = overview.customer_name or "клиент не указан"
+        customer = customer_name_label(overview.customer_name)
         lines = [f"Чек #{receipt.id} · заказ #{receipt.service_order_id}", f"Клиент: {customer}", f"Автомобиль: {car}"]
         for item in overview.items[:12]:
             quantity = f" × {item.quantity:g}" if item.quantity is not None else ""
@@ -292,6 +307,24 @@ def current_user_id(message: Message) -> int:
 def money(value: int) -> str:
     """Keep a formatted amount together when Telegram wraps a line."""
     return f"{value:,}".replace(",", "\u00a0") + "\u00a0₽"
+
+
+def known_customer_name(value: object) -> str | None:
+    """Hide internal phone-derived placeholders from user-facing cards."""
+    name = str(value or "").strip()
+    normalized = name.casefold().replace("ё", "е")
+    if not name or normalized in {
+        "неизвестно", "не указан", "не указано", "имя неизвестно",
+        "имя не указано", "клиент неизвестен", "клиент не указан",
+    }:
+        return None
+    if normalized.startswith("клиент +") and len(re.sub(r"\D", "", name)) >= 7:
+        return None
+    return name
+
+
+def customer_name_label(value: object, missing: str = "Имя не указано") -> str:
+    return known_customer_name(value) or missing
 
 
 def fill_contact_and_appointment_from_text(
@@ -471,7 +504,7 @@ def order_summary(order: ServiceOrder, prefix: str = "✅ Заказ-наряд 
     car = f"{order.brand} {order.model}" + (f" ({order.plate_number})" if order.plate_number else "")
     return (
         f"{prefix}\n\n"
-        f"👤 {order.customer_name or 'Клиент не указан'}\n"
+        f"👤 {customer_name_label(order.customer_name)}\n"
         f"🚘 {car}\n"
         + (f"Причина обращения: {order.concern}\n" if order.concern else "")
         + f"🔧 {order.description}\n"
@@ -503,7 +536,7 @@ def service_order_card_text(order: ServiceOrder) -> str:
             f"🗓 {appointment_datetime_label(starts_at, bool(appointment['is_flexible']))}"
         )
     lines.extend([
-        f"👤 {order.customer_name or 'Клиент не указан'}",
+        f"👤 {customer_name_label(order.customer_name)}",
         f"🚘 {car}",
     ])
     if order.mileage_at_visit:
@@ -608,6 +641,10 @@ def appointment_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
             text="🚫 Клиент не приехал",
             callback_data=f"appointment:no_show:{appointment_id}",
         )],
+        [InlineKeyboardButton(
+            text="✏️ Изменить запись",
+            callback_data=f"edit:appointment:{appointment_id}",
+        )],
     ])
 
 
@@ -620,14 +657,97 @@ def appointment_card_text(appointment: AppointmentOverview) -> str:
         f"📋 Основная карточка визита · запись #{appointment.id}\n"
         f"Статус: {order_status_label('planned')}\n"
         f"🗓 {appointment_datetime_label(starts_at, bool(appointment.is_flexible))}\n"
-        f"👤 {appointment.customer_name or 'Клиент не указан'}\n"
-        f"🚘 {car}\n"
+        f"👤 {customer_name_label(appointment.customer_name)}\n"
+        + (f"📞 {appointment.customer_phone}\n" if appointment.customer_phone else "")
+        + f"🚘 {car}\n"
         f"Причина обращения: {appointment.description}\n"
         f"{parts_source_label(appointment.parts_source)}"
         + (
             f"\nСогласовано: {money(appointment.agreed_amount)}"
             if appointment.agreed_amount is not None else ""
         )
+    )
+
+
+async def sync_appointment_cards(bot: Bot, appointment: AppointmentOverview) -> int:
+    updated = 0
+    for card in db.get_service_message_cards_for_appointment(appointment.id):
+        chat_id = int(card["chat_id"])
+        message_id = int(card["message_id"])
+        try:
+            await bot.edit_message_text(
+                appointment_card_text(appointment),
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=appointment_keyboard(appointment.id),
+            )
+            updated += 1
+        except TelegramBadRequest as error:
+            error_text = str(error).casefold()
+            if "message is not modified" in error_text:
+                updated += 1
+            elif "message to edit not found" in error_text:
+                db.forget_service_message_card(chat_id, message_id)
+            else:
+                logging.warning(
+                    "Could not update appointment card %s/%s: %s",
+                    chat_id, message_id, error,
+                )
+    return updated
+
+
+def edit_removes_customer(text: str) -> bool:
+    normalized = text.casefold().replace("ё", "е")
+    return any(phrase in normalized for phrase in (
+        "без имени", "без клиента", "клиент не указан", "имя не указано",
+        "удали имя", "убери имя", "отвяжи клиента", "не назначал",
+    ))
+
+
+def resolve_visit_car_for_edit(
+    user_id: int, current_car_id: int, command: WorkshopCommand, text: str
+) -> int:
+    """Resolve visit-specific car edits without mutating an unrelated contact's car."""
+    current = db.get_car_for_user(user_id, current_car_id)
+    if current is None:
+        raise ValueError("Автомобиль не найден")
+    remove_customer = edit_removes_customer(text)
+    has_car_change = any((
+        command.car_brand, command.car_model, command.car_year,
+        command.plate_number, command.vin, command.mileage,
+    ))
+    has_customer_change = bool(command.customer_name or command.customer_phone or remove_customer)
+    if not has_car_change and not has_customer_change:
+        return current_car_id
+
+    customer_id = current.customer_id
+    if remove_customer:
+        customer_id = None
+    elif command.customer_name or command.customer_phone:
+        customer = db.find_customer(user_id, command.customer_name, command.customer_phone)
+        if customer is None and command.customer_phone:
+            customer = db.find_or_add_customer_by_phone(
+                user_id, command.customer_phone, command.customer_name
+            )
+        elif customer is None and command.customer_name:
+            customer_id = db.add_customer(user_id, command.customer_name, None)
+        if customer is not None:
+            customer_id = customer.id
+
+    brand = command.car_brand or current.brand
+    model = command.car_model or current.model
+    plate = command.plate_number.upper() if command.plate_number else current.plate_number
+    vin = command.vin or current.vin
+    candidate = db.find_car_by_details(user_id, brand, model, plate, vin)
+    if candidate is not None and candidate.customer_id == customer_id:
+        return candidate.id
+
+    # A visit may have been accidentally attached to an existing contact. Make
+    # a separate car card so correcting this visit cannot rewrite their history.
+    return db.add_car(
+        user_id, brand, model, command.car_year or current.year, plate, customer_id,
+        vin, command.mileage or current.mileage, command.next_service_date,
+        command.next_service_mileage,
     )
 
 
@@ -914,12 +1034,20 @@ def record_ai_usage(task_type: str, response: object) -> None:
 
 
 async def show_orders(
-    message: Message, scope: str = "in_progress", command: WorkshopCommand | None = None
+    message: Message, scope: str = "in_progress", command: WorkshopCommand | None = None,
+    completed_days: int | None = None, telegram_id: int | None = None,
 ) -> None:
     assert message.from_user is not None
-    orders = db.get_recent_orders_for_telegram_user(message.from_user.id, limit=100)
+    owner_telegram_id = telegram_id if telegram_id is not None else message.from_user.id
+    if scope == "closed" and completed_days is not None:
+        orders = db.get_completed_orders_for_telegram_user(
+            owner_telegram_id, completed_days
+        )
+    else:
+        orders = db.get_recent_orders_for_telegram_user(owner_telegram_id, limit=100)
     if scope == "closed":
-        orders = [order for order in orders if order.status in {"ready", "completed"}]
+        if completed_days is None:
+            orders = [order for order in orders if order.status in {"ready", "completed"}]
     elif scope == "no_show":
         orders = [order for order in orders if order.status == "no_show"]
     elif scope == "all":
@@ -953,18 +1081,31 @@ async def show_orders(
         "no_show": "с неявкой клиента",
         "all": "за всё время",
     }
+    period_label = (
+        "за сегодня" if completed_days == 1
+        else f"за последние {completed_days} дня" if completed_days == 3
+        else f"за последние {completed_days} дней" if completed_days
+        else ""
+    )
     if not orders:
-        await message.answer(f"Заказ-нарядов {scope_labels[scope]} не найдено.")
+        await message.answer(
+            f"Выполненных заказ-нарядов {period_label} не найдено."
+            if completed_days else f"Заказ-нарядов {scope_labels[scope]} не найдено."
+        )
         return
     await message.answer(
-        f"🧾 Заказ-наряды {scope_labels[scope]}:", reply_markup=main_keyboard
+        (
+            f"✅ Выполненные заказ-наряды {period_label}:"
+            if completed_days else f"🧾 Заказ-наряды {scope_labels[scope]}:"
+        ),
+        reply_markup=main_keyboard,
     )
     for order in orders:
         car = f"{order.brand} {order.model}" + (f" · {order.plate_number}" if order.plate_number else "")
         status = order_status_label(order.status)
         text = (
             f"#{order.id} · {car}\n"
-            f"👤 {order.customer_name or 'Клиент не указан'}\n"
+            f"👤 {customer_name_label(order.customer_name)}\n"
             f"{order.description}\n"
             f"{status} · Прибыль {money(order.profit)}"
         )
@@ -1129,22 +1270,22 @@ async def show_semantic_crm_query(
         )
         if entity == "customers":
             lines.append(
-                f"• {item.get('customer_name') or 'Клиент не указан'} · {car}"
+                f"• {customer_name_label(item.get('customer_name'))} · {car}"
                 + (f" · заказ #{item['id']}" if "description" in item else "")
             )
         elif entity == "cars":
             lines.append(
-                f"• {car} · {item.get('customer_name') or 'Клиент не указан'}"
+                f"• {car} · {customer_name_label(item.get('customer_name'))}"
             )
         elif entity == "appointments":
             starts_at = datetime.fromisoformat(str(item["starts_at"]))
             lines.append(
                 f"• #{item['id']} · {appointment_datetime_label(starts_at, bool(item['is_flexible']))}"
-                f" · {item.get('customer_name') or 'Клиент не указан'} · {car}"
+                f" · {customer_name_label(item.get('customer_name'))} · {car}"
             )
         else:
             lines.append(
-                f"• #{item['id']} · {item.get('customer_name') or 'Клиент не указан'}"
+                f"• #{item['id']} · {customer_name_label(item.get('customer_name'))}"
                 f" · {car} · {item['description']}"
             )
         if command.query_has_recommendations and item.get("recommendations"):
@@ -1170,7 +1311,7 @@ async def open_order(callback: CallbackQuery) -> None:
     status = order_status_label(order.status)
     lines = [
         f"📋 Заказ-наряд #{order.id}",
-        f"Клиент: {order.customer_name or 'не указан'}",
+        f"Клиент: {customer_name_label(order.customer_name, 'не указано')}",
         f"Автомобиль: {car}",
         f"Статус: {status}",
         "",
@@ -1352,7 +1493,7 @@ async def order_text_for_client(callback: CallbackQuery) -> None:
     lines = [
         f"ЗАКАЗ-НАРЯД №{order.id}",
         "",
-        f"Клиент: {order.customer_name or 'не указан'}",
+        f"Клиент: {customer_name_label(order.customer_name, 'не указано')}",
         f"Автомобиль: {order.brand} {order.model}",
         f"Госномер: {order.plate_number or 'не указан'}",
         f"VIN: {order.vin or 'не указан'}",
@@ -1400,19 +1541,60 @@ async def show_search_result(message: Message, query: str) -> None:
     if not any(result.values()):
         await message.answer("Ничего не найдено.")
         return
+    normalized_query_phone = db.normalize_phone(query)
+    if normalized_query_phone and len(normalized_query_phone) >= 10:
+        exact_customers = []
+        for item in result["customers"]:
+            phones = db.get_customer_phones(int(item["id"]))
+            if any(
+                db.normalize_phone(phone) == normalized_query_phone
+                for phone in phones
+            ):
+                exact_customers.append((item, phones))
+        if exact_customers:
+            for item, phones in exact_customers:
+                customer_id = int(item["id"])
+                lines = [
+                    "🔎 Клиент найден по точному номеру",
+                    f"👤 {customer_name_label(item['full_name'])}",
+                    f"📞 {' · '.join(phones)}",
+                ]
+                vins: list[tuple[str, str]] = []
+                cars = [
+                    car for car in result["cars"]
+                    if car["customer_id"] is not None
+                    and int(car["customer_id"]) == customer_id
+                ]
+                if not cars:
+                    lines.append("🚘 Автомобили не добавлены")
+                for car in cars:
+                    title = f"🚘 {car['brand']} {car['model']}" + (
+                        f" · {car['plate_number']}" if car["plate_number"] else ""
+                    )
+                    lines.append(title)
+                    if car["vin"]:
+                        lines.append(f"VIN: {car['vin']}")
+                        vins.append((f"{car['brand']} {car['model']}", str(car["vin"])))
+                await message.answer(
+                    "\n".join(lines),
+                    reply_markup=customer_action_keyboard(
+                        customer_id, has_phone=bool(phones), vins=vins
+                    ),
+                )
+            return
     lines = [f"🔎 Результаты: {query}"]
     vin_buttons: list[list[InlineKeyboardButton]] = []
     customer_buttons: list[list[InlineKeyboardButton]] = []
     linked_customers: set[int] = set()
     for item in result["customers"]:
         lines.append(
-            f"\n👤 {item['full_name']}\n📞 {item['phone'] or 'телефон не указан'}"
+            f"\n👤 {customer_name_label(item['full_name'])}\n📞 {item['phone'] or 'телефон не указан'}"
         )
         customer_id = int(item["id"])
         linked_customers.add(customer_id)
         customer_buttons.append([
             InlineKeyboardButton(
-                text=f"📋 Карточка · {item['full_name']}",
+                text=f"📋 Карточка · {customer_name_label(item['full_name'])}",
                 callback_data=f"customer:open:{customer_id}",
             )
         ])
@@ -1429,7 +1611,7 @@ async def show_search_result(message: Message, query: str) -> None:
             ])
         if item["mileage"]:
             details.append(f"{item['mileage']} км")
-        owner = f"\nКлиент: {item['customer_name']}" if item["customer_name"] else ""
+        owner = f"\nКлиент: {customer_name_label(item['customer_name'], 'не указано')}"
         phone = f"\nТелефон: {item['customer_phone']}" if item["customer_phone"] else ""
         lines.append(f"\nАвтомобиль: {title}" + owner + phone + (f"\n{' · '.join(details)}" if details else ""))
         if item["customer_id"] is not None and int(item["customer_id"]) not in linked_customers:
@@ -1437,7 +1619,7 @@ async def show_search_result(message: Message, query: str) -> None:
             linked_customers.add(customer_id)
             customer_buttons.append([
                 InlineKeyboardButton(
-                    text=f"📋 Карточка · {item['customer_name']}",
+                    text=f"📋 Карточка · {customer_name_label(item['customer_name'])}",
                     callback_data=f"customer:open:{customer_id}",
                 )
             ])
@@ -1603,8 +1785,19 @@ async def apply_command(
         customer_id = None
 
     plate = command.plate_number.upper() if command.plate_number else None
-    car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, plate, command.vin)
-    if car is None and customer_id is not None:
+    has_car_identity = bool(
+        command.car_brand or command.car_model or plate or command.vin
+    )
+    if customer_id is not None:
+        car = db.find_customer_car_by_details(
+            owner_id, customer_id, command.car_brand, command.car_model,
+            plate, command.vin,
+        )
+    else:
+        car = db.find_car_by_details(
+            owner_id, command.car_brand, command.car_model, plate, command.vin
+        )
+    if car is None and customer_id is not None and not has_car_identity:
         car = db.find_single_car_for_customer(owner_id, customer_id)
     if car is None and command.car_brand and command.car_model:
         car_id = db.add_car(owner_id, command.car_brand, command.car_model, command.car_year, plate, customer_id, command.vin, command.mileage, command.next_service_date, command.next_service_mileage)
@@ -1671,8 +1864,12 @@ async def apply_command(
             f"📋 Основная карточка визита · запись #{appointment_id}\n"
             f"Статус: {order_status_label('planned')}\n"
             f"Когда: {appointment_datetime_label(starts_at, is_flexible)}\n"
-            f"Клиент: {(customer.full_name if customer else command.customer_name) or 'не указан'}\n"
-            f"Автомобиль: {command.car_brand or ''} {command.car_model or ''}"
+            f"Клиент: {customer_name_label(customer.full_name if customer else command.customer_name, 'не указано')}\n"
+            + (
+                f"Телефон: {customer.phone if customer else command.customer_phone}\n"
+                if (customer and customer.phone) or command.customer_phone else ""
+            )
+            + f"Автомобиль: {command.car_brand or ''} {command.car_model or ''}"
             + (f" · {plate}" if plate else "")
             + f"\nПричина обращения: {appointment_reason}"
             + f"\n{parts_source_label(command.parts_source)}"
@@ -1736,7 +1933,7 @@ async def request_delete(message: Message, command: WorkshopCommand, owner_id: i
     if command.intent == "delete_customer":
         customer = db.find_customer(owner_id, command.customer_name, command.customer_phone)
         if customer:
-            target_id, label = customer.id, f"клиента {customer.full_name} и все его автомобили с заказ-нарядами"
+            target_id, label = customer.id, f"клиента {customer_name_label(customer.full_name)} и все его автомобили с заказ-нарядами"
     elif command.intent == "delete_car":
         car = db.find_car_by_details(owner_id, command.car_brand, command.car_model, command.plate_number, command.vin)
         if car:
@@ -1767,7 +1964,15 @@ async def start(message: Message) -> None:
 @router.message(F.text == SEARCH)
 async def search_start(message: Message, state: FSMContext) -> None:
     await state.set_state(Search.query)
-    await message.answer("Введите имя, телефон, госномер или VIN.", reply_markup=cancel_keyboard)
+    await message.answer(
+        "Введите любые известные данные: имя или фамилию, телефон, автомобиль, "
+        "госномер, VIN, пробег, работу, рекомендацию, запчасть или сумму.\n"
+        "Если передумали — отправьте «Отмена».",
+        reply_markup=ForceReply(
+            selective=True,
+            input_field_placeholder="Что найти?",
+        ),
+    )
 
 
 @router.message(Search.query, F.text)
@@ -1783,6 +1988,28 @@ async def search_query(message: Message, state: FSMContext) -> None:
 @router.message(F.text == ORDERS)
 async def orders_button(message: Message) -> None:
     await show_orders(message)
+
+
+@router.message(F.text == COMPLETED_ORDERS)
+async def completed_orders_button(message: Message) -> None:
+    await message.answer(
+        "За какой период показать выполненные заказ-наряды?",
+        reply_markup=completed_orders_period_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("orders:completed:"))
+async def completed_orders_period(callback: CallbackQuery) -> None:
+    days = int(callback.data.rsplit(":", 1)[1])
+    if days not in {1, 3, 7}:
+        await callback.answer("Неизвестный период.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message is not None:
+        await show_orders(
+            callback.message, "closed", completed_days=days,
+            telegram_id=callback.from_user.id,
+        )
 
 
 @router.message(F.text == APPOINTMENTS)
@@ -1815,7 +2042,7 @@ async def show_appointments(message: Message, target_date: datetime | None = Non
         await message.answer(
             f"Запись #{appointment.id}\n"
             f"🗓 {appointment_datetime_label(starts_at, bool(appointment.is_flexible))}\n"
-            f"👤 {appointment.customer_name or 'Клиент не указан'}"
+            f"👤 {customer_name_label(appointment.customer_name)}"
             + (f" · {appointment.customer_phone}" if appointment.customer_phone else "")
             + f"\n🚘 {car}\n"
             f"Причина обращения: {appointment.description}"
@@ -1933,62 +2160,14 @@ async def close_order_cost(message: Message, bot: Bot, state: FSMContext) -> Non
 
 
 @router.message(F.text == CUSTOMERS)
-async def customers_button(message: Message) -> None:
-    assert message.from_user is not None
-    customers = db.get_customer_overviews(message.from_user.id)
-    unassigned_cars = db.get_unassigned_cars_for_telegram_user(message.from_user.id)
-    if not customers and not unassigned_cars:
-        await message.answer("Клиентов пока нет.")
-        return
-    await message.answer("👥 Клиенты:", reply_markup=main_keyboard)
-    for overview in customers[:20]:
-        customer = overview.customer
-        customer_phones = db.get_customer_phones(customer.id)
-        phone_text = " · ".join(customer_phones) if customer_phones else "телефон не указан"
-        lines = [f"👤 {customer.full_name}", f"📞 {phone_text}"]
-        vins: list[tuple[str, str]] = []
-        if not overview.cars:
-            lines.append("Автомобили не добавлены")
-        for item in overview.cars:
-            car = item.car
-            title = f"{car.brand} {car.model}" + (f" · {car.plate_number}" if car.plate_number else " · без номера")
-            car_lines = [title]
-            if car.vin:
-                car_lines.append(f"VIN: {car.vin}")
-                vins.append((f"{car.brand} {car.model}", car.vin))
-            car_lines.append(f"Заказов: {item.orders_total} · В работе: {item.in_progress} · Готово: {item.completed}")
-            lines.append("\n".join(car_lines))
-        await message.answer(
-            "\n".join(lines),
-            reply_markup=customer_action_keyboard(
-                customer.id, has_phone=bool(customer.phone), vins=vins
-            ),
-        )
-    if unassigned_cars:
-        await message.answer(
-            "🚘 Автомобили без привязанного клиента\n"
-            "Они сохранены, но имя и телефон владельца ещё не указаны."
-        )
-        for car in unassigned_cars[:20]:
-            lines = [
-                f"🚘 {car['brand']} {car['model']}"
-                + (f" · {car['plate_number']}" if car["plate_number"] else " · без номера"),
-                "👤 Клиент не указан",
-            ]
-            if car["vin"]:
-                lines.append(f"VIN: {car['vin']}")
-            if car["mileage"]:
-                lines.append(f"Пробег: {int(car['mileage']):,} км".replace(",", " "))
-            lines.append(
-                f"Заказов: {car['orders_total']} · В работе: {car['in_progress']} · "
-                f"Готово: {car['completed']}"
-            )
-            latest_order_id = car["latest_order_id"]
-            keyboard = (
-                order_list_keyboard(int(latest_order_id))
-                if latest_order_id is not None else main_keyboard
-            )
-            await message.answer("\n".join(lines), reply_markup=keyboard)
+async def customers_button(message: Message, state: FSMContext) -> None:
+    # Compatibility for an old Telegram keyboard that may still be visible.
+    await state.set_state(Search.query)
+    await message.answer(
+        "Общий список заменён поиском, чтобы не засорять чат. Введите имя, "
+        "телефон, автомобиль, номер, VIN или любые данные из карточки.",
+        reply_markup=cancel_keyboard,
+    )
 
 
 @router.callback_query(F.data.startswith("customer:contact:"))
@@ -2003,7 +2182,7 @@ async def open_customer_contact(callback: CallbackQuery) -> None:
         return
     await callback.message.answer_contact(
         phone_number=customer.phone,
-        first_name=customer.full_name,
+        first_name=customer_name_label(customer.full_name),
     )
 
 
@@ -2028,7 +2207,7 @@ async def open_customer_card(callback: CallbackQuery) -> None:
     lines = [
         "👤 Карточка клиента",
         "",
-        f"Имя: {customer.full_name}",
+        f"Имя: {customer_name_label(customer.full_name, 'не указано')}",
         f"Телефоны: {' · '.join(db.get_customer_phones(customer.id)) or 'не указан'}",
     ]
     imported_notes = db.get_customer_notes(customer.id, limit=5)
@@ -2093,7 +2272,7 @@ async def open_customer_history(callback: CallbackQuery) -> None:
         ),
         None,
     )
-    lines = ["📚 История клиента", "", f"👤 {customer.full_name}"]
+    lines = ["📚 История клиента", "", f"👤 {customer_name_label(customer.full_name)}"]
     buttons: list[list[InlineKeyboardButton]] = []
     history_count = 0
     if overview is not None:
@@ -2239,6 +2418,10 @@ async def edit_record(callback: CallbackQuery, state: FSMContext) -> None:
             "или «Алексей, Audi Q3, госномер А311АА»."
         ),
         "order": "Напишите, что изменить в заказе, например: «работы 5000, описание замена масла».",
+        "appointment": (
+            "Напишите все исправления обычным сообщением. Например:\n"
+            "«Лада Веста, без имени, завтра в 11:00, замена бензонасоса»."
+        ),
         "receipt": "Отправьте новую итоговую сумму чека одним числом.",
     }
     await callback.answer()
@@ -2326,7 +2509,7 @@ async def edit_record_value(message: Message, bot: Bot, state: FSMContext) -> No
         updated = db.get_customer_for_telegram_user(message.from_user.id, record_id)
         result = [
             "✅ Карточка клиента изменена.",
-            f"Имя: {updated.full_name}",
+            f"Имя: {customer_name_label(updated.full_name, 'не указано')}",
             f"Телефон: {updated.phone or 'не указан'}",
         ]
         if car_changed:
@@ -2354,9 +2537,101 @@ async def edit_record_value(message: Message, bot: Bot, state: FSMContext) -> No
         changed = db.update_receipt_total(owner_id, record_id, total)
         await state.clear()
         await message.answer("✅ Сумма чека изменена." if changed else "Чек не найден.", reply_markup=main_keyboard)
+    elif kind in {"order", "appointment"}:
+        assert message.from_user is not None
+        text = message.text.strip()
+        settings = openrouter_settings()
+        if settings is None or not ai_budget_available():
+            await message.answer(
+                "Для изменения карточки обычным текстом нужен доступный ИИ-парсер. "
+                "Проверьте API-ключ и лимит расходов."
+            )
+            return
+        try:
+            response = await parse_workshop_command(
+                settings[0],
+                f"Измени существующую карточку {kind} #{record_id}. "
+                f"Извлеки только явно указанные новые данные: {text}",
+                settings[1],
+            )
+            record_ai_usage("text", response)
+            command = fill_contact_and_appointment_from_text(response.value, text)
+        except OpenRouterError as error:
+            await message.answer(f"Не удалось распознать изменения: {error}")
+            return
+
+        if kind == "appointment":
+            appointment = db.get_appointment_for_telegram_user(
+                message.from_user.id, record_id
+            )
+            if appointment is None:
+                await state.clear()
+                await message.answer("Запись не найдена.", reply_markup=main_keyboard)
+                return
+            car_id = resolve_visit_car_for_edit(owner_id, appointment.car_id, command, text)
+            starts_at = command.appointment_start
+            is_flexible = None
+            if starts_at:
+                is_flexible = not bool(
+                    re.search(r"(?<!\d)\d{1,2}[:.]\d{2}(?!\d)", text)
+                )
+            try:
+                changed = db.update_appointment(
+                    owner_id, record_id, car_id=car_id,
+                    description=command.concern or command.description,
+                    starts_at=starts_at, agreed_amount=command.agreed_amount,
+                    is_flexible=is_flexible, parts_source=command.parts_source,
+                )
+            except ValueError as error:
+                await message.answer(f"Изменение не сохранено: {error}")
+                return
+            await state.clear()
+            updated = db.get_appointment_for_telegram_user(message.from_user.id, record_id)
+            if changed and updated is not None:
+                await sync_appointment_cards(bot, updated)
+                await message.answer(
+                    "✅ Запись изменена.\n\n" + appointment_card_text(updated),
+                    reply_markup=main_keyboard,
+                )
+            else:
+                await message.answer("Запись не найдена.", reply_markup=main_keyboard)
+            return
+
+        try:
+            order = db.get_service_order(record_id)
+        except ValueError:
+            await state.clear()
+            await message.answer("Заказ не найден.", reply_markup=main_keyboard)
+            return
+        if db.get_car_for_user(owner_id, order.car_id) is None:
+            await state.clear()
+            await message.answer("Заказ не найден.", reply_markup=main_keyboard)
+            return
+        car_id = resolve_visit_car_for_edit(owner_id, order.car_id, command, text)
+        if car_id != order.car_id:
+            order = db.reassign_order_car(owner_id, record_id, car_id)
+        order = db.update_service_order(
+            record_id, command.description, command.labor_revenue,
+            command.parts_cost, command.parts_revenue, command.parts_profit,
+            add_amounts=False,
+        )
+        if command.concern or command.agreed_amount is not None or command.recommendations:
+            order = db.update_order_crm_fields(
+                record_id, owner_id, concern=command.concern,
+                agreed_amount=command.agreed_amount,
+                recommendations=command.recommendations,
+            )
+        if command.parts_source:
+            order = db.update_order_parts_source(record_id, command.parts_source, owner_id)
+        await state.clear()
+        await sync_service_order_cards(bot, order)
+        await message.answer(
+            "✅ Карточка заказа изменена.\n\n" + service_order_card_text(order),
+            reply_markup=main_keyboard,
+        )
     else:
         await state.clear()
-        await process_text(message, f"Измени заказ #{record_id}: {message.text}", state, bot)
+        await message.answer("Неизвестный тип карточки.", reply_markup=main_keyboard)
 
 
 @router.callback_query(F.data.startswith("delete:"))
@@ -2591,7 +2866,7 @@ async def resolve_direct_receipt_target(
         return
     orders = db.get_active_orders_for_customer(owner_id, customer.id)
     if not orders:
-        await message.answer(f"У клиента {customer.full_name} нет заказ-нарядов в работе.")
+        await message.answer(f"У клиента {customer_name_label(customer.full_name)} нет заказ-нарядов в работе.")
         return
     if len(orders) == 1:
         await state.update_data(order_id=orders[0].id, recognize_image=True)
@@ -2599,7 +2874,7 @@ async def resolve_direct_receipt_target(
         return
     await state.set_state(DirectReceipt.choosing_order)
     await message.answer(
-        f"У клиента {customer.full_name} несколько автомобилей в работе. Выберите заказ:",
+        f"У клиента {customer_name_label(customer.full_name)} несколько автомобилей в работе. Выберите заказ:",
         reply_markup=receipt_order_choices(orders),
     )
 
@@ -2730,6 +3005,7 @@ async def report(message: Message) -> None:
         f"Не приехали (No-show): {data.no_shows}\n"
         f"Стоимость работ: {data.labor_revenue:,} ₽\n"
         f"Прибыль с запчастей: {data.parts_margin:,} ₽\n"
+        f"💵 Заработок за сегодня: {data.today_profit:,} ₽\n"
         f"💰 Общая прибыль: {data.profit:,} ₽".replace(",", " ")
     )
 
@@ -2810,7 +3086,7 @@ async def process_text(
         for entry in entries:
             last_visit = str(entry["last_visit"])[:10] if entry["last_visit"] else "визитов ещё не было"
             car = f"{entry['brand']} {entry['model']}" + (f" · {entry['plate_number']}" if entry["plate_number"] else "")
-            lines.append(f"• {entry['full_name']} · {car} · {last_visit}")
+            lines.append(f"• {customer_name_label(entry['full_name'])} · {car} · {last_visit}")
         await message.answer("\n".join(lines))
         return
     settings = openrouter_settings()
@@ -2823,7 +3099,8 @@ async def process_text(
     api_key, model, _, _, _ = settings
     recent_messages = db.get_recent_incoming_texts(message.from_user.id, limit=8)
     ignored_context = {
-        SEARCH, CUSTOMERS, APPOINTMENTS, ORDERS, COMPLETE_ORDER, WORK_PHOTO,
+        SEARCH, CUSTOMERS, APPOINTMENTS, ORDERS, COMPLETED_ORDERS,
+        COMPLETE_ORDER, WORK_PHOTO,
         RECEIPT_PHOTO, REPORT, AI_USAGE, CANCEL, "[медиа/голосовое]",
     }
     if recent_messages and recent_messages[-1].strip() in {text.strip(), "[медиа/голосовое]"}:
@@ -3042,7 +3319,7 @@ async def main() -> None:
                             reason.append(f"дата {str(item['next_service_date'])[:10]}")
                         if item["next_service_mileage"]:
                             reason.append(f"пробег {item['next_service_mileage']} км")
-                        lines.append(f"• {item['customer_name'] or 'Клиент не указан'} · {car} · {', '.join(reason)}")
+                        lines.append(f"• {customer_name_label(item['customer_name'])} · {car} · {', '.join(reason)}")
                     await bot.send_message(ADMIN_ID, "\n".join(lines))
             if now.hour == 20 and db.claim_daily_reminder(now.date().isoformat()):
                 orders = [

@@ -7,6 +7,71 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
+
+
+_SEARCH_TRANSLITERATION = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
+    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
+}
+
+_SEARCH_ALIASES = {
+    "tiana": "teana", "kashkay": "qashqai",
+    "shevrole": "chevrolet", "henday": "hyundai", "hunday": "hyundai",
+    "folksvagen": "volkswagen", "reno": "renault", "shkoda": "skoda",
+    "mersedes": "mercedes", "sitroen": "citroen", "pezho": "peugeot",
+    "mitsubisi": "mitsubishi", "deu": "daewoo", "dzhili": "geely",
+    "cheri": "chery", "bmv": "bmw", "kruz": "cruze", "fokus": "focus",
+    "kamri": "camry", "korolla": "corolla", "solyaris": "solaris",
+    "vaz": "lada",
+}
+
+_SEARCH_STOP_WORDS = {
+    "mashina", "avtomobil", "avto", "klient", "klienta", "naydi", "nayti",
+    "pokazhi", "poisk", "marka", "model", "nomer", "kartochka", "kartochku",
+}
+
+_PLATE_HOMOGLYPHS = str.maketrans({
+    "а": "a", "в": "b", "е": "e", "к": "k", "м": "m", "н": "h",
+    "о": "o", "р": "p", "с": "c", "т": "t", "у": "y", "х": "x",
+})
+
+
+def _search_tokens(value: object) -> list[str]:
+    text = str(value or "").casefold().replace("ё", "е")
+    transliterated = "".join(_SEARCH_TRANSLITERATION.get(char, char) for char in text)
+    tokens = re.findall(r"[a-z0-9]+", transliterated)
+    return [_SEARCH_ALIASES.get(token, token) for token in tokens]
+
+
+def _plate_search_key(value: object) -> str:
+    text = str(value or "").casefold().translate(_PLATE_HOMOGLYPHS)
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def _edit_distance_at_most_one(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) <= 1
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = long_index = differences = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        differences += 1
+        if differences > 1:
+            return False
+        long_index += 1
+    return True
 
 
 @dataclass(frozen=True)
@@ -78,6 +143,7 @@ class Report:
     parts_revenue: int
     parts_cost: int
     parts_profit: int
+    today_profit: int = 0
 
     @property
     def revenue(self) -> int:
@@ -184,6 +250,64 @@ class Database:
         if len(digits) == 11 and digits.startswith("8"):
             digits = "7" + digits[1:]
         return digits or None
+
+    def _find_duplicate_appointment(
+        self, connection: sqlite3.Connection, car_id: int, description: str,
+        starts_at: str, exclude_id: int | None = None,
+    ) -> sqlite3.Row | None:
+        """Prefer client phones for visit deduplication, then fall back to the car."""
+        target_phone_rows = connection.execute(
+            """SELECT cu.phone FROM cars c
+               JOIN customers cu ON cu.id = c.customer_id
+               WHERE c.id = ? AND cu.phone IS NOT NULL
+               UNION ALL
+               SELECT cp.phone FROM cars c
+               JOIN customer_phones cp ON cp.customer_id = c.customer_id
+               WHERE c.id = ?""",
+            (car_id, car_id),
+        ).fetchall()
+        target_phones = {
+            normalized for row in target_phone_rows
+            if (normalized := self.normalize_phone(row["phone"]))
+        }
+        target_day = datetime.fromisoformat(starts_at).date()
+        normalized_description = re.sub(r"\s+", " ", description).strip().casefold()
+        params: tuple[object, ...] = () if exclude_id is None else (exclude_id,)
+        exclude_sql = "" if exclude_id is None else "AND a.id != ?"
+        rows = connection.execute(
+            f"""SELECT a.id, a.car_id, a.starts_at, a.description, cu.phone,
+                       (SELECT GROUP_CONCAT(cp.phone, '|') FROM customer_phones cp
+                        WHERE cp.customer_id = c.customer_id) AS extra_phones
+                FROM appointments a
+                JOIN cars c ON c.id = a.car_id
+                LEFT JOIN customers cu ON cu.id = c.customer_id
+                WHERE a.status IN ('scheduled', 'in_progress') {exclude_sql}
+                ORDER BY a.id""",
+            params,
+        ).fetchall()
+        for row in rows:
+            if int(row["car_id"]) == car_id and str(row["starts_at"]) == starts_at:
+                return row
+            if datetime.fromisoformat(str(row["starts_at"])).date() != target_day:
+                continue
+            candidate_description = re.sub(
+                r"\s+", " ", str(row["description"])
+            ).strip().casefold()
+            if candidate_description != normalized_description:
+                continue
+            if target_phones:
+                candidate_values = [row["phone"]]
+                if row["extra_phones"]:
+                    candidate_values.extend(str(row["extra_phones"]).split("|"))
+                candidate_phones = {
+                    normalized for value in candidate_values
+                    if (normalized := self.normalize_phone(str(value or "")))
+                }
+                if target_phones & candidate_phones:
+                    return row
+            elif int(row["car_id"]) == car_id:
+                return row
+        return None
 
     @staticmethod
     def normalize_plate(value: str | None) -> str | None:
@@ -737,14 +861,15 @@ class Database:
     ) -> AppointmentSaveResult:
         connection = self.connect()
         try:
-            existing = connection.execute(
-                """SELECT id FROM appointments
-                   WHERE car_id = ? AND starts_at = ?
-                     AND status IN ('scheduled', 'in_progress')
-                   ORDER BY id LIMIT 1""",
-                (car_id, starts_at),
-            ).fetchone()
+            # Serialize the read/check/write sequence. The unique index below
+            # covers an identical time slot; this broader check also catches
+            # the same visit when natural-language parsing shifts its time.
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._find_duplicate_appointment(
+                connection, car_id, description, starts_at
+            )
             if existing is not None:
+                connection.rollback()
                 return AppointmentSaveResult(int(existing["id"]), False)
 
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(appointments)")}
@@ -822,6 +947,99 @@ class Database:
                 (telegram_id, limit),
             ).fetchall()
             return [AppointmentOverview(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def get_appointment_for_telegram_user(
+        self, telegram_id: int, appointment_id: int
+    ) -> AppointmentOverview | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at,
+                          a.status, c.brand, c.model, c.plate_number,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone,
+                          a.agreed_amount, a.is_flexible, a.parts_source
+                   FROM appointments a
+                   JOIN cars c ON c.id = a.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND a.id = ?""",
+                (telegram_id, appointment_id),
+            ).fetchone()
+            return AppointmentOverview(**dict(row)) if row is not None else None
+        finally:
+            connection.close()
+
+    def update_appointment(
+        self, user_id: int, appointment_id: int, *, car_id: int | None = None,
+        description: str | None = None, starts_at: str | None = None,
+        agreed_amount: int | None = None, is_flexible: bool | None = None,
+        parts_source: str | None = None,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            current = connection.execute(
+                """SELECT a.* FROM appointments a JOIN cars c ON c.id = a.car_id
+                   WHERE a.id = ? AND c.user_id = ?""",
+                (appointment_id, user_id),
+            ).fetchone()
+            if current is None:
+                return False
+            target_car_id = car_id if car_id is not None else int(current["car_id"])
+            if connection.execute(
+                "SELECT 1 FROM cars WHERE id = ? AND user_id = ?", (target_car_id, user_id)
+            ).fetchone() is None:
+                return False
+            target_start = starts_at or str(current["starts_at"])
+            target_description = description or str(current["description"])
+            duplicate = self._find_duplicate_appointment(
+                connection, target_car_id, target_description, target_start,
+                exclude_id=appointment_id,
+            )
+            if duplicate is not None:
+                raise ValueError(f"Duplicate active appointment #{duplicate['id']}")
+            appointment_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(appointments)")
+            }
+            if "ends_at" in appointment_columns:
+                ends_at = (datetime.fromisoformat(target_start) + timedelta(hours=1)).isoformat()
+                connection.execute(
+                    """UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
+                              ends_at = ?, agreed_amount = COALESCE(?, agreed_amount),
+                              is_flexible = COALESCE(?, is_flexible),
+                              parts_source = COALESCE(?, parts_source)
+                       WHERE id = ?""",
+                    (
+                        target_car_id, target_description, target_start, ends_at,
+                        agreed_amount, int(is_flexible) if is_flexible is not None else None,
+                        parts_source, appointment_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
+                              agreed_amount = COALESCE(?, agreed_amount),
+                              is_flexible = COALESCE(?, is_flexible),
+                              parts_source = COALESCE(?, parts_source)
+                       WHERE id = ?""",
+                    (
+                        target_car_id, target_description, target_start, agreed_amount,
+                        int(is_flexible) if is_flexible is not None else None,
+                        parts_source, appointment_id,
+                    ),
+                )
+            if current["service_order_id"] is not None and target_car_id != int(current["car_id"]):
+                connection.execute(
+                    "UPDATE service_orders SET car_id = ? WHERE id = ?",
+                    (target_car_id, current["service_order_id"]),
+                )
+            self._write_audit(
+                connection, user_id, "appointment", appointment_id, "updated",
+                f"car_id={target_car_id}; starts_at={target_start}; description={target_description!r}",
+            )
+            connection.commit()
+            return True
         finally:
             connection.close()
 
@@ -992,55 +1210,178 @@ class Database:
             connection.close()
 
     def search(self, telegram_id: int, query: str) -> dict[str, list[dict[str, object]]]:
-        """Search client, car and order data without relying on SQLite's limited Unicode collation."""
-        needle = query.casefold().replace(" ", "")
-        needle_digits = re.sub(r"\D", "", query)
+        """Rank token, transliterated, fuzzy and identifier matches across CRM fields."""
+        query_tokens = _search_tokens(query)
+        meaningful_tokens = [
+            token for token in query_tokens if token not in _SEARCH_STOP_WORDS
+        ]
+        if meaningful_tokens:
+            query_tokens = meaningful_tokens
+        query_compact = "".join(query_tokens)
+        query_digits = re.sub(r"\D", "", query)
+        query_plate = _plate_search_key(query)
         connection = self.connect()
         try:
             customers = [dict(row) for row in connection.execute(
                 """SELECT c.id, c.full_name, c.phone,
                           (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
-                           WHERE cp.customer_id = c.id) AS extra_phones
+                           WHERE cp.customer_id = c.id) AS extra_phones,
+                          (SELECT GROUP_CONCAT(cn.note_text, ' ') FROM customer_notes cn
+                           WHERE cn.customer_id = c.id) AS notes
                    FROM customers c JOIN users u ON u.id = c.user_id
-                   WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL
+                   ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             cars = [dict(row) for row in connection.execute(
-                """SELECT c.id, c.customer_id, c.brand, c.model, c.plate_number, c.vin, c.mileage,
+                """SELECT c.id, c.customer_id, c.brand, c.model, c.year,
+                          c.plate_number, c.vin, c.mileage, c.next_service_date,
+                          c.next_service_mileage,
                           cu.full_name AS customer_name, cu.phone AS customer_phone,
                           (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
-                           WHERE cp.customer_id = cu.id) AS customer_extra_phones
+                           WHERE cp.customer_id = cu.id) AS customer_extra_phones,
+                          (SELECT GROUP_CONCAT(cn.note_text, ' ') FROM customer_notes cn
+                           WHERE cn.customer_id = cu.id) AS customer_notes
                    FROM cars c JOIN users u ON u.id = c.user_id LEFT JOIN customers cu ON cu.id = c.customer_id
-                   WHERE u.telegram_id = ? ORDER BY c.id DESC""", (telegram_id,)
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL
+                   ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             orders = [dict(row) for row in connection.execute(
-                """SELECT o.id, o.description, o.status, c.brand, c.model, c.plate_number,
-                          cu.full_name AS customer_name,
+                """SELECT o.id, o.description, o.status, o.concern, o.agreed_amount,
+                          o.recommendations, o.labor_revenue, o.parts_cost,
+                          o.parts_revenue, o.parts_profit, o.parts_source,
+                          o.created_at, o.completed_at, o.mileage_at_visit,
+                          c.brand, c.model, c.year, c.plate_number, c.vin, c.mileage,
+                          c.next_service_date, c.next_service_mileage,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone,
+                          (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
+                           WHERE cp.customer_id = cu.id) AS customer_extra_phones,
+                          (SELECT GROUP_CONCAT(cn.note_text, ' ') FROM customer_notes cn
+                           WHERE cn.customer_id = cu.id) AS customer_notes,
                           (SELECT GROUP_CONCAT(op.caption, ' ')
                            FROM order_photos op
                            WHERE op.service_order_id = o.id
-                             AND op.photo_type = 'work') AS photo_captions
+                             AND op.photo_type = 'work') AS photo_captions,
+                          (SELECT GROUP_CONCAT(
+                              pi.name || ' ' || COALESCE(pi.article, '') || ' ' ||
+                              COALESCE(pi.quantity, '') || ' ' || COALESCE(pi.unit_cost, '') ||
+                              ' ' || COALESCE(pi.total_cost, ''), ' '
+                           ) FROM part_items pi
+                           WHERE pi.service_order_id = o.id) AS part_details,
+                          (SELECT GROUP_CONCAT(r.total_cost, ' ') FROM receipts r
+                           WHERE r.service_order_id = o.id) AS receipt_totals
                    FROM service_orders o JOIN cars c ON c.id = o.car_id JOIN users u ON u.id = c.user_id
-                   LEFT JOIN customers cu ON cu.id = c.customer_id WHERE u.telegram_id = ? ORDER BY o.id DESC""", (telegram_id,)
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND o.archived_at IS NULL
+                   ORDER BY o.id DESC""", (telegram_id,)
             ).fetchall()]
         finally:
             connection.close()
 
-        def matches(values: list[object]) -> bool:
-            for value in values:
-                text = str(value or "")
-                if needle in text.casefold().replace(" ", ""):
-                    return True
-                if len(needle_digits) >= 6 and needle_digits in re.sub(r"\D", "", text):
-                    return True
-            return False
+        def match_score(values: list[object]) -> int | None:
+            haystack_tokens = [
+                token for value in values for token in _search_tokens(value)
+            ]
+            if not haystack_tokens:
+                return None
+            score = 0
+            haystack_compact = "".join(haystack_tokens)
+            if query_compact and query_compact in haystack_compact:
+                score += 100
+            digits_match = len(query_digits) >= 4 and any(
+                query_digits in re.sub(r"\D", "", str(value or ""))
+                for value in values
+            )
+            if digits_match:
+                score += 100
+            plate_match = (
+                any(char.isdigit() for char in query)
+                and len(query_plate) >= 4
+                and any(
+                query_plate in _plate_search_key(value) for value in values
+                )
+            )
+            if plate_match:
+                score += 100
+
+            for query_token in query_tokens:
+                if digits_match and query_token.isdigit():
+                    continue
+                if plate_match and len(query_tokens) == 1:
+                    continue
+                if query_token.isdigit() and len(query_token) >= 4:
+                    # Long numeric identifiers (phones, amounts, mileage, years)
+                    # must match their full normalized digit sequence. Matching
+                    # one formatted phone segment such as "919" creates noise.
+                    return None
+                best = 0
+                for candidate in haystack_tokens:
+                    if query_token == candidate:
+                        best = max(best, 30)
+                    elif not query_token.isdigit() and min(len(query_token), len(candidate)) >= 3 and (
+                        query_token in candidate or candidate in query_token
+                    ):
+                        best = max(best, 20)
+                    elif (
+                        not query_token.isdigit()
+                        and len(query_token) >= 4 and len(candidate) >= 4
+                        and _edit_distance_at_most_one(query_token, candidate)
+                    ):
+                        best = max(best, 10)
+                if best == 0:
+                    return None
+                score += best
+            return score or None
+
+        def ranked(
+            rows: list[dict[str, object]],
+            values_for: Callable[[dict[str, object]], list[object]],
+        ) -> list[dict[str, object]]:
+            matches: list[tuple[int, int, dict[str, object]]] = []
+            for row in rows:
+                values = values_for(row)
+                score = match_score(values)
+                if score is not None:
+                    matches.append((score, int(row["id"]), row))
+            matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return [row for _, _, row in matches[:10]]
+
+        def order_search_values(row: dict[str, object]) -> list[object]:
+            status_alias = {
+                "in_progress": "в работе активный",
+                "ready": "готов выполнен закрыт",
+                "completed": "готов выполнен закрыт",
+                "no_show": "не приехал неявка",
+            }.get(str(row["status"]), "")
+            parts_source_alias = {
+                "customer": "запчасти клиента клиентские",
+                "workshop": "запчасти сервиса наши",
+            }.get(str(row["parts_source"]), "")
+            return [
+                row["id"], row["description"], row["status"], status_alias,
+                row["concern"], row["agreed_amount"], row["recommendations"],
+                row["labor_revenue"], row["parts_cost"], row["parts_revenue"],
+                row["parts_profit"], row["parts_source"], parts_source_alias,
+                row["created_at"], row["completed_at"], row["mileage_at_visit"],
+                row["brand"], row["model"], row["year"], row["plate_number"],
+                row["vin"], row["mileage"], row["next_service_date"],
+                row["next_service_mileage"], row["customer_name"],
+                row["customer_phone"], row["customer_extra_phones"],
+                row["customer_notes"], row["photo_captions"],
+                row["part_details"], row["receipt_totals"],
+            ]
 
         return {
-            "customers": [row for row in customers if matches([row["full_name"], row["phone"], row["extra_phones"]])][:10],
-            "cars": [row for row in cars if matches([row["brand"], row["model"], row["plate_number"], row["vin"], row["customer_name"], row["customer_phone"], row["customer_extra_phones"]])][:10],
-            "orders": [row for row in orders if matches([
-                row["description"], row["brand"], row["model"], row["plate_number"],
-                row["customer_name"], row["photo_captions"],
-            ])][:10],
+            "customers": ranked(customers, lambda row: [
+                row["full_name"], row["phone"], row["extra_phones"], row["notes"],
+            ]),
+            "cars": ranked(cars, lambda row: [
+                row["brand"], row["model"], row["year"], row["plate_number"],
+                row["vin"], row["mileage"], row["next_service_date"],
+                row["next_service_mileage"], row["customer_name"],
+                row["customer_phone"], row["customer_extra_phones"],
+                row["customer_notes"],
+            ]),
+            "orders": ranked(orders, order_search_values),
         }
 
     def log_ai_usage(self, task_type: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
@@ -1093,6 +1434,49 @@ class Database:
         finally:
             connection.close()
 
+    def get_car_for_user(self, user_id: int, car_id: int) -> Car | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT id, user_id, customer_id, brand, model, year, plate_number,
+                          vin, mileage, next_service_date, next_service_mileage
+                   FROM cars WHERE user_id = ? AND id = ? AND archived_at IS NULL""",
+                (user_id, car_id),
+            ).fetchone()
+            return Car(**dict(row)) if row is not None else None
+        finally:
+            connection.close()
+
+    def reassign_order_car(self, user_id: int, order_id: int, car_id: int) -> ServiceOrder:
+        connection = self.connect()
+        try:
+            owned_car = connection.execute(
+                "SELECT 1 FROM cars WHERE id = ? AND user_id = ? AND archived_at IS NULL",
+                (car_id, user_id),
+            ).fetchone()
+            order = connection.execute(
+                """SELECT o.car_id FROM service_orders o JOIN cars c ON c.id = o.car_id
+                   WHERE o.id = ? AND c.user_id = ? AND o.archived_at IS NULL""",
+                (order_id, user_id),
+            ).fetchone()
+            if owned_car is None or order is None:
+                raise ValueError("Order or car does not exist")
+            connection.execute(
+                "UPDATE service_orders SET car_id = ? WHERE id = ?", (car_id, order_id)
+            )
+            connection.execute(
+                "UPDATE appointments SET car_id = ? WHERE service_order_id = ?",
+                (car_id, order_id),
+            )
+            self._write_audit(
+                connection, user_id, "order", order_id, "car_reassigned",
+                f"car_id={order['car_id']} -> {car_id}",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id)
+
     def find_car(self, user_id: int, brand: str, model: str, plate_number: str | None) -> Car | None:
         connection = self.connect()
         try:
@@ -1118,7 +1502,7 @@ class Database:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT id, user_id, customer_id, brand, model, year, plate_number, vin, mileage FROM cars WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, user_id, customer_id, brand, model, year, plate_number, vin, mileage FROM cars WHERE user_id = ? AND archived_at IS NULL ORDER BY id DESC",
                 (user_id,),
             ).fetchall()
             if vin:
@@ -1130,7 +1514,56 @@ class Database:
                 if found is not None:
                     return found
             if brand and model:
-                return next((Car(**dict(row)) for row in rows if row["brand"].casefold() == brand.casefold() and row["model"].casefold() == model.casefold()), None)
+                matches = [
+                    Car(**dict(row)) for row in rows
+                    if row["brand"].casefold() == brand.casefold()
+                    and row["model"].casefold() == model.casefold()
+                ]
+                return matches[0] if len(matches) == 1 else None
+            return None
+        finally:
+            connection.close()
+
+    def find_customer_car_by_details(
+        self, user_id: int, customer_id: int, brand: str | None,
+        model: str | None, plate_number: str | None, vin: str | None,
+    ) -> Car | None:
+        """Find a car only inside one customer card, never by another owner's model."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT id, user_id, customer_id, brand, model, year,
+                          plate_number, vin, mileage
+                   FROM cars
+                   WHERE user_id = ? AND customer_id = ? AND archived_at IS NULL
+                   ORDER BY id DESC""",
+                (user_id, customer_id),
+            ).fetchall()
+            if vin:
+                match = next(
+                    (row for row in rows if row["vin"] and row["vin"].casefold() == vin.casefold()),
+                    None,
+                )
+                if match is not None:
+                    return Car(**dict(match))
+            if plate_number:
+                match = next(
+                    (
+                        row for row in rows
+                        if row["plate_number"]
+                        and row["plate_number"].casefold() == plate_number.casefold()
+                    ),
+                    None,
+                )
+                if match is not None:
+                    return Car(**dict(match))
+            if brand and model:
+                matches = [
+                    Car(**dict(row)) for row in rows
+                    if row["brand"].casefold() == brand.casefold()
+                    and row["model"].casefold() == model.casefold()
+                ]
+                return matches[0] if len(matches) == 1 else None
             return None
         finally:
             connection.close()
@@ -1213,6 +1646,37 @@ class Database:
                    LEFT JOIN customers cu ON cu.id = c.customer_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? AND o.archived_at IS NULL AND c.archived_at IS NULL ORDER BY o.id DESC LIMIT ?""",
                 (telegram_id, limit),
+            ).fetchall()
+            return [ServiceOrder(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def get_completed_orders_for_telegram_user(
+        self, telegram_id: int, days: int
+    ) -> list[ServiceOrder]:
+        if days not in {1, 3, 7}:
+            raise ValueError("Completed-order period must be 1, 3 or 7 days")
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT o.id, o.car_id, o.description, o.labor_revenue,
+                          o.parts_cost, o.parts_revenue, o.parts_profit, o.status,
+                          o.created_at, c.brand, c.model, c.plate_number, c.vin,
+                          c.mileage, cu.full_name AS customer_name, o.concern,
+                          o.agreed_amount, o.recommendations, o.completed_at,
+                          o.archived_at, o.parts_source, o.mileage_at_visit
+                   FROM service_orders o
+                   JOIN cars c ON c.id = o.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ?
+                     AND o.status IN ('ready', 'completed')
+                     AND o.archived_at IS NULL AND c.archived_at IS NULL
+                     AND date(o.completed_at, 'localtime') >= date(
+                         'now', 'localtime', ?
+                     )
+                   ORDER BY o.completed_at DESC, o.id DESC""",
+                (telegram_id, f"-{days - 1} days"),
             ).fetchall()
             return [ServiceOrder(**dict(row)) for row in rows]
         finally:
@@ -1629,9 +2093,16 @@ class Database:
                            WHERE au.telegram_id = ? AND a.status = 'no_show') AS no_shows,
                           COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
                           COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost,
-                          COALESCE(SUM(o.parts_profit), 0) AS parts_profit
+                          COALESCE(SUM(o.parts_profit), 0) AS parts_profit,
+                          COALESCE(SUM(CASE
+                            WHEN o.status IN ('ready', 'completed')
+                             AND date(o.completed_at, 'localtime') = date('now', 'localtime')
+                            THEN o.labor_revenue + CASE
+                              WHEN o.parts_revenue = 0 THEN o.parts_profit
+                              ELSE o.parts_revenue - o.parts_cost + o.parts_profit
+                            END ELSE 0 END), 0) AS today_profit
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id JOIN users AS u ON u.id = c.user_id
-                   WHERE u.telegram_id = ? AND o.status != 'no_show'""",
+                   WHERE u.telegram_id = ? AND o.status != 'no_show' AND o.archived_at IS NULL""",
                 (telegram_id, telegram_id),
             ).fetchone()
             return Report(**dict(row))

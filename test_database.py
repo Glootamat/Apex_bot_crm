@@ -46,6 +46,38 @@ class DatabaseTest(unittest.TestCase):
             car = db.find_car(user_id, "kia", "rio", "а123аа77")
             self.assertEqual(car.id, car_id)
 
+    def test_same_model_cars_are_resolved_inside_the_customer_card(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(458, "Мастер", None)
+            neighbor_id = db.add_customer(user_id, "Сосед", None)
+            phone_customer_id = db.add_customer(
+                user_id, "Клиент +79197507170", "+79197507170"
+            )
+            neighbor_car_id = db.add_car(
+                user_id, "Lada", "Priora", customer_id=neighbor_id
+            )
+            phone_car_id = db.add_car(
+                user_id, "Lada", "Priora", customer_id=phone_customer_id
+            )
+
+            self.assertIsNone(
+                db.find_car_by_details(user_id, "Lada", "Priora", None, None)
+            )
+            self.assertEqual(
+                db.find_customer_car_by_details(
+                    user_id, neighbor_id, "Lada", "Priora", None, None
+                ).id,
+                neighbor_car_id,
+            )
+            self.assertEqual(
+                db.find_customer_car_by_details(
+                    user_id, phone_customer_id, "Lada", "Priora", None, None
+                ).id,
+                phone_car_id,
+            )
+
     def test_phone_only_customer_can_be_named_after_first_visit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -215,6 +247,131 @@ class DatabaseTest(unittest.TestCase):
             backup = create_backup(directory_path / "test.sqlite3", directory_path / "backups")
             self.assertTrue(backup.exists())
 
+    def test_search_covers_all_customer_card_details(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2020, "Мастер", None)
+            customer_id = db.add_customer(user_id, "Пётр Сидоров", "+79990002020")
+            car_id = db.add_car(
+                user_id, "Lada", "Vesta", 2021, "А777АА26", customer_id,
+                "XTA00000000002020", 85000, "2026-12-01", 95000,
+            )
+            order = db.add_service_order(
+                car_id, "Замена помпы", 4500, 1200, 1800,
+                concern="Перегрев двигателя", recommendations="Проверить термостат",
+            )
+            db.add_part_items(order.id, [("Водяной насос", 1, 1200, 1200)])
+            connection = db.connect()
+            try:
+                connection.execute(
+                    "INSERT INTO customer_notes(customer_id, note_text) VALUES (?, ?)",
+                    (customer_id, "Предпочитает вечернее время"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(db.search(2020, "Сидоров")["customers"][0]["id"], customer_id)
+            self.assertEqual(db.search(2020, "95000")["cars"][0]["id"], car_id)
+            self.assertEqual(db.search(2020, "термостат")["orders"][0]["id"], order.id)
+            self.assertEqual(db.search(2020, "Водяной насос")["orders"][0]["id"], order.id)
+            self.assertEqual(db.search(2020, "вечернее")["customers"][0]["id"], customer_id)
+
+    def test_search_handles_multi_field_transliteration_and_typos(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2022, "Мастер", None)
+            customer_id = db.add_customer(
+                user_id, "Александр", "+7 968 277-42-82"
+            )
+            car_id = db.add_car(
+                user_id, "Nissan", "Teana", plate_number="Н990СЕ",
+                customer_id=customer_id,
+            )
+
+            queries = (
+                "ниссан тиана",
+                "тиана ниссан",
+                "Nissan Teana",
+                "нисан тиана",
+                "машина Александр ниссан",
+                "H990CE",
+            )
+            for query in queries:
+                with self.subTest(query=query):
+                    cars = db.search(2022, query)["cars"]
+                    self.assertTrue(cars)
+                    self.assertEqual(cars[0]["id"], car_id)
+
+    def test_exact_phone_search_does_not_match_phone_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2023, "Мастер", None)
+            target_customer = db.add_customer(
+                user_id, "Target", "+7 919 750-71-70"
+            )
+            target_car = db.add_car(
+                user_id, "Lada", "Priora", customer_id=target_customer
+            )
+            target_order = db.add_service_order(
+                target_car, "Service", 1000, 0, 0
+            )
+            other_customer = db.add_customer(
+                user_id, "Other", "+7 919 735-10-41"
+            )
+            db.add_car(user_id, "Kia", "Sorento", customer_id=other_customer)
+
+            result = db.search(2023, "+79197507170")
+
+            self.assertEqual(
+                [item["id"] for item in result["customers"]], [target_customer]
+            )
+            self.assertEqual([item["id"] for item in result["cars"]], [target_car])
+            self.assertEqual(
+                [item["id"] for item in result["orders"]], [target_order.id]
+            )
+
+    def test_completed_orders_can_be_filtered_by_recent_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(2021, "Мастер", None)
+            car_id = db.add_car(user_id, "Lada", "Vesta")
+            orders = [
+                db.add_service_order(car_id, f"Service {number}", 1000, 0, 0)
+                for number in range(3)
+            ]
+            for order in orders:
+                db.set_order_status(order.id, "ready", user_id)
+            connection = db.connect()
+            try:
+                connection.execute(
+                    "UPDATE service_orders SET completed_at = datetime('now', '-2 days') WHERE id = ?",
+                    (orders[1].id,),
+                )
+                connection.execute(
+                    "UPDATE service_orders SET completed_at = datetime('now', '-5 days') WHERE id = ?",
+                    (orders[2].id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(
+                [item.id for item in db.get_completed_orders_for_telegram_user(2021, 1)],
+                [orders[0].id],
+            )
+            self.assertEqual(
+                {item.id for item in db.get_completed_orders_for_telegram_user(2021, 3)},
+                {orders[0].id, orders[1].id},
+            )
+            self.assertEqual(
+                len(db.get_completed_orders_for_telegram_user(2021, 7)), 3
+            )
+
     def test_additional_customer_phone_is_displayed_found_and_searchable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -350,6 +507,92 @@ class DatabaseTest(unittest.TestCase):
                 db.find_active_appointment_id(car_id, "2026-08-03T12:00:00+03:00"),
                 first_id,
             )
+
+    def test_same_visit_is_not_duplicated_when_parsed_time_shifts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4020, "Master", None)
+            car_id = db.add_car(user_id, "Lada", "Priora")
+
+            first = db.save_appointment(
+                car_id, "течь масла", "2026-08-05T10:00:00+03:00"
+            )
+            repeated = db.save_appointment(
+                car_id, "  Течь   масла ", "2026-08-05T11:00:00+03:00"
+            )
+
+            self.assertTrue(first.created)
+            self.assertFalse(repeated.created)
+            self.assertEqual(repeated.id, first.id)
+
+    def test_appointment_deduplication_prefers_customer_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4023, "Master", None)
+            customer_id = db.add_customer(user_id, "Иван", "+7 999 123-45-67")
+            first_car = db.add_car(
+                user_id, "Lada", "Priora", customer_id=customer_id
+            )
+            second_car = db.add_car(
+                user_id, "Lada", "Vesta", customer_id=customer_id
+            )
+
+            first = db.save_appointment(
+                first_car, "течь масла", "2026-08-05T10:00:00+03:00"
+            )
+            repeated = db.save_appointment(
+                second_car, "Течь масла", "2026-08-05T11:00:00+03:00"
+            )
+            other_visit = db.save_appointment(
+                second_car, "диагностика подвески", "2026-08-05T12:00:00+03:00"
+            )
+
+            self.assertFalse(repeated.created)
+            self.assertEqual(repeated.id, first.id)
+            self.assertTrue(other_visit.created)
+            self.assertNotEqual(other_visit.id, first.id)
+
+    def test_visit_can_be_reassigned_to_anonymous_car_and_edited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4021, "Master", None)
+            customer_id = db.add_customer(user_id, "Diana", None)
+            wrong_car = db.add_car(user_id, "Hyundai", "Solaris", customer_id=customer_id)
+            right_car = db.add_car(user_id, "Lada", "Vesta")
+            appointment_id = db.add_appointment(
+                wrong_car, "работа на выезде", "2026-08-04T17:10:00+03:00"
+            )
+            order = db.start_appointment(user_id, appointment_id)
+
+            changed = db.update_appointment(
+                user_id, appointment_id, car_id=right_car,
+                description="замена бензонасоса",
+            )
+
+            self.assertTrue(changed)
+            updated = db.get_service_order(order.id)
+            self.assertEqual((updated.brand, updated.model), ("Lada", "Vesta"))
+            self.assertIsNone(updated.customer_name)
+            self.assertEqual(
+                db.get_appointment_for_telegram_user(4021, appointment_id).car_id,
+                right_car,
+            )
+
+    def test_finance_report_includes_profit_completed_today(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4022, "Master", None)
+            car_id = db.add_car(user_id, "Lada", "Vesta")
+            order = db.add_service_order(car_id, "Service", 4000, 1000, 1500)
+            db.set_order_status(order.id, "ready", user_id)
+
+            report = db.get_report_for_telegram_user(4022)
+
+            self.assertEqual(report.today_profit, 4500)
 
     def test_completed_order_is_hidden_from_appointments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
