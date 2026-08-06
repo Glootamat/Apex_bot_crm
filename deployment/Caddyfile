@@ -1,0 +1,16 @@
+apexauto26.ru {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8000
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+}
+
+www.apexauto26.ru {
+	redir https://apexauto26.ru{uri} permanent
+}

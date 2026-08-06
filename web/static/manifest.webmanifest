@@ -4,9 +4,9 @@
   "description": "Записи, заказ-наряды и клиенты автосервиса Apex Auto",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f2f4f7",
-  "theme_color": "#101828",
+  "background_color": "#080b0f",
+  "theme_color": "#080b0f",
   "icons": [
-    {"src": "/assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+    {"src": "/assets/apex-logo.png", "sizes": "400x400", "type": "image/png", "purpose": "any maskable"}
   ]
 }

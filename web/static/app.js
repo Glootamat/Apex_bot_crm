@@ -99,6 +99,15 @@ $("#loginForm").addEventListener("submit", async (event) => {
 $("#searchButton").addEventListener("click", runSearch);
 $("#searchInput").addEventListener("keydown", (event) => { if (event.key === "Enter") runSearch(); });
 $("#refreshButton").addEventListener("click", loadDashboard);
+$("#focusSearch").addEventListener("click", () => { $("#searchInput").focus(); $("#searchInput").scrollIntoView({behavior: "smooth", block: "center"}); });
+document.querySelectorAll("[data-coming]").forEach((button) => button.addEventListener("click", () => toast(`${button.dataset.coming}: раздел добавим следующим этапом`)));
+document.querySelectorAll(".side-nav .nav-item:not(.active)").forEach((button) => button.addEventListener("click", () => toast(`${button.dataset.section}: раздел добавим следующим этапом`)));
+$("#logoutButton").addEventListener("click", async () => {
+  await fetch("/api/logout", {method: "POST", credentials: "same-origin"}).catch(() => {});
+  showLogin();
+});
 $("#todayLabel").textContent = new Date().toLocaleDateString("ru-RU", {weekday:"long", day:"numeric", month:"long"});
+const greeting = new Date().getHours() < 12 ? "Доброе утро" : new Date().getHours() < 18 ? "Добрый день" : "Добрый вечер";
+document.querySelector(".welcome-row h2").textContent = `${greeting}, Дмитрий`;
 if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js"));
 loadDashboard();

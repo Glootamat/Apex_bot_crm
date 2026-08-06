@@ -3,80 +3,88 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#101828">
-  <meta name="description" content="Apex CRM — управление записями и заказ-нарядами автосервиса">
+  <meta name="theme-color" content="#080b0f">
+  <meta name="description" content="Apex CRM — управление автосервисом">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/assets/apex-logo.png" type="image/png">
   <link rel="stylesheet" href="/assets/styles.css">
   <title>Apex CRM</title>
 </head>
 <body>
   <div class="app-shell">
-    <header class="topbar">
-      <div class="brand-mark">A</div>
-      <div>
-        <div class="eyebrow">APEX AUTO</div>
-        <h1>CRM сервиса</h1>
-      </div>
-      <button id="refreshButton" class="icon-button" aria-label="Обновить">↻</button>
-    </header>
+    <aside class="sidebar">
+      <div class="side-brand"><img src="/assets/apex-logo.png" alt="Apex CRM"></div>
+      <nav class="side-nav" aria-label="Основная навигация">
+        <button class="nav-item active" data-section="Главная"><span>⌂</span>Главная</button>
+        <button class="nav-item" data-section="Календарь"><span>▦</span>Календарь</button>
+        <button class="nav-item" data-section="Заказ-наряды"><span>▤</span>Заказ-наряды</button>
+        <button class="nav-item" data-section="Клиенты"><span>♙</span>Клиенты</button>
+        <button class="nav-item" data-section="Автомобили"><span>◇</span>Автомобили</button>
+        <button class="nav-item" data-section="Финансы"><span>↗</span>Финансы</button>
+      </nav>
+      <button id="logoutButton" class="logout-button"><span>↪</span>Выйти</button>
+    </aside>
 
-    <main id="dashboard" hidden>
-      <section class="welcome">
-        <p id="todayLabel" class="muted"></p>
-        <h2>Рабочий день</h2>
-      </section>
+    <div class="workspace">
+      <header class="topbar">
+        <img class="mobile-logo" src="/assets/apex-logo.png" alt="Apex CRM">
+        <div class="topbar-title"><span class="eyebrow">APEX AUTO</span><h1>Главная</h1></div>
+        <button id="refreshButton" class="icon-button" aria-label="Обновить">↻</button>
+        <div class="user-chip"><span>A</span><div><strong>Администратор</strong><small>Владелец</small></div></div>
+      </header>
 
-      <section class="metrics" aria-label="Показатели">
-        <article class="metric metric-primary">
-          <span>Заработок сегодня</span>
-          <strong id="todayProfit">—</strong>
-        </article>
-        <article class="metric">
-          <span>В работе</span>
-          <strong id="activeOrders">—</strong>
-        </article>
-        <article class="metric">
-          <span>Записей впереди</span>
-          <strong id="appointmentsCount">—</strong>
-        </article>
-      </section>
+      <main id="dashboard" hidden>
+        <section class="welcome-row">
+          <div><p id="todayLabel" class="muted"></p><h2>Доброе утро, Дмитрий</h2></div>
+          <div class="status-live"><i></i> Система работает</div>
+        </section>
 
-      <section class="search-card">
-        <label for="searchInput">Поиск по всей CRM</label>
-        <div class="search-row">
-          <input id="searchInput" type="search" placeholder="Имя, телефон, авто, VIN, номер…" autocomplete="off">
-          <button id="searchButton" class="primary-button">Найти</button>
+        <section class="metrics" aria-label="Показатели">
+          <article class="metric metric-yellow"><div class="metric-icon">₽</div><span>Заработок сегодня</span><strong id="todayProfit">—</strong><small>Финансовый результат дня</small></article>
+          <article class="metric"><div class="metric-icon blue">▤</div><span>Заказов в работе</span><strong id="activeOrders">—</strong><small>Активные заказ-наряды</small></article>
+          <article class="metric"><div class="metric-icon green">▦</div><span>Записей впереди</span><strong id="appointmentsCount">—</strong><small>Ближайшие визиты</small></article>
+        </section>
+
+        <section class="quick-actions">
+          <button data-coming="Новый заказ"><b>＋</b><span><strong>Новый заказ</strong><small>Создать заказ-наряд</small></span></button>
+          <button data-coming="Новая запись"><b>▦</b><span><strong>Новая запись</strong><small>Добавить в календарь</small></span></button>
+          <button data-coming="Новый клиент"><b>♙</b><span><strong>Новый клиент</strong><small>Создать карточку</small></span></button>
+          <button id="focusSearch"><b>⌕</b><span><strong>Найти клиента</strong><small>По всей базе CRM</small></span></button>
+        </section>
+
+        <section class="search-card">
+          <div><span class="eyebrow">БЫСТРЫЙ ПОИСК</span><h2>Поиск по всей CRM</h2></div>
+          <div class="search-row"><input id="searchInput" type="search" placeholder="Имя, телефон, автомобиль, VIN, госномер…" autocomplete="off"><button id="searchButton" class="primary-button">Найти</button></div>
+          <div id="searchResults" class="results" hidden></div>
+        </section>
+
+        <div class="dashboard-grid">
+          <section class="panel">
+            <div class="section-heading"><div><span class="eyebrow">РАСПИСАНИЕ</span><h2>Ближайшие записи</h2></div><button data-coming="Календарь" class="text-button">Все записи →</button></div>
+            <div id="appointments" class="card-list"></div>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><div><span class="eyebrow">СЕРВИС</span><h2>Заказы в работе</h2></div><button data-coming="Заказ-наряды" class="text-button">Все заказы →</button></div>
+            <div id="orders" class="card-list"></div>
+          </section>
         </div>
-        <div id="searchResults" class="results" hidden></div>
-      </section>
+      </main>
+    </div>
 
-      <section class="section-block">
-        <div class="section-heading">
-          <div><span class="eyebrow">РАСПИСАНИЕ</span><h2>Ближайшие записи</h2></div>
-        </div>
-        <div id="appointments" class="card-list"></div>
-      </section>
-
-      <section class="section-block">
-        <div class="section-heading">
-          <div><span class="eyebrow">СЕРВИС</span><h2>Заказ-наряды в работе</h2></div>
-        </div>
-        <div id="orders" class="card-list"></div>
-      </section>
-    </main>
+    <nav class="bottom-nav" aria-label="Мобильная навигация">
+      <button class="active"><span>⌂</span>Главная</button><button data-coming="Календарь"><span>▦</span>Календарь</button><button data-coming="Заказы"><span>▤</span>Заказы</button><button data-coming="Клиенты"><span>♙</span>Клиенты</button><button data-coming="Ещё"><span>•••</span>Ещё</button>
+    </nav>
   </div>
 
   <div id="loginScreen" class="login-screen">
     <form id="loginForm" class="login-card">
-      <div class="login-logo">A</div>
-      <span class="eyebrow">APEX AUTO</span>
-      <h2>Вход в CRM</h2>
-      <p class="muted">Данные клиентов доступны только авторизованным сотрудникам.</p>
-      <label>Логин<input id="username" name="username" autocomplete="username" required></label>
+      <img class="login-logo" src="/assets/apex-logo.png" alt="Apex CRM">
+      <div class="login-copy"><span class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</span><h2>Вход в Apex CRM</h2><p class="muted">Управление автосервисом в одном приложении</p></div>
+      <label>Логин<input id="username" name="username" autocomplete="username" value="admin" required></label>
       <label>Пароль<input id="password" name="password" type="password" autocomplete="current-password" required></label>
       <p id="loginError" class="error" role="alert"></p>
-      <button class="primary-button wide" type="submit">Войти</button>
+      <button class="primary-button wide" type="submit">Войти в CRM</button>
+      <small class="secure-note">● Защищённое соединение</small>
     </form>
   </div>
 
