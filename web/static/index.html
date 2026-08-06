@@ -5,30 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#080b0f">
   <meta name="description" content="Apex CRM — управление автосервисом">
-  <link rel="manifest" href="/manifest.webmanifest?v=4">
-  <link rel="icon" href="/assets/icon-192.png" type="image/png">
-  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-  <link rel="stylesheet" href="/assets/styles.css?v=4">
+  <link rel="manifest" href="/manifest.webmanifest?v=6">
+  <link rel="icon" href="/assets/icon-v2-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon-v2.png">
+  <link rel="stylesheet" href="/assets/styles.css?v=6">
   <title>Apex CRM</title>
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="side-brand"><img src="/assets/apex-logo.png" alt="Apex CRM"></div>
+      <div class="side-brand"><img src="/assets/apex-logo-v2.png" alt="Apex CRM"></div>
       <nav class="side-nav" aria-label="Основная навигация">
-        <button class="nav-item active" data-section="Главная"><span>⌂</span>Главная</button>
-        <button class="nav-item" data-section="Календарь"><span>▦</span>Календарь</button>
-        <button class="nav-item" data-section="Заказ-наряды"><span>▤</span>Заказ-наряды</button>
-        <button class="nav-item" data-section="Клиенты"><span>♙</span>Клиенты</button>
-        <button class="nav-item" data-section="Автомобили"><span>◇</span>Автомобили</button>
-        <button class="nav-item" data-section="Финансы"><span>↗</span>Финансы</button>
+        <button class="nav-item active" data-view="dashboard"><span>⌂</span>Главная</button>
+        <button class="nav-item" data-view="appointments"><span>▦</span>Календарь</button>
+        <button class="nav-item" data-view="orders"><span>▤</span>Заказ-наряды</button>
+        <button class="nav-item" data-view="customers"><span>♙</span>Клиенты</button>
+        <button class="nav-item" data-view="cars"><span>◇</span>Автомобили</button>
+        <button class="nav-item" data-view="finance"><span>↗</span>Финансы</button>
       </nav>
       <button id="logoutButton" class="logout-button"><span>↪</span>Выйти</button>
     </aside>
 
     <div class="workspace">
       <header class="topbar">
-        <img class="mobile-logo" src="/assets/apex-logo.png" alt="Apex CRM">
+        <img class="mobile-logo" src="/assets/apex-logo-v2.png" alt="Apex CRM">
         <div class="topbar-title"><span class="eyebrow">APEX AUTO</span><h1>Главная</h1></div>
         <button id="refreshButton" class="icon-button" aria-label="Обновить">↻</button>
         <div class="user-chip"><span>A</span><div><strong>Администратор</strong><small>Владелец</small></div></div>
@@ -47,9 +47,9 @@
         </section>
 
         <section class="quick-actions">
-          <button data-coming="Новый заказ"><b>＋</b><span><strong>Новый заказ</strong><small>Создать заказ-наряд</small></span></button>
-          <button data-coming="Новая запись"><b>▦</b><span><strong>Новая запись</strong><small>Добавить в календарь</small></span></button>
-          <button data-coming="Новый клиент"><b>♙</b><span><strong>Новый клиент</strong><small>Создать карточку</small></span></button>
+          <button data-create="order"><b>＋</b><span><strong>Новый заказ</strong><small>Создать заказ-наряд</small></span></button>
+          <button data-create="appointment"><b>▦</b><span><strong>Новая запись</strong><small>Добавить в календарь</small></span></button>
+          <button data-create="customer"><b>♙</b><span><strong>Новый клиент</strong><small>Создать карточку</small></span></button>
           <button id="focusSearch"><b>⌕</b><span><strong>Найти клиента</strong><small>По всей базе CRM</small></span></button>
         </section>
 
@@ -61,25 +61,30 @@
 
         <div class="dashboard-grid">
           <section class="panel">
-            <div class="section-heading"><div><span class="eyebrow">РАСПИСАНИЕ</span><h2>Ближайшие записи</h2></div><button data-coming="Календарь" class="text-button">Все записи →</button></div>
+            <div class="section-heading"><div><span class="eyebrow">РАСПИСАНИЕ</span><h2>Ближайшие записи</h2></div><button data-view="appointments" class="text-button">Все записи →</button></div>
             <div id="appointments" class="card-list"></div>
           </section>
           <section class="panel">
-            <div class="section-heading"><div><span class="eyebrow">СЕРВИС</span><h2>Заказы в работе</h2></div><button data-coming="Заказ-наряды" class="text-button">Все заказы →</button></div>
+            <div class="section-heading"><div><span class="eyebrow">СЕРВИС</span><h2>Заказы в работе</h2></div><button data-view="orders" class="text-button">Все заказы →</button></div>
             <div id="orders" class="card-list"></div>
           </section>
         </div>
       </main>
+      <section id="sectionView" class="section-view" hidden>
+        <div class="page-heading"><div><span id="sectionEyebrow" class="eyebrow"></span><h2 id="sectionTitle"></h2></div><button id="sectionCreate" class="primary-button">＋ Добавить</button></div>
+        <div id="sectionTools" class="section-tools"></div>
+        <div id="sectionContent" class="entity-grid"></div>
+      </section>
     </div>
 
     <nav class="bottom-nav" aria-label="Мобильная навигация">
-      <button class="active"><span>⌂</span>Главная</button><button data-coming="Календарь"><span>▦</span>Календарь</button><button data-coming="Заказы"><span>▤</span>Заказы</button><button data-coming="Клиенты"><span>♙</span>Клиенты</button><button data-coming="Ещё"><span>•••</span>Ещё</button>
+      <button class="active" data-view="dashboard"><span>⌂</span>Главная</button><button data-view="appointments"><span>▦</span>Календарь</button><button data-view="orders"><span>▤</span>Заказы</button><button data-view="customers"><span>♙</span>Клиенты</button><button data-view="cars"><span>◇</span>Авто</button>
     </nav>
   </div>
 
   <div id="loginScreen" class="login-screen">
     <form id="loginForm" class="login-card">
-      <img class="login-logo" src="/assets/apex-logo.png" alt="Apex CRM">
+      <img class="login-logo" src="/assets/apex-logo-v2.png" alt="Apex CRM">
       <div class="login-copy"><span class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</span><h2>Вход в Apex CRM</h2><p class="muted">Управление автосервисом в одном приложении</p></div>
       <label>Логин<input id="username" name="username" autocomplete="username" value="admin" required></label>
       <label>Пароль<input id="password" name="password" type="password" autocomplete="current-password" required></label>
@@ -90,6 +95,13 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="/assets/app.js?v=4" defer></script>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-backdrop" data-close-modal></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-heading"><div><span class="eyebrow">APEX CRM</span><h2 id="modalTitle"></h2></div><button type="button" class="modal-close" data-close-modal>×</button></div>
+      <form id="entityForm" class="entity-form"></form>
+    </section>
+  </div>
+  <script src="/assets/app.js?v=6" defer></script>
 </body>
 </html>

@@ -1426,7 +1426,7 @@ class Database:
                 """
                 SELECT cars.id, cars.user_id, cars.customer_id, cars.brand, cars.model, cars.year, cars.plate_number, cars.vin, cars.mileage
                 FROM cars JOIN users ON users.id = cars.user_id
-                WHERE users.telegram_id = ? ORDER BY cars.id DESC
+                WHERE users.telegram_id = ? AND cars.archived_at IS NULL ORDER BY cars.id DESC
                 """,
                 (telegram_id,),
             ).fetchall()

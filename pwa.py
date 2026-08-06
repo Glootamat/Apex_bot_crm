@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,9 +34,60 @@ COOKIE_NAME = "apex_crm_session"
 SESSION_SECONDS = 12 * 60 * 60
 
 
+@app.middleware("http")
+async def prevent_api_caching(request: Request, call_next):
+    """CRM API responses must always reflect the current shared SQLite database."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class CustomerPayload(BaseModel):
+    full_name: str
+    phone: str | None = None
+
+
+class CarPayload(BaseModel):
+    customer_id: int | None = None
+    brand: str
+    model: str
+    year: int | None = None
+    plate_number: str | None = None
+    vin: str | None = None
+    mileage: int | None = None
+
+
+class AppointmentPayload(BaseModel):
+    car_id: int
+    description: str
+    starts_at: str
+    agreed_amount: int | None = None
+    is_flexible: bool = False
+    parts_source: str | None = None
+
+
+class OrderPayload(BaseModel):
+    car_id: int
+    description: str
+    labor_revenue: int = 0
+    parts_cost: int = 0
+    parts_revenue: int = 0
+    parts_profit: int = 0
+    concern: str | None = None
+    agreed_amount: int | None = None
+    recommendations: str | None = None
+    parts_source: str | None = None
+
+
+class ActionPayload(BaseModel):
+    action: str
 
 
 def _b64decode(value: str) -> bytes:
@@ -106,6 +157,35 @@ def owner_telegram_id() -> int:
         return int(os.environ["ADMIN_ID"])
     except (KeyError, ValueError) as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "CRM owner is not configured") from error
+
+
+def owner_user_id() -> int:
+    connection = db.connect()
+    try:
+        row = connection.execute(
+            "SELECT id FROM users WHERE telegram_id = ?", (owner_telegram_id(),)
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "CRM owner is not initialized")
+    return int(row["id"])
+
+
+def require_car(car_id: int):
+    car = db.get_car_for_user(owner_user_id(), car_id)
+    if car is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Автомобиль не найден")
+    return car
+
+
+def require_order(order_id: int):
+    try:
+        order = db.get_service_order(order_id)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Заказ-наряд не найден") from error
+    require_car(order.car_id)
+    return order
 
 
 @app.get("/health")
@@ -188,3 +268,164 @@ def search(q: str, _: Annotated[str, Depends(require_user)]) -> dict[str, object
     if len(query) < 2:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Введите минимум два символа")
     return db.search(owner_telegram_id(), query)
+
+
+@app.get("/api/crm")
+def crm_data(_: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+    telegram_id = owner_telegram_id()
+    report = db.get_report_for_telegram_user(telegram_id)
+    return {
+        "customers": [asdict(item) for item in db.get_customers_for_telegram_user(telegram_id)],
+        "cars": [asdict(item) for item in db.get_cars_for_telegram_user(telegram_id)],
+        "appointments": [
+            asdict(item) for item in db.get_upcoming_appointments_for_telegram_user(telegram_id, limit=200)
+        ],
+        "orders": [
+            asdict(item) | {"profit": item.profit}
+            for item in db.get_recent_orders_for_telegram_user(telegram_id, limit=300)
+        ],
+        "finance": asdict(report) | {"revenue": report.revenue, "profit": report.profit},
+    }
+
+
+@app.post("/api/customers")
+def create_customer(data: CustomerPayload, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+    name = data.full_name.strip() or "Имя не указано"
+    customer_id = db.add_customer(owner_user_id(), name, data.phone or None)
+    customer = db.get_customer_for_telegram_user(owner_telegram_id(), customer_id)
+    return asdict(customer) if customer else {"id": customer_id}
+
+
+@app.put("/api/customers/{customer_id}")
+def edit_customer(
+    customer_id: int, data: CustomerPayload, _: Annotated[str, Depends(require_user)]
+) -> dict[str, object]:
+    if db.get_customer_for_telegram_user(owner_telegram_id(), customer_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Клиент не найден")
+    db.update_customer(customer_id, data.full_name.strip() or "Имя не указано", data.phone or None)
+    return asdict(db.get_customer_for_telegram_user(owner_telegram_id(), customer_id))
+
+
+@app.post("/api/cars")
+def create_car(data: CarPayload, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+    if data.customer_id is not None and db.get_customer_for_telegram_user(
+        owner_telegram_id(), data.customer_id
+    ) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Клиент не найден")
+    car_id = db.add_car(
+        owner_user_id(), data.brand.strip(), data.model.strip(), data.year,
+        data.plate_number or None, data.customer_id, data.vin or None, data.mileage,
+    )
+    return asdict(require_car(car_id))
+
+
+@app.put("/api/cars/{car_id}")
+def edit_car(car_id: int, data: CarPayload, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+    require_car(car_id)
+    if data.customer_id is not None and db.get_customer_for_telegram_user(
+        owner_telegram_id(), data.customer_id
+    ) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Клиент не найден")
+    db.update_car(
+        car_id, data.customer_id, data.brand.strip(), data.model.strip(), data.year,
+        data.plate_number or None, data.vin or None, data.mileage,
+    )
+    return asdict(require_car(car_id))
+
+
+@app.post("/api/appointments")
+def create_appointment(
+    data: AppointmentPayload, _: Annotated[str, Depends(require_user)]
+) -> dict[str, object]:
+    require_car(data.car_id)
+    try:
+        appointment_id = db.add_appointment(
+            data.car_id, data.description.strip(), data.starts_at,
+            agreed_amount=data.agreed_amount, is_flexible=data.is_flexible,
+            parts_source=data.parts_source,
+        )
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+    return asdict(db.get_appointment_for_telegram_user(owner_telegram_id(), appointment_id))
+
+
+@app.put("/api/appointments/{appointment_id}")
+def edit_appointment(
+    appointment_id: int, data: AppointmentPayload,
+    _: Annotated[str, Depends(require_user)],
+) -> dict[str, object]:
+    require_car(data.car_id)
+    if db.get_appointment_for_telegram_user(owner_telegram_id(), appointment_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Запись не найдена")
+    try:
+        db.update_appointment(
+            owner_user_id(), appointment_id, car_id=data.car_id,
+            description=data.description.strip(), starts_at=data.starts_at,
+            agreed_amount=data.agreed_amount, is_flexible=data.is_flexible,
+            parts_source=data.parts_source,
+        )
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+    return asdict(db.get_appointment_for_telegram_user(owner_telegram_id(), appointment_id))
+
+
+@app.post("/api/appointments/{appointment_id}/action")
+def appointment_action(
+    appointment_id: int, data: ActionPayload,
+    _: Annotated[str, Depends(require_user)],
+) -> dict[str, object]:
+    if db.get_appointment_for_telegram_user(owner_telegram_id(), appointment_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Запись не найдена")
+    if data.action == "arrived":
+        result = db.start_appointment(owner_user_id(), appointment_id)
+    elif data.action == "no_show":
+        result = db.mark_appointment_no_show(owner_user_id(), appointment_id)
+    else:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестное действие")
+    if result is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Действие уже выполнено")
+    return asdict(result) | {"profit": result.profit}
+
+
+@app.post("/api/orders")
+def create_order(data: OrderPayload, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+    require_car(data.car_id)
+    order = db.add_service_order(
+        data.car_id, data.description.strip(), data.labor_revenue, data.parts_cost,
+        data.parts_revenue, data.parts_profit, data.concern, data.agreed_amount,
+        data.recommendations, data.parts_source,
+    )
+    return asdict(order) | {"profit": order.profit}
+
+
+@app.put("/api/orders/{order_id}")
+def edit_order(
+    order_id: int, data: OrderPayload, _: Annotated[str, Depends(require_user)]
+) -> dict[str, object]:
+    order = require_order(order_id)
+    if data.car_id != order.car_id:
+        require_car(data.car_id)
+        db.reassign_order_car(owner_user_id(), order_id, data.car_id)
+    order = db.update_service_order(
+        order_id, data.description.strip(), data.labor_revenue, data.parts_cost,
+        data.parts_revenue, data.parts_profit, False,
+    )
+    order = db.update_order_crm_fields(
+        order_id, owner_user_id(), concern=data.concern,
+        agreed_amount=data.agreed_amount, recommendations=data.recommendations,
+    )
+    if data.parts_source:
+        order = db.update_order_parts_source(order_id, data.parts_source, owner_user_id())
+    return asdict(order) | {"profit": order.profit}
+
+
+@app.post("/api/orders/{order_id}/status")
+def order_status(
+    order_id: int, data: ActionPayload, _: Annotated[str, Depends(require_user)]
+) -> dict[str, object]:
+    require_order(order_id)
+    try:
+        order = db.set_order_status(order_id, data.action, owner_user_id())
+    except ValueError as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+    return asdict(order) | {"profit": order.profit}

@@ -1,5 +1,5 @@
-const CACHE = "apex-crm-shell-v4";
-const SHELL = ["/", "/assets/styles.css?v=4", "/assets/app.js?v=4", "/assets/apex-logo.png", "/assets/icon-192.png", "/manifest.webmanifest?v=4"];
+const CACHE = "apex-crm-shell-v6";
+const SHELL = ["/", "/assets/styles.css?v=6", "/assets/app.js?v=6", "/assets/apex-logo-v2.png", "/assets/icon-v2-192.png", "/manifest.webmanifest?v=6"];
 self.addEventListener("install", (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))).then(() => self.clients.claim())));
 self.addEventListener("fetch", (event) => {
