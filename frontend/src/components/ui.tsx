@@ -1,5 +1,5 @@
-import { X } from "lucide-react";
-import type { ButtonHTMLAttributes, PropsWithChildren, ReactNode } from "react";
+import { ChevronRight, X } from "lucide-react";
+import type { ButtonHTMLAttributes, HTMLAttributes, PropsWithChildren, ReactNode } from "react";
 import { twMerge } from "tailwind-merge";
 
 export function Button({ className, variant = "primary", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "danger" | "ghost" }) {
@@ -7,8 +7,12 @@ export function Button({ className, variant = "primary", ...props }: ButtonHTMLA
   return <button className={twMerge("inline-flex min-h-11 items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-apex", styles[variant], className)} {...props} />;
 }
 
-export function Card({ className, children }: PropsWithChildren<{ className?: string }>) {
-  return <section className={twMerge("rounded-2xl border border-line bg-panel p-4 shadow-card", className)}>{children}</section>;
+export function Card({ className, children, ...props }: PropsWithChildren<HTMLAttributes<HTMLElement>>) {
+  return <section className={twMerge("min-w-0 max-w-full rounded-2xl border border-line bg-panel p-4 shadow-card", className)} {...props}>{children}</section>;
+}
+
+export function DetailCard({ className, children, onClick, label = "Открыть подробную карточку" }: PropsWithChildren<{ className?: string; onClick: () => void; label?: string }>) {
+  return <button type="button" onClick={onClick} aria-label={label} className={twMerge("group min-w-0 max-w-full rounded-2xl border border-line bg-panel p-4 text-left shadow-card transition hover:border-apex/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-apex", className)}><div className="flex min-w-0 items-center gap-3">{children}<ChevronRight className="ml-auto shrink-0 text-muted transition group-hover:translate-x-1 group-hover:text-apex" size={20} /></div></button>;
 }
 
 export function EmptyState({ children }: PropsWithChildren) {
@@ -17,7 +21,7 @@ export function EmptyState({ children }: PropsWithChildren) {
 
 export function Modal({ title, children, onClose }: PropsWithChildren<{ title: string; onClose: () => void }>) {
   return <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-sm sm:items-center sm:p-5" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section role="dialog" aria-modal="true" aria-labelledby="modal-title" className="max-h-[94dvh] w-full overflow-y-auto rounded-t-3xl border border-line bg-panel p-5 shadow-2xl sm:max-w-2xl sm:rounded-3xl sm:p-6">
+    <section role="dialog" aria-modal="true" aria-labelledby="modal-title" className="max-h-[94dvh] min-w-0 w-full max-w-full overflow-x-hidden overflow-y-auto rounded-t-3xl border border-line bg-panel p-4 shadow-2xl sm:max-w-2xl sm:rounded-3xl sm:p-6">
       <header className="mb-5 flex items-center justify-between gap-4"><h2 id="modal-title" className="text-xl font-black">{title}</h2><Button variant="ghost" className="size-11 p-0" onClick={onClose} aria-label="Закрыть"><X size={20} /></Button></header>
       {children}
     </section>

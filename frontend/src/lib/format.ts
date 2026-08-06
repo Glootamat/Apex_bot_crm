@@ -3,7 +3,7 @@ export const money = (value: number | null | undefined) =>
 
 export const customerName = (value: string | null | undefined) => {
   const name = value?.trim() ?? "";
-  return !name || /^клиент\s*\+?\d+$/iu.test(name) ? "Имя не указано" : name;
+  return !name || /^клиент\s*\+?[\d\s()-]+$/iu.test(name) ? "Имя не указано" : name;
 };
 
 export const formatDateTime = (value: string) => {
