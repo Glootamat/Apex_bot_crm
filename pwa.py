@@ -593,6 +593,18 @@ def dashboard(_: Annotated[str, Depends(require_user)]) -> dict[str, object]:
     }
 
 
+@app.get("/api/finance/ai-usage")
+def ai_usage_finance(
+    period: int = 30,
+    _: Annotated[dict[str, object], Depends(require_platform_admin)] = None,
+) -> dict[str, object]:
+    if period not in {1, 7, 30, 0}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Допустимы периоды: 1, 7, 30 или 0")
+    summary = db.get_ai_usage_summary(period or None)
+    summary["usd_to_rub_rate"] = max(1.0, float(os.getenv("AI_USD_TO_RUB_RATE", "90")))
+    return summary
+
+
 @app.get("/api/search")
 def search(q: str, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
     query = q.strip()

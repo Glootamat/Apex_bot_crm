@@ -1832,6 +1832,34 @@ class Database:
         finally:
             connection.close()
 
+    def get_ai_usage_summary(self, days: int | None) -> dict[str, object]:
+        connection = self.connect()
+        try:
+            where = "" if not days else " WHERE created_at >= datetime('now', ?)"
+            params: tuple[object, ...] = () if not days else (f"-{days - 1} days",)
+            total = connection.execute(
+                f"SELECT COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS requests, "
+                f"COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens "
+                f"FROM ai_usage_log{where}", params,
+            ).fetchone()
+            by_task = connection.execute(
+                f"SELECT task_type, model, COUNT(*) AS requests, COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+                f"COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens "
+                f"FROM ai_usage_log{where} GROUP BY task_type, model ORDER BY cost_usd DESC", params,
+            ).fetchall()
+            daily = connection.execute(
+                f"SELECT substr(created_at, 1, 10) AS date, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+                f"FROM ai_usage_log{where} GROUP BY substr(created_at, 1, 10) ORDER BY date", params,
+            ).fetchall()
+            return {
+                "cost_usd": float(total["cost_usd"]), "requests": int(total["requests"]),
+                "input_tokens": int(total["input_tokens"]), "output_tokens": int(total["output_tokens"]),
+                "by_task": [dict(row) for row in by_task],
+                "daily": [dict(row) for row in daily],
+            }
+        finally:
+            connection.close()
+
     def add_car(self, user_id: int, brand: str, model: str, year: int | None = None, plate_number: str | None = None, customer_id: int | None = None, vin: str | None = None, mileage: int | None = None, next_service_date: str | None = None, next_service_mileage: int | None = None) -> int:
         connection = self.connect()
         try:

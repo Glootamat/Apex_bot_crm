@@ -1,23 +1,27 @@
 import {
-  Banknote, BarChart3, ChevronDown, CircleAlert, ClipboardList, PackageOpen,
+  Banknote, BarChart3, BrainCircuit, ChevronDown, CircleAlert, ClipboardList, PackageOpen,
   TrendingUp, Wrench,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useOutletContext, useSearchParams } from "react-router-dom";
 import type { AppOutlet } from "../app/AppShell";
 import { Button, Card, EmptyState, Spinner } from "../components/ui";
 import { formatDateTime, money, parseCrmDate } from "../lib/format";
 import type { Order } from "../lib/types";
 import { useCrm } from "../features/crm/useCrm";
+import { api } from "../lib/api";
+import type { AiUsageSummary } from "../lib/types";
 
 type Period = 1 | 7 | 30 | 0;
 type Section = "revenue" | "labor" | "parts" | "profit" | null;
-type View = "overview" | "analytics";
+type View = "overview" | "analytics" | "ai";
 
 const startOfDay = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate());
 
 export function FinancePage() {
   const crm = useCrm();
+  const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
   const { openDetail } = useOutletContext<AppOutlet>();
   const [params] = useSearchParams();
   const [period, setPeriod] = useState<Period>(params.get("period") === "today" ? 1 : 30);
@@ -54,16 +58,35 @@ export function FinancePage() {
   const attention = allOrders.filter((item) => !item.archived_at && !["ready", "completed"].includes(item.status));
   const scheduled = (crm.data?.appointments ?? []).filter((item) => item.status === "scheduled");
   const chart = dailyProfit(orders, period === 0 ? 30 : period, window.end);
+  const aiUsage = useQuery({ queryKey: ["ai-usage", period], queryFn: () => api.aiUsage(period), enabled: view === "ai" && Boolean(account.data?.platform_admin), retry: false });
 
   return <div className="grid min-w-0 gap-6">
     <header><p className="text-sm font-bold text-apex">АНАЛИТИКА</p><h1 className="text-3xl font-black">Финансы</h1><p className="mt-1 text-muted">Доходы, прибыль и состояние заказов</p></header>
-    <div className="grid grid-cols-2 rounded-xl border border-line bg-panel-soft p-1 sm:max-w-md">
+    <div className={`grid rounded-xl border border-line bg-panel-soft p-1 ${account.data?.platform_admin ? "grid-cols-3 sm:max-w-xl" : "grid-cols-2 sm:max-w-md"}`}>
       <button className={`rounded-lg px-3 py-2 text-sm font-bold ${view === "overview" ? "bg-apex text-black" : "text-muted"}`} onClick={() => setView("overview")}>Обзор</button>
       <button className={`rounded-lg px-3 py-2 text-sm font-bold ${view === "analytics" ? "bg-apex text-black" : "text-muted"}`} onClick={() => setView("analytics")}><span className="inline-flex items-center gap-2"><BarChart3 size={16} />Аналитика</span></button>
+      {Boolean(account.data?.platform_admin) && <button className={`rounded-lg px-3 py-2 text-sm font-bold ${view === "ai" ? "bg-apex text-black" : "text-muted"}`} onClick={() => setView("ai")}><span className="inline-flex items-center gap-2"><BrainCircuit size={16} />ИИ-расходы</span></button>}
     </div>
     <div className="flex max-w-full gap-2 overflow-x-auto pb-1">{([[1,"Сегодня"],[7,"7 дней"],[30,"30 дней"],[0,"Всё время"]] as const).map(([value, label]) => <Button className="shrink-0" key={value} variant={period === value ? "primary" : "secondary"} onClick={() => setPeriod(value)}>{label}</Button>)}</div>
-    {view === "overview" ? <Overview sections={sections} open={open} setOpen={setOpen} orders={orders} ordersOpen={ordersOpen} setOrdersOpen={setOrdersOpen} openDetail={openDetail} totals={totals} margin={margin} /> : <Analytics totals={totals} previous={previous} change={change} margin={margin} chart={chart} attention={attention} scheduled={scheduled} openDetail={openDetail} />}
+    {view === "overview" ? <Overview sections={sections} open={open} setOpen={setOpen} orders={orders} ordersOpen={ordersOpen} setOrdersOpen={setOrdersOpen} openDetail={openDetail} totals={totals} margin={margin} /> : view === "analytics" ? <Analytics totals={totals} previous={previous} change={change} margin={margin} chart={chart} attention={attention} scheduled={scheduled} openDetail={openDetail} /> : <AiExpenses data={aiUsage.data} pending={aiUsage.isPending} />}
   </div>;
+}
+
+function AiExpenses({ data, pending }: { data?: AiUsageSummary; pending: boolean }) {
+  if (pending) return <Spinner label="Загружаю расходы на ИИ…" />;
+  if (!data) return <EmptyState>Данные об использовании ИИ пока недоступны.</EmptyState>;
+  const labels: Record<string, string> = { vision: "Распознавание чека", vehicle_recognition: "Распознавание автомобиля", vin_decode: "VIN-декодирование" };
+  const rub = (value: number) => `${Math.round(value * data.usd_to_rub_rate).toLocaleString("ru-RU")} ₽`;
+  return <div className="grid gap-4">
+    <Card className="border-apex/30 bg-gradient-to-br from-panel to-panel-soft"><div className="flex items-start gap-3"><BrainCircuit className="mt-1 text-apex" size={25} /><div><h2 className="text-xl font-black">Расходы на ИИ</h2><p className="mt-1 text-sm text-muted">Расчёт: $1 = {data.usd_to_rub_rate.toLocaleString("ru-RU")} ₽. Курс можно изменить в настройках сервера.</p></div></div><section className="mt-5 grid gap-3 sm:grid-cols-4"><Metric label="Расходы" value={rub(data.cost_usd)} /><Metric label="Запросов" value={String(data.requests)} /><Metric label="Средняя стоимость" value={rub(data.requests ? data.cost_usd / data.requests : 0)} /><Metric label="Токенов" value={(data.input_tokens + data.output_tokens).toLocaleString("ru-RU")} hint={`Вход: ${data.input_tokens.toLocaleString("ru-RU")} · выход: ${data.output_tokens.toLocaleString("ru-RU")}`} /></section></Card>
+    <AiExpenseChart items={data.daily} rate={data.usd_to_rub_rate} />
+    <Card><h2 className="text-lg font-black">Разбивка по функциям</h2><div className="mt-3 overflow-x-auto"><table className="w-full min-w-[620px] text-left text-sm"><thead className="border-b border-line text-muted"><tr><th className="pb-3 font-medium">Функция</th><th className="pb-3 font-medium">Модель</th><th className="pb-3 text-right font-medium">Запросы</th><th className="pb-3 text-right font-medium">Токены</th><th className="pb-3 text-right font-medium">Расходы</th></tr></thead><tbody>{data.by_task.length ? data.by_task.map((row) => <tr key={`${row.task_type}-${row.model}`} className="border-b border-line/70 last:border-0"><td className="py-3 font-bold">{labels[row.task_type] ?? row.task_type}</td><td className="py-3 text-muted">{row.model}</td><td className="py-3 text-right">{row.requests}</td><td className="py-3 text-right">{(row.input_tokens + row.output_tokens).toLocaleString("ru-RU")}</td><td className="py-3 text-right font-bold text-apex">{rub(row.cost_usd)}</td></tr>) : <tr><td colSpan={5} className="py-8 text-center text-muted">ИИ-запросов за выбранный период ещё не было.</td></tr>}</tbody></table></div></Card>
+  </div>;
+}
+
+function AiExpenseChart({ items, rate }: { items: AiUsageSummary["daily"]; rate: number }) {
+  const values = items.map((item) => item.cost_usd * rate); const width = 760; const height = 230; const left = 24; const right = 18; const top = 20; const bottom = 34; const plotWidth = width - left - right; const plotHeight = height - top - bottom; const max = Math.max(...values, 1); const points = values.map((value, index) => ({ x: left + (values.length <= 1 ? plotWidth / 2 : index / (values.length - 1) * plotWidth), y: top + plotHeight - value / max * plotHeight, value, label: items[index]?.date.slice(5).split("-").reverse().join(".") ?? "" })); const line = points.map((point) => `${point.x},${point.y}`).join(" "); const area = points.length ? `${left},${top + plotHeight} ${line} ${left + plotWidth},${top + plotHeight}` : "";
+  return <Card className="overflow-hidden border-apex/20 bg-gradient-to-br from-panel to-panel-soft"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-lg font-black">Динамика расходов на ИИ</h2><p className="mt-1 text-sm text-muted">Стоимость запросов по дням за выбранный период</p></div><span className="rounded-lg bg-apex/10 px-3 py-2 text-sm font-bold text-apex">В рублях</span></div><div className="mt-4 overflow-x-auto rounded-xl border border-line bg-canvas/40 p-2"><svg className="h-auto min-w-[620px] w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="График расходов на ИИ"><defs><linearGradient id="aiCostArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#ffd400" stopOpacity="0.42" /><stop offset="100%" stopColor="#ffd400" stopOpacity="0.02" /></linearGradient></defs>{[0,.25,.5,.75,1].map((tick) => { const y = top + plotHeight - tick * plotHeight; return <line key={tick} x1={left} y1={y} x2={left + plotWidth} y2={y} stroke="#273440" strokeWidth="1" strokeDasharray={tick ? "4 6" : undefined} />; })}{area && <polygon points={area} fill="url(#aiCostArea)" />}{points.length > 1 && <polyline points={line} fill="none" stroke="#ffd400" strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />}{points.map((point, index) => <g key={`${point.label}-${index}`}><circle cx={point.x} cy={point.y} r={point.value ? 4.5 : 2.5} fill={point.value ? "#ffd400" : "#586574"} stroke="#0b1118" strokeWidth="3"><title>{point.label}: {Math.round(point.value).toLocaleString("ru-RU")} ₽</title></circle>{(index === 0 || index === points.length - 1 || index % Math.max(1, Math.ceil(points.length / 7)) === 0) && <text x={point.x} y={height - 12} textAnchor="middle" fill="#8391a2" fontSize="11">{point.label}</text>}</g>)}</svg></div></Card>;
 }
 
 function Overview({ sections, open, setOpen, orders, ordersOpen, setOrdersOpen, openDetail, totals, margin }: { sections: { key: Exclude<Section, null>; label: string; value: number; hint: string; icon: typeof Banknote; color: string; rows: readonly (readonly [string, number])[] }[]; open: Section; setOpen: (value: Section) => void; orders: Order[]; ordersOpen: boolean; setOrdersOpen: (value: boolean) => void; openDetail: AppOutlet["openDetail"]; totals: ReturnType<typeof calculate>; margin: number }) {

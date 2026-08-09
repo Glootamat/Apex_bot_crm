@@ -26,6 +26,9 @@ export type Finance = {
   orders: number; no_shows: number; labor_revenue: number; parts_revenue: number;
   parts_cost: number; parts_profit: number; today_profit: number; revenue: number; profit: number;
 };
+export type AiUsageRow = { task_type: string; model: string; requests: number; cost_usd: number; input_tokens: number; output_tokens: number };
+export type AiUsageDaily = { date: string; cost_usd: number };
+export type AiUsageSummary = { cost_usd: number; requests: number; input_tokens: number; output_tokens: number; usd_to_rub_rate: number; by_task: AiUsageRow[]; daily: AiUsageDaily[] };
 export type CrmData = { customers: Customer[]; cars: Car[]; appointments: Appointment[]; appointment_history: Appointment[]; orders: Order[]; finance: Finance };
 export type Dashboard = { today_profit: number; active_orders: number; upcoming_appointments: number; orders: Order[]; appointments: Appointment[] };
 export type StaffRole = "admin" | "service_advisor" | "mechanic" | "accountant" | "viewer";

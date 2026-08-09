@@ -165,7 +165,7 @@ export function AppShell() {
       swipeStart.current = {
         x: touch.clientX,
         y: touch.clientY,
-        tracking: menuOpen || touch.clientX <= 32,
+        tracking: menuOpen || touch.clientX <= window.innerWidth / 2,
       };
     };
     const touchEnd = (event: TouchEvent) => {

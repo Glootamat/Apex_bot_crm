@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { AiUsageSummary } from "./types";
 import type { Account, AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, Order, OrderInput, Organization, PartsCatalogResult, PartsCatalogStatus, ProfitLigaOrdersResult, ReceiptUploadResult, RosskoOrdersResult, SearchResults, StaffMember, StaffRole, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
@@ -46,6 +47,7 @@ export const api = {
   createOrganization: (value: { name: string; city: string; owner_name: string; username: string; password: string; demo: boolean }) => request<Organization>("/api/platform/organizations", { method: "POST", ...json(value) }),
   updateOrganizationAccess: (id: number, action: "block" | "activate" | "demo") => request<Organization>(`/api/platform/organizations/${id}/access`, { method: "POST", ...json({ action }) }),
   dashboard: () => request<Dashboard>("/api/dashboard"),
+  aiUsage: (period: number) => request<AiUsageSummary>(`/api/finance/ai-usage?period=${period}`),
   crm: () => request<CrmData>("/api/crm"),
   search: (query: string) => request<SearchResults>(`/api/search?q=${encodeURIComponent(query)}`),
   trash: () => request<TrashData>("/api/trash"),
