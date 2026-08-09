@@ -22,6 +22,39 @@ def password_hash(password: str) -> str:
 
 
 class PwaTest(unittest.TestCase):
+    def test_platform_owner_creates_demo_service_and_controls_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.add_or_update_user(7001, "Platform Owner", None)
+            environment = {
+                "ADMIN_ID": "7001",
+                "PWA_ADMIN_USER": "admin",
+                "PWA_PASSWORD_HASH": password_hash("secret-password"),
+                "PWA_SESSION_SECRET": "s" * 48,
+            }
+            with patch.object(pwa, "db", db), patch.dict(os.environ, environment):
+                admin = TestClient(pwa.app, base_url="https://testserver")
+                self.assertEqual(admin.post("/api/login", json={"username": "admin", "password": "secret-password"}).status_code, 200)
+                created = admin.post("/api/platform/organizations", json={
+                    "name": "Demo Service", "city": "Ставрополь", "owner_name": "Demo Owner",
+                    "username": "demo-owner", "password": "demo-password", "demo": True,
+                })
+                self.assertEqual(created.status_code, 201)
+                self.assertEqual(created.json()["status"], "demo")
+                organization_id = created.json()["id"]
+
+                owner = TestClient(pwa.app, base_url="https://testserver")
+                self.assertEqual(owner.post("/api/login", json={"username": "demo-owner", "password": "demo-password"}).status_code, 200)
+                blocked = admin.post(f"/api/platform/organizations/{organization_id}/access", json={"action": "block"})
+                self.assertEqual(blocked.json()["status"], "blocked")
+                self.assertEqual(owner.get("/api/dashboard").status_code, 401)
+                self.assertEqual(owner.post("/api/login", json={"username": "demo-owner", "password": "demo-password"}).status_code, 401)
+
+                restored = admin.post(f"/api/platform/organizations/{organization_id}/access", json={"action": "activate"})
+                self.assertEqual(restored.json()["status"], "active")
+                self.assertEqual(owner.post("/api/login", json={"username": "demo-owner", "password": "demo-password"}).status_code, 200)
+
     def test_health_login_and_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

@@ -7,6 +7,27 @@ from database import Database
 
 
 class DatabaseTest(unittest.TestCase):
+    def test_platform_can_manage_demo_and_organization_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            organization_id = db.create_organization(
+                "Тестовый сервис", "Ставрополь", "Иван Владелец",
+                "demo-owner", "password-hash", demo_days=7,
+            )
+            service = next(item for item in db.list_organizations() if item["id"] == organization_id)
+            self.assertEqual(service["status"], "demo")
+            self.assertEqual(service["demo_days_left"], 7)
+            self.assertIsNotNone(db.get_auth_account("demo-owner"))
+
+            self.assertTrue(db.update_organization_access(organization_id, "block"))
+            self.assertEqual(db.list_organizations()[0]["status"], "blocked")
+            self.assertIsNone(db.get_auth_account("demo-owner"))
+
+            self.assertTrue(db.update_organization_access(organization_id, "activate"))
+            self.assertEqual(db.list_organizations()[0]["status"], "active")
+            self.assertIsNotNone(db.get_auth_account("demo-owner"))
+
     def test_user_car_and_service_order_are_linked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -727,12 +748,13 @@ class DatabaseTest(unittest.TestCase):
             db.initialize()
             user_id = db.add_or_update_user(4012, "Master", None)
             car_id = db.add_car(user_id, "Kia", "Rio", mileage=125000)
+            order = db.add_service_order(car_id, "Диагностика", 0, 0, 0)
             checklist = [
                 ("general", "body", "Кузов", False),
                 ("suspension", "bearings", "Подшипники", True),
             ]
 
-            card = db.start_diagnostic(user_id, car_id, None, checklist)
+            card = db.start_diagnostic(user_id, car_id, order.id, checklist)
             self.assertIsNotNone(card)
             assert card is not None
             self.assertEqual(card["mileage"], 125000)
@@ -751,12 +773,53 @@ class DatabaseTest(unittest.TestCase):
             summary = db.list_diagnostics(user_id)[0]
             self.assertEqual(summary["checked"], 1)
             self.assertEqual(summary["critical"], 1)
+            reopened = db.start_diagnostic(user_id, car_id, order.id, checklist)
+            assert reopened is not None
+            self.assertEqual(reopened["id"], card["id"])
+            self.assertEqual(reopened["status"], "completed")
+            self.assertEqual(reopened["items"][1]["right_status"], "critical")
 
             other_user_id = db.add_or_update_user(4013, "Other", None)
             self.assertIsNone(db.delete_diagnostic(other_user_id, int(card["id"])))
             self.assertEqual(db.delete_diagnostic(user_id, int(card["id"])), [])
             self.assertIsNone(db.get_diagnostic(user_id, int(card["id"])))
             self.assertEqual(db.list_diagnostics(user_id), [])
+
+    def test_diagnostic_creates_one_safe_order_without_invented_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4014, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Venga", mileage=198500)
+            checklist = [("suspension", "rods", "Рулевые тяги", True)]
+            card = db.start_diagnostic(user_id, car_id, None, checklist)
+            assert card is not None
+            db.update_diagnostic_item(
+                user_id, int(card["id"]), "rods", left_status="critical",
+                right_status="attention", recommendation="Заменить рулевую тягу",
+                estimated_cost=2500,
+            )
+
+            result = db.create_order_from_diagnostic(user_id, int(card["id"]))
+            assert result is not None
+            order, created = result
+            self.assertTrue(created)
+            self.assertEqual(order.labor_revenue, 2500)
+            self.assertEqual(order.parts_cost, 0)
+            self.assertEqual(order.parts_revenue, 0)
+            self.assertIn("Левая сторона", order.description)
+            self.assertIn("Правая сторона", order.description)
+            self.assertIn("Требуется подобрать запчасти", order.recommendations or "")
+            self.assertIn("• Рулевые тяги — левая сторона", order.recommendations or "")
+            self.assertNotIn("левая сторона Заменить", order.description)
+            self.assertEqual(db.get_part_items(order.id), [])
+
+            repeated = db.create_order_from_diagnostic(user_id, int(card["id"]))
+            assert repeated is not None
+            repeated_order, repeated_created = repeated
+            self.assertFalse(repeated_created)
+            self.assertEqual(repeated_order.id, order.id)
+            self.assertEqual(repeated_order.description, order.description)
 
     def test_phone_and_plate_are_normalized_for_future_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

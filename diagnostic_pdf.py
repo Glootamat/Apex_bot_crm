@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 from typing import Mapping, Sequence
+from xml.sax.saxutils import escape
 
 from PIL import Image as PILImage, ImageDraw
 
@@ -74,11 +75,40 @@ def _worst_status(item: Mapping[str, object]) -> str:
     return "unchecked"
 
 
+def _issue_rows(items: list[Mapping[str, object]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in items:
+        left = item.get("left_status")
+        right = item.get("right_status")
+        if left is not None or right is not None:
+            for side, side_status in (("левая сторона", left), ("правая сторона", right)):
+                if side_status in {"attention", "critical"}:
+                    row = dict(item)
+                    row["label"] = f"{item.get('label', '')} — {side}"
+                    row["status"] = side_status
+                    row["left_status"] = None
+                    row["right_status"] = None
+                    rows.append(row)
+        elif item.get("status") in {"attention", "critical"}:
+            rows.append(dict(item))
+    return rows
+
+
 def _rounded_logo(path: Path, radius: int = 70) -> BytesIO:
     source = PILImage.open(path).convert("RGBA")
     mask = PILImage.new("L", source.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, *source.size), radius=radius, fill=255)
     source.putalpha(mask)
+    output = BytesIO()
+    source.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
+def _approved_logo_crop(path: Path) -> BytesIO:
+    source = PILImage.open(path).convert("RGB")
+    width, height = source.size
+    source = source.crop((int(width * 0.095), int(height * 0.24), int(width * 0.905), int(height * 0.72)))
     output = BytesIO()
     source.save(output, format="PNG")
     output.seek(0)
@@ -162,7 +192,7 @@ def build_diagnostic_pdf(
     info.setStyle(TableStyle([("ROWBACKGROUNDS", (0, 0), (-1, -1), [PANEL, SOFT]), ("LINEBELOW", (0, 0), (-1, -1), 0.4, LINE), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
     story.extend([info, Spacer(1, 6 * mm)])
 
-    issue_items = [item for item in items if _worst_status(item) in {"attention", "critical"}]
+    issue_items = _issue_rows(items)
     if not issue_items:
         no_issues = Table([[Paragraph("<b>По результатам диагностики замечаний не выявлено.</b>", body)]], colWidths=[186 * mm])
         no_issues.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#10271F")), ("BOX", (0, 0), (-1, -1), 0.8, GREEN), ("TEXTCOLOR", (0, 0), (-1, -1), GREEN), ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 9)]))
@@ -218,6 +248,46 @@ def build_diagnostic_pdf(
     return output.getvalue()
 
 
+class _BrandLockup(Flowable):
+    def __init__(self, bold: str):
+        super().__init__()
+        self.width = 186 * mm
+        self.height = 24 * mm
+        self.bold = bold
+
+    def draw(self):
+        c = self.canv
+        size = 22 * mm
+        c.setStrokeColor(APEX)
+        c.setLineWidth(1.1)
+        c.roundRect(0, 1 * mm, size, size, 3 * mm, fill=0, stroke=1)
+        c.setFillColor(APEX)
+        path = c.beginPath()
+        path.moveTo(4 * mm, 7 * mm)
+        path.lineTo(11 * mm, 18 * mm)
+        path.lineTo(18 * mm, 7 * mm)
+        path.lineTo(15 * mm, 7 * mm)
+        path.lineTo(11 * mm, 13 * mm)
+        path.lineTo(7 * mm, 7 * mm)
+        path.close()
+        c.drawPath(path, fill=1, stroke=0)
+        path = c.beginPath()
+        path.moveTo(8.5 * mm, 6.2 * mm)
+        path.lineTo(11 * mm, 10 * mm)
+        path.lineTo(13.5 * mm, 6.2 * mm)
+        path.close()
+        c.drawPath(path, fill=1, stroke=0)
+        c.setFont(self.bold, 19)
+        c.setFillColor(colors.white)
+        c.drawString(28 * mm, 9 * mm, "APEX")
+        apex_width = c.stringWidth("APEX", self.bold, 19)
+        c.setFillColor(APEX)
+        c.drawString(28 * mm + apex_width + 3 * mm, 9 * mm, "AUTO")
+        c.setFillColor(MUTED)
+        c.setFont(self.bold, 7)
+        c.drawRightString(self.width, 13 * mm, "ДИАГНОСТИЧЕСКАЯ КАРТА")
+
+
 class _VehicleCard(Flowable):
     def __init__(self, diagnostic: Mapping[str, object], issues_count: int, regular: str, bold: str):
         super().__init__()
@@ -253,7 +323,8 @@ class _IssueCard(Flowable):
     def __init__(self, item: Mapping[str, object], regular: str, bold: str):
         super().__init__()
         self.width = 186 * mm
-        self.height = 25 * mm
+        self.notes = " · ".join(filter(None, [str(item.get("comment") or ""), str(item.get("recommendation") or "")]))
+        self.height = (25 if self.notes else 20) * mm
         self.item = item
         self.regular = regular
         self.bold = bold
@@ -266,22 +337,22 @@ class _IssueCard(Flowable):
         c.setStrokeColor(LINE)
         c.roundRect(0, 0, self.width, self.height, 11, fill=1, stroke=1)
         c.setFillColor(accent)
-        c.roundRect(5 * mm, 5 * mm, 1.7 * mm, 15 * mm, 1.5, fill=1, stroke=0)
+        c.roundRect(5 * mm, 4 * mm, 1.7 * mm, self.height - 8 * mm, 1.5, fill=1, stroke=0)
         c.setFillColor(MUTED)
         c.setFont(self.bold, 6.5)
         section = SECTION_LABELS.get(str(self.item.get("section_key")), str(self.item.get("section_key", ""))).upper()
-        c.drawString(10 * mm, 18.2 * mm, section)
+        c.drawString(10 * mm, self.height - 6.8 * mm, section)
         c.setFillColor(colors.white)
         c.setFont(self.bold, 10)
-        c.drawString(10 * mm, 12.6 * mm, str(self.item.get("label", ""))[:62])
-        notes = " · ".join(filter(None, [str(self.item.get("comment") or ""), str(self.item.get("recommendation") or "")])) or "Без комментария"
-        note_style = ParagraphStyle("IssueNote", fontName=self.regular, fontSize=7.2, leading=8.3, textColor=MUTED)
-        note = Paragraph(notes, note_style)
-        note.wrapOn(c, 118 * mm, 8 * mm)
-        note.drawOn(c, 10 * mm, 3.5 * mm)
+        c.drawString(10 * mm, self.height - 12.4 * mm, str(self.item.get("label", ""))[:62])
+        if self.notes:
+            note_style = ParagraphStyle("IssueNote", fontName=self.regular, fontSize=7.2, leading=8.3, textColor=MUTED)
+            note = Paragraph(self.notes, note_style)
+            note.wrapOn(c, 118 * mm, 8 * mm)
+            note.drawOn(c, 10 * mm, 3.5 * mm)
         c.setFillColor(accent)
         c.setFont(self.bold, 7.5)
-        c.drawRightString(self.width - 6 * mm, 17.5 * mm, STATUS_LABELS[status])
+        c.drawRightString(self.width - 6 * mm, self.height / 2, STATUS_LABELS[status])
         if self.item.get("estimated_cost") is not None:
             price = f"{int(self.item['estimated_cost']):,} ₽".replace(",", " ")
             c.setFillColor(APEX)
@@ -309,18 +380,21 @@ def build_diagnostic_pdf(
         author="Apex Auto",
     )
     story: list[object] = []
-    brand_style = ParagraphStyle("CardBrand", fontName=bold, fontSize=18, leading=19, textColor=colors.white)
-    brand = Paragraph("<font color='#F7FAFC'>APEX</font> <font color='#FFD600'>AUTO</font><br/><font size='7' color='#FFD600'>ДИАГНОСТИЧЕСКАЯ КАРТА</font>", brand_style)
+    body = ParagraphStyle("CardBody", fontName=regular, fontSize=8.5, leading=11, textColor=colors.white)
+    small = ParagraphStyle("CardSmall", parent=body, fontSize=7.5, leading=9, textColor=MUTED)
+    heading = ParagraphStyle("CardHeading", parent=body, fontName=bold, fontSize=13, leading=16)
     if logo_path and logo_path.is_file():
-        brand_row: object = Table([[Image(_rounded_logo(logo_path), 22 * mm, 22 * mm), brand]], colWidths=[28 * mm, 158 * mm])
-        brand_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-        story.append(brand_row)
+        report_logo = Image(_approved_logo_crop(logo_path), 102 * mm, 26 * mm, kind="proportional")
+        report_title = Paragraph("ДИАГНОСТИЧЕСКАЯ КАРТА", ParagraphStyle("ReportTitle", fontName=bold, fontSize=9, leading=11, alignment=2, textColor=MUTED))
+        logo_row = Table([[report_logo, report_title]], colWidths=[108 * mm, 78 * mm])
+        logo_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+        story.append(logo_row)
     else:
-        story.append(brand)
+        story.append(_BrandLockup(bold))
     story.append(Spacer(1, 6 * mm))
 
     items = list(diagnostic.get("items", []))
-    issue_items = [item for item in items if _worst_status(item) in {"attention", "critical"}]
+    issue_items = _issue_rows(items)
     story.extend([_VehicleCard(diagnostic, len(issue_items), regular, bold), Spacer(1, 7 * mm)])
     section_style = ParagraphStyle("CardSection", fontName=bold, fontSize=10, leading=12, textColor=colors.white)
     story.extend([Paragraph("ВЫЯВЛЕННЫЕ ЗАМЕЧАНИЯ", section_style), Spacer(1, 4 * mm)])
@@ -344,6 +418,22 @@ def build_diagnostic_pdf(
         canvas.saveState()
         canvas.setFillColor(INK)
         canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+        label = "Спасибо, что выбрали Apex Auto"
+        canvas.setFont(regular, 7.5)
+        text_width = canvas.stringWidth(label, regular, 7.5)
+        group_width = text_width + 9 * mm
+        start_x = (A4[0] - group_width) / 2
+        center_x = start_x + 3 * mm
+        center_y = 7 * mm
+        canvas.setStrokeColor(LINE)
+        canvas.setLineWidth(0.7)
+        canvas.circle(center_x, center_y, 3 * mm, fill=0, stroke=1)
+        canvas.setStrokeColor(APEX)
+        canvas.setLineWidth(1)
+        canvas.line(center_x - 1.6 * mm, center_y, center_x - 0.4 * mm, center_y - 1.2 * mm)
+        canvas.line(center_x - 0.4 * mm, center_y - 1.2 * mm, center_x + 1.8 * mm, center_y + 1.4 * mm)
+        canvas.setFillColor(MUTED)
+        canvas.drawString(start_x + 7 * mm, center_y - 2.2, label)
         canvas.restoreState()
 
     document.build(story, onFirstPage=page, onLaterPages=page)

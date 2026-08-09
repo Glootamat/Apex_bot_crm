@@ -4,8 +4,11 @@ import {
   CarFront,
   ClipboardCheck,
   ClipboardList,
+  FileDown,
+  FileImage,
   Pencil,
-  Receipt,
+  PackageSearch,
+  Save,
   Share2,
   Trash2,
   UserRound,
@@ -20,7 +23,6 @@ import type {
   Customer,
   Order,
   OrderAttachment,
-  ReceiptUploadResult,
 } from "../../lib/types";
 import {
   customerName,
@@ -31,7 +33,7 @@ import {
 } from "../../lib/format";
 import { api } from "../../lib/api";
 import { refreshCrm } from "../../lib/query";
-import { shareOrderImage } from "../../lib/orderImage";
+import { exportOrderImage, exportOrderPdf } from "../../lib/orderImage";
 import { Button, Modal } from "../../components/ui";
 import type { EntityModalState } from "./EntityModal";
 
@@ -53,7 +55,7 @@ const Row = ({ label, value }: { label: string; value: React.ReactNode }) => (
     <dt className="text-xs font-semibold uppercase tracking-wide text-muted">
       {label}
     </dt>
-    <dd className="mt-1 break-words font-semibold">{value || "Не указано"}</dd>
+    <dd className="mt-1 whitespace-pre-line break-words font-semibold">{value || "Не указано"}</dd>
   </div>
 );
 
@@ -62,8 +64,7 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
   const [attachments, setAttachments] = useState<OrderAttachment[]>(
     detail.kind === "order" ? (detail.value.attachments ?? []) : [],
   );
-  const [receiptResult, setReceiptResult] =
-    useState<ReceiptUploadResult | null>(null);
+  const [orderExportOpen, setOrderExportOpen] = useState(false);
   const remove = useMutation({
     mutationFn: () =>
       detail.kind === "customer"
@@ -81,13 +82,12 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     },
   });
   const upload = useMutation({
-    mutationFn: ({ file, type }: { file: File; type: "work" | "receipt" }) =>
+    mutationFn: ({ file, type }: { file: File; type: "work" }) =>
       detail.kind === "order"
         ? api.uploadOrderPhoto(detail.value.id, file, type)
         : Promise.reject(new Error("Загрузка недоступна")),
     onSuccess: async (value) => {
       setAttachments((items) => [...items, value]);
-      setReceiptResult(value.photo_type === "receipt" ? value : null);
       await refreshCrm();
     },
   });
@@ -102,17 +102,13 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
       remove.mutate();
   };
   const uploadInput = (
-    type: "work" | "receipt",
+    type: "work",
     icon: React.ReactNode,
     label: string,
   ) => (
     <label className="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-xl bg-panel-soft px-4 py-2 text-sm font-bold hover:bg-line">
       {icon}
-      {upload.isPending
-        ? type === "receipt"
-          ? "Распознаю чек…"
-          : "Загрузка…"
-        : label}
+      {upload.isPending ? "Загрузка…" : label}
       <input
         className="sr-only"
         type="file"
@@ -309,6 +305,14 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
           </Related>
           <div className="grid gap-2 sm:grid-cols-2">
             <Button
+              className="sm:col-span-2"
+              variant="secondary"
+              onClick={() => go(`/cars/${detail.value.id}/history`)}
+            >
+              <ClipboardList size={17} />
+              История автомобиля
+            </Button>
+            <Button
               variant="secondary"
               onClick={() => go(`/orders?car_id=${detail.value.id}`)}
             >
@@ -415,9 +419,6 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
   const o = detail.value;
   const markup = o.parts_revenue - o.parts_cost + o.parts_profit;
   const works = attachments.filter((x) => x.photo_type === "work" && x.url);
-  const receipts = attachments.filter(
-    (x) => x.photo_type === "receipt" && x.url,
-  );
   const diagnosticAction = (
     <Button
       variant="secondary"
@@ -457,22 +458,6 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
         <Row label="Выполненные работы" value={o.description} />
         <Row label="Рекомендации" value={o.recommendations} />
         <Gallery title="Фото работ" items={works} />
-        <Gallery title="Фото чеков" items={receipts} />
-        {receiptResult?.recognized && (
-          <p className="rounded-xl bg-success/10 p-3 text-sm text-success">
-            Распознано позиций: {receiptResult.items_count}. Закупка:{" "}
-            {money(receiptResult.purchase_cost)}. Наценка{" "}
-            {receiptResult.markup_percent}%:{" "}
-            {money(receiptResult.markup_profit)}. Цена клиенту:{" "}
-            {money(receiptResult.selling_price)}.
-          </p>
-        )}
-        {receiptResult?.recognition_error && (
-          <p className="rounded-xl bg-danger/10 p-3 text-sm text-danger">
-            Фото сохранено, но чек не расшифрован:{" "}
-            {receiptResult.recognition_error}
-          </p>
-        )}
         {upload.error && (
           <p className="text-sm text-danger">
             Не удалось загрузить фото. Используйте JPG, PNG или WebP до 10 МБ.
@@ -482,16 +467,27 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
           <p className="text-sm text-danger">Не удалось удалить заказ-наряд</p>
         )}
         <div className="grid gap-2 sm:grid-cols-2">
-          {uploadInput("work", <Camera size={17} />, "Добавить фото работ")}
-          {uploadInput(
-            "receipt",
-            <Receipt size={17} />,
-            upload.isPending ? "Распознаю чек…" : "Добавить чек и наценить",
-          )}
-          <Button variant="secondary" onClick={() => void shareOrderImage(o)}>
-            <Share2 size={17} />
-            Отправить картинкой
+          <Button
+            variant="primary"
+            className="sm:col-span-2"
+            onClick={() => go(`/parts-catalog?order_id=${o.id}`)}
+          >
+            <PackageSearch size={17} />
+            Подобрать запчасти и загрузить заказ поставщика
           </Button>
+          {uploadInput("work", <Camera size={17} />, "Добавить фото работ")}
+          <Button variant="secondary" onClick={() => setOrderExportOpen((current) => !current)}>
+            <Save size={17} />
+            Сохранить
+          </Button>
+          <Button variant="secondary" onClick={() => void exportOrderImage(o, true)}>
+            <Share2 size={17} />
+            Поделиться
+          </Button>
+          {orderExportOpen && <div className="grid gap-2 rounded-xl border border-apex/30 bg-panel-soft p-3 sm:col-span-2 sm:grid-cols-2">
+            <Button variant="secondary" onClick={() => { setOrderExportOpen(false); void exportOrderPdf(o); }}><FileDown size={17} />Сохранить PDF</Button>
+            <Button variant="secondary" onClick={() => { setOrderExportOpen(false); void exportOrderImage(o, false); }}><FileImage size={17} />Сохранить картинкой</Button>
+          </div>}
           {diagnosticAction}
           <Button className="sm:col-span-2" onClick={() => onEdit({ kind: "order", value: o })}>
             <Pencil size={17} />

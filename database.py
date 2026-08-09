@@ -8,7 +8,7 @@ import math
 from psycopg import IntegrityError as PostgresIntegrityError
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +32,18 @@ _SEARCH_ALIASES = {
     "kamri": "camry", "korolla": "corolla", "solyaris": "solaris",
     "vaz": "lada",
 }
+
+
+def _timestamp_expired(value: object) -> bool:
+    if not value:
+        return False
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment <= datetime.now(timezone.utc)
+    except ValueError:
+        return False
 
 _SEARCH_STOP_WORDS = {
     "mashina", "avtomobil", "avto", "klient", "klienta", "naydi", "nayti",
@@ -344,6 +356,40 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS organizations (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    data_owner_user_id INTEGER NOT NULL UNIQUE,
+                    city TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    demo_expires_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (data_owner_user_id) REFERENCES users(id) ON DELETE RESTRICT
+                );
+
+                CREATE TABLE IF NOT EXISTS auth_accounts (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    full_name TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    platform_admin INTEGER NOT NULL DEFAULT 0,
+                    password_changed_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS organization_memberships (
+                    id INTEGER PRIMARY KEY,
+                    organization_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+                    FOREIGN KEY (account_id) REFERENCES auth_accounts(id) ON DELETE CASCADE,
+                    UNIQUE(organization_id, account_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS cars (
                     id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL,
@@ -441,6 +487,16 @@ class Database:
                     markup_percent REAL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS supplier_order_imports (
+                    id INTEGER PRIMARY KEY,
+                    service_order_id INTEGER NOT NULL,
+                    supplier TEXT NOT NULL,
+                    external_order_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE,
+                    UNIQUE(service_order_id, supplier, external_order_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS receipts (
@@ -644,6 +700,9 @@ class Database:
             incoming_columns = {row["name"] for row in connection.execute("PRAGMA table_info(incoming_messages)")}
             if "message_id" not in incoming_columns:
                 connection.execute("ALTER TABLE incoming_messages ADD COLUMN message_id INTEGER")
+            organization_columns = {row["name"] for row in connection.execute("PRAGMA table_info(organizations)")}
+            if "demo_expires_at" not in organization_columns:
+                connection.execute("ALTER TABLE organizations ADD COLUMN demo_expires_at TEXT")
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_customers_user_active ON customers(user_id, archived_at);
@@ -672,6 +731,8 @@ class Database:
                     WHERE service_order_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_diagnostics_car ON diagnostics(car_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_diagnostics_order ON diagnostics(service_order_id);
+                CREATE INDEX IF NOT EXISTS idx_memberships_account ON organization_memberships(account_id, active);
+                CREATE INDEX IF NOT EXISTS idx_memberships_org ON organization_memberships(organization_id, active);
                 CREATE INDEX IF NOT EXISTS idx_diagnostic_items_diagnostic ON diagnostic_items(diagnostic_id, section_key);
                 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
                 """
@@ -712,6 +773,264 @@ class Database:
             row = connection.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
             connection.commit()
             return int(row["id"])
+        finally:
+            connection.close()
+
+    def bootstrap_web_owner(self, username: str, password_hash: str, full_name: str, telegram_id: int) -> dict[str, object]:
+        """Create the first organization/account without moving existing CRM records."""
+        data_owner_id = self.add_or_update_user(telegram_id, full_name, username)
+        connection = self.connect()
+        try:
+            organization = connection.execute(
+                "SELECT id FROM organizations WHERE data_owner_user_id = ?", (data_owner_id,),
+            ).fetchone()
+            if organization is None:
+                cursor = connection.execute(
+                    "INSERT INTO organizations (name, data_owner_user_id) VALUES (?, ?)",
+                    (os.getenv("PWA_WORKSPACE_NAME", "Apex Auto"), data_owner_id),
+                )
+                organization_id = int(cursor.lastrowid)
+            else:
+                organization_id = int(organization["id"])
+            account = connection.execute(
+                "SELECT id FROM auth_accounts WHERE username = ?", (username.casefold(),),
+            ).fetchone()
+            if account is None:
+                cursor = connection.execute(
+                    """INSERT INTO auth_accounts
+                       (username, password_hash, full_name, platform_admin, password_changed_at)
+                       VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)""",
+                    (username.casefold(), password_hash, full_name),
+                )
+                account_id = int(cursor.lastrowid)
+            else:
+                account_id = int(account["id"])
+            connection.execute(
+                """INSERT INTO organization_memberships (organization_id, account_id, role)
+                   VALUES (?, ?, 'owner') ON CONFLICT(organization_id, account_id) DO NOTHING""",
+                (organization_id, account_id),
+            )
+            connection.commit()
+            return self.get_auth_account(username) or {}
+        finally:
+            connection.close()
+
+    def get_auth_account(self, username: str) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT a.id, a.username, a.password_hash, a.full_name, a.active,
+                          a.platform_admin, m.organization_id, m.role,
+                          o.name AS organization_name, o.data_owner_user_id, o.demo_expires_at,
+                          u.telegram_id AS data_owner_telegram_id
+                   FROM auth_accounts a
+                   JOIN organization_memberships m ON m.account_id = a.id AND m.active = 1
+                   JOIN organizations o ON o.id = m.organization_id AND o.active = 1
+                   JOIN users u ON u.id = o.data_owner_user_id
+                   WHERE a.username = ? AND a.active = 1
+                   ORDER BY m.id LIMIT 1""",
+                (username.strip().casefold(),),
+            ).fetchone()
+            result = dict(row) if row else None
+            return None if result and _timestamp_expired(result.get("demo_expires_at")) else result
+        finally:
+            connection.close()
+
+    def get_auth_context(self, account_id: int, organization_id: int) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT a.id, a.username, a.full_name, a.active, a.platform_admin,
+                          m.organization_id, m.role, o.name AS organization_name, o.demo_expires_at,
+                          o.data_owner_user_id, u.telegram_id AS data_owner_telegram_id
+                   FROM auth_accounts a
+                   JOIN organization_memberships m ON m.account_id = a.id AND m.active = 1
+                   JOIN organizations o ON o.id = m.organization_id AND o.active = 1
+                   JOIN users u ON u.id = o.data_owner_user_id
+                   WHERE a.id = ? AND m.organization_id = ? AND a.active = 1""",
+                (account_id, organization_id),
+            ).fetchone()
+            result = dict(row) if row else None
+            return None if result and _timestamp_expired(result.get("demo_expires_at")) else result
+        finally:
+            connection.close()
+
+    def list_staff(self, organization_id: int) -> list[dict[str, object]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT a.id, a.username, a.full_name, a.active, m.role, m.created_at
+                   FROM organization_memberships m JOIN auth_accounts a ON a.id = m.account_id
+                   WHERE m.organization_id = ? AND m.active = 1 ORDER BY a.full_name""",
+                (organization_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def create_staff(self, organization_id: int, username: str, password_hash: str, full_name: str, role: str) -> int:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                "INSERT INTO auth_accounts (username, password_hash, full_name) VALUES (?, ?, ?)",
+                (username.strip().casefold(), password_hash, full_name.strip()),
+            )
+            account_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO organization_memberships (organization_id, account_id, role) VALUES (?, ?, ?)",
+                (organization_id, account_id, role),
+            )
+            connection.commit()
+            return account_id
+        finally:
+            connection.close()
+
+    def update_staff(self, organization_id: int, account_id: int, role: str | None = None, active: bool | None = None, password_hash: str | None = None) -> bool:
+        connection = self.connect()
+        try:
+            membership = connection.execute(
+                "SELECT role FROM organization_memberships WHERE organization_id = ? AND account_id = ?",
+                (organization_id, account_id),
+            ).fetchone()
+            if membership is None or membership["role"] == "owner":
+                return False
+            if role is not None:
+                connection.execute(
+                    "UPDATE organization_memberships SET role = ? WHERE organization_id = ? AND account_id = ?",
+                    (role, organization_id, account_id),
+                )
+            if active is not None:
+                connection.execute("UPDATE auth_accounts SET active = ? WHERE id = ?", (int(active), account_id))
+            if password_hash is not None:
+                connection.execute(
+                    "UPDATE auth_accounts SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (password_hash, account_id),
+                )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def list_organizations(self) -> list[dict[str, object]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT o.id, o.name, o.city, o.active, o.demo_expires_at, o.created_at,
+                          owner.full_name AS owner_name, owner.username AS owner_username,
+                          (SELECT COUNT(*) FROM organization_memberships m
+                           WHERE m.organization_id = o.id AND m.active = 1) AS employees,
+                          (SELECT COUNT(*) FROM service_orders so JOIN cars c ON c.id = so.car_id
+                           WHERE c.user_id = o.data_owner_user_id AND so.archived_at IS NULL) AS orders
+                   FROM organizations o
+                   LEFT JOIN organization_memberships om ON om.organization_id = o.id AND om.role = 'owner' AND om.active = 1
+                   LEFT JOIN auth_accounts owner ON owner.id = om.account_id
+                   ORDER BY o.id"""
+            ).fetchall()
+            now = datetime.now(timezone.utc)
+            result: list[dict[str, object]] = []
+            for row in rows:
+                item = dict(row)
+                expires_at = item.get("demo_expires_at")
+                expires = None
+                if expires_at:
+                    try:
+                        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                        if expires.tzinfo is None:
+                            expires = expires.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        expires = None
+                if not item["active"]:
+                    item["status"] = "blocked"
+                elif expires is not None and expires <= now:
+                    item["status"] = "expired"
+                elif expires is not None:
+                    item["status"] = "demo"
+                else:
+                    item["status"] = "active"
+                item["demo_days_left"] = max(0, (expires - now).days + 1) if expires is not None else None
+                result.append(item)
+            return result
+        finally:
+            connection.close()
+
+    def create_organization(self, name: str, city: str | None, owner_name: str, username: str, password_hash: str, demo_days: int = 7) -> int:
+        connection = self.connect()
+        try:
+            row = connection.execute("SELECT MIN(telegram_id) AS value FROM users").fetchone()
+            synthetic_telegram_id = min(-1, int(row["value"] or 0) - 1)
+            cursor = connection.execute(
+                "INSERT INTO users (telegram_id, username, full_name) VALUES (?, ?, ?)",
+                (synthetic_telegram_id, username.strip().casefold(), owner_name.strip()),
+            )
+            data_owner_id = int(cursor.lastrowid)
+            cursor = connection.execute(
+                "INSERT INTO organizations (name, data_owner_user_id, city, demo_expires_at) VALUES (?, ?, ?, ?)",
+                (name.strip(), data_owner_id, city.strip() if city else None,
+                 (datetime.now(timezone.utc) + timedelta(days=demo_days)).isoformat() if demo_days > 0 else None),
+            )
+            organization_id = int(cursor.lastrowid)
+            cursor = connection.execute(
+                "INSERT INTO auth_accounts (username, password_hash, full_name) VALUES (?, ?, ?)",
+                (username.strip().casefold(), password_hash, owner_name.strip()),
+            )
+            account_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO organization_memberships (organization_id, account_id, role) VALUES (?, ?, 'owner')",
+                (organization_id, account_id),
+            )
+            connection.commit()
+            return organization_id
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def update_organization_access(self, organization_id: int, action: str) -> bool:
+        connection = self.connect()
+        try:
+            if action == "block":
+                cursor = connection.execute(
+                    "UPDATE organizations SET active = 0 WHERE id = ?", (organization_id,)
+                )
+            elif action == "activate":
+                cursor = connection.execute(
+                    "UPDATE organizations SET active = 1, demo_expires_at = NULL WHERE id = ?", (organization_id,)
+                )
+            elif action == "demo":
+                cursor = connection.execute(
+                    "UPDATE organizations SET active = 1, demo_expires_at = ? WHERE id = ?",
+                    ((datetime.now(timezone.utc) + timedelta(days=7)).isoformat(), organization_id),
+                )
+            else:
+                raise ValueError("Неизвестное действие")
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def get_workspace(self, organization_id: int) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute("SELECT id, name, city FROM organizations WHERE id = ?", (organization_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            connection.close()
+
+    def update_workspace(self, organization_id: int, name: str, city: str | None) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            connection.execute("UPDATE organizations SET name = ?, city = ? WHERE id = ?", (name.strip(), city.strip() if city else None, organization_id))
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_workspace(organization_id)
+
+    def update_account_password(self, account_id: int, password_hash: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute("UPDATE auth_accounts SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP WHERE id = ?", (password_hash, account_id))
+            connection.commit()
         finally:
             connection.close()
 
@@ -2214,6 +2533,60 @@ class Database:
         finally:
             connection.close()
 
+    def imported_supplier_order_ids(self, service_order_id: int, supplier: str) -> set[str]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT external_order_id FROM supplier_order_imports WHERE service_order_id = ? AND supplier = ?",
+                (service_order_id, supplier),
+            ).fetchall()
+            return {str(row["external_order_id"]) for row in rows}
+        finally:
+            connection.close()
+
+    def import_supplier_order(
+        self, service_order_id: int, supplier: str, external_order_id: str,
+        parts: list[tuple[str, str, int, int]], markup_percent: float, round_to: int = 50,
+    ) -> tuple[int, int, int]:
+        connection = self.connect()
+        try:
+            if connection.execute(
+                "SELECT 1 FROM supplier_order_imports WHERE service_order_id = ? AND supplier = ? AND external_order_id = ?",
+                (service_order_id, supplier, external_order_id),
+            ).fetchone():
+                raise ValueError("supplier order already imported")
+            purchase_total = 0
+            sale_total = 0
+            for name, article, quantity, unit_cost in parts:
+                quantity = max(1, int(quantity))
+                unit_cost = int(unit_cost)
+                total_cost = unit_cost * quantity
+                unit_sale = math.ceil((unit_cost * (1 + markup_percent / 100)) / round_to) * round_to
+                connection.execute(
+                    """INSERT INTO part_items
+                       (service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent),
+                )
+                purchase_total += total_cost
+                sale_total += unit_sale * quantity
+            connection.execute(
+                """UPDATE service_orders SET parts_cost = parts_cost + ?, parts_revenue = parts_revenue + ?,
+                       parts_source = 'workshop' WHERE id = ?""",
+                (purchase_total, sale_total, service_order_id),
+            )
+            connection.execute(
+                "INSERT INTO supplier_order_imports (service_order_id, supplier, external_order_id) VALUES (?, ?, ?)",
+                (service_order_id, supplier, external_order_id),
+            )
+            connection.commit()
+            return len(parts), purchase_total, sale_total
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def apply_markup_to_unmarked_parts(self, service_order_id: int, percent: float) -> tuple[int, int, int]:
         """Apply a margin once to receipt-derived positions not marked up before."""
         connection = self.connect()
@@ -2543,12 +2916,20 @@ class Database:
                 (service_order_id, car_id, user_id),
             ).fetchone() is None:
                 return None
-            existing = connection.execute(
-                """SELECT id FROM diagnostics WHERE car_id = ? AND status = 'draft'
-                   AND COALESCE(service_order_id, 0) = COALESCE(?, 0)
-                   ORDER BY id DESC LIMIT 1""",
-                (car_id, service_order_id),
-            ).fetchone()
+            if service_order_id is not None:
+                # An order has one current diagnostic card. Reopen it even after
+                # completion so closing and returning never creates a blank card.
+                existing = connection.execute(
+                    """SELECT id FROM diagnostics WHERE car_id = ? AND service_order_id = ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (car_id, service_order_id),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    """SELECT id FROM diagnostics WHERE car_id = ? AND status = 'draft'
+                       AND service_order_id IS NULL ORDER BY id DESC LIMIT 1""",
+                    (car_id,),
+                ).fetchone()
             if existing is None:
                 cursor = connection.execute(
                     "INSERT INTO diagnostics (car_id, service_order_id, mileage) VALUES (?, ?, ?)",
@@ -2571,6 +2952,96 @@ class Database:
         finally:
             connection.close()
         return self.get_diagnostic(user_id, diagnostic_id)
+
+    def create_order_from_diagnostic(self, user_id: int, diagnostic_id: int) -> tuple[ServiceOrder, bool] | None:
+        """Create and link one safe draft order from diagnostic findings."""
+        connection = self.connect()
+        try:
+            diagnostic = connection.execute(
+                """SELECT d.id, d.car_id, d.service_order_id, d.notes
+                   FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                   WHERE d.id = ? AND c.user_id = ? AND c.archived_at IS NULL""",
+                (diagnostic_id, user_id),
+            ).fetchone()
+            if diagnostic is None:
+                return None
+            rows = connection.execute(
+                """SELECT label, status, left_status, right_status, recommendation,
+                          estimated_cost
+                   FROM diagnostic_items WHERE diagnostic_id = ? ORDER BY id""",
+                (diagnostic_id,),
+            ).fetchall()
+            issue_statuses = {"attention", "critical"}
+            works: list[str] = []
+            required_parts: list[str] = []
+            labor_revenue = 0
+            for row in rows:
+                recommendation = str(row["recommendation"] or "").strip()
+                label = str(row["label"])
+                sides: list[str] = []
+                if row["left_status"] in issue_statuses:
+                    sides.append("левая сторона")
+                if row["right_status"] in issue_statuses:
+                    sides.append("правая сторона")
+                if sides:
+                    side_lines = "\n".join(f"• {side.capitalize()}" for side in sides)
+                    works.append(f"{recommendation or label}:\n{side_lines}")
+                    required_parts.extend(f"• {label} — {side}" for side in sides)
+                elif row["status"] in issue_statuses or recommendation:
+                    works.append(recommendation or label)
+                    required_parts.append(f"• {label}")
+                if (sides or row["status"] in issue_statuses or recommendation) and row["estimated_cost"] is not None:
+                    labor_revenue += max(0, int(row["estimated_cost"]))
+            # Preserve order while removing identical recommendations.
+            works = list(dict.fromkeys(works))
+            required_parts = list(dict.fromkeys(required_parts))
+            if not works:
+                return None
+            description = "\n\n".join(works)
+            recommendations = "Требуется подобрать запчасти:\n" + "\n".join(required_parts)
+            linked_order_id = diagnostic["service_order_id"]
+            if linked_order_id is not None:
+                linked_order_id = int(linked_order_id)
+                expected_concern = f"По результатам диагностики №{diagnostic_id}"
+                linked = connection.execute(
+                    "SELECT concern FROM service_orders WHERE id = ? AND car_id = ? AND archived_at IS NULL",
+                    (linked_order_id, diagnostic["car_id"]),
+                ).fetchone()
+                # Refresh only orders created by this workflow; never overwrite a manually linked order.
+                if linked is not None and linked["concern"] == expected_concern:
+                    connection.execute(
+                        """UPDATE service_orders
+                           SET description = ?, labor_revenue = ?, recommendations = ?
+                           WHERE id = ?""",
+                        (description, labor_revenue, recommendations, linked_order_id),
+                    )
+                    self._write_audit(connection, user_id, "service_order", linked_order_id, "synced_from_diagnostic")
+                    connection.commit()
+                return self.get_service_order(linked_order_id), False
+            cursor = connection.execute(
+                """INSERT INTO service_orders
+                   (car_id, description, labor_revenue, parts_cost, parts_revenue,
+                    parts_profit, concern, recommendations, mileage_at_visit)
+                   VALUES (?, ?, ?, 0, 0, 0, ?, ?,
+                           (SELECT COALESCE(d.mileage, c.mileage) FROM diagnostics d
+                            JOIN cars c ON c.id = d.car_id WHERE d.id = ?))""",
+                (
+                    diagnostic["car_id"], description, labor_revenue,
+                    f"По результатам диагностики №{diagnostic_id}",
+                    recommendations,
+                    diagnostic_id,
+                ),
+            )
+            order_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE diagnostics SET service_order_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND service_order_id IS NULL",
+                (order_id, diagnostic_id),
+            )
+            self._write_audit(connection, user_id, "service_order", order_id, "created_from_diagnostic")
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_service_order(order_id), True
 
     def get_diagnostic(self, user_id: int, diagnostic_id: int) -> dict[str, object] | None:
         connection = self.connect()
@@ -2596,6 +3067,41 @@ class Database:
                 "SELECT id, filename, caption, created_at FROM diagnostic_photos WHERE diagnostic_id = ? ORDER BY id",
                 (diagnostic_id,),
             ).fetchall()]
+            result["order_description"] = None
+            result["labor_revenue"] = 0
+            result["parts_revenue"] = 0
+            result["part_names"] = []
+            result["parts"] = []
+            if result.get("service_order_id") is not None:
+                order = connection.execute(
+                    """SELECT description, labor_revenue, parts_revenue
+                       FROM service_orders WHERE id = ?""",
+                    (result["service_order_id"],),
+                ).fetchone()
+                if order is not None:
+                    result["order_description"] = order["description"]
+                    result["labor_revenue"] = int(order["labor_revenue"] or 0)
+                    result["parts_revenue"] = int(order["parts_revenue"] or 0)
+                part_rows = connection.execute(
+                        """SELECT name, article, quantity, unit_cost, total_cost, markup_percent
+                           FROM part_items WHERE service_order_id = ? ORDER BY id""",
+                        (result["service_order_id"],),
+                    ).fetchall()
+                result["part_names"] = [str(item["name"]) for item in part_rows]
+                result["parts"] = []
+                for item in part_rows:
+                    part = dict(item)
+                    quantity = max(1, int(part.get("quantity") or 1))
+                    unit_cost = int(part.get("unit_cost") or 0)
+                    markup = part.get("markup_percent")
+                    if unit_cost and markup is not None:
+                        unit_sale = math.ceil((unit_cost * (1 + float(markup) / 100)) / 50) * 50
+                        part["sale_unit"] = unit_sale
+                        part["sale_total"] = unit_sale * quantity
+                    else:
+                        part["sale_unit"] = None
+                        part["sale_total"] = None
+                    result["parts"].append(part)
             return result
         finally:
             connection.close()

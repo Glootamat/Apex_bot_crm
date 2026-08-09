@@ -25,6 +25,46 @@ class SupplierOffer:
     warehouse: str | None = None
 
 
+@dataclass(frozen=True)
+class RosskoOrderPart:
+    article: str
+    name: str
+    brand: str
+    purchase_price: int
+    quantity: int
+    status: int
+
+
+@dataclass(frozen=True)
+class RosskoOrder:
+    id: int
+    created_date: str
+    delivery_date: str
+    total_price: int
+    payment_status: str
+    parts: list[RosskoOrderPart]
+
+
+@dataclass(frozen=True)
+class ProfitLigaOrderPart:
+    article: str
+    name: str
+    brand: str
+    purchase_price: int
+    quantity: int
+    status: str
+
+
+@dataclass(frozen=True)
+class ProfitLigaOrder:
+    id: str
+    created_date: str
+    delivery_date: str
+    total_price: int
+    payment_status: str
+    parts: list[ProfitLigaOrderPart]
+
+
 def configured_suppliers() -> dict[str, bool]:
     return {
         "rossko": bool(os.getenv("ROSSKO_KEY1") and os.getenv("ROSSKO_KEY2")),
@@ -32,12 +72,12 @@ def configured_suppliers() -> dict[str, bool]:
     }
 
 
-async def search_suppliers(query: str) -> tuple[list[SupplierOffer], dict[str, str]]:
+async def search_suppliers(query: str, supplier: str | None = None) -> tuple[list[SupplierOffer], dict[str, str]]:
     tasks: list[tuple[str, Any]] = []
     configured = configured_suppliers()
-    if configured["rossko"]:
+    if configured["rossko"] and supplier in {None, "rossko"}:
         tasks.append(("rossko", search_rossko(query)))
-    if configured["profit_liga"]:
+    if configured["profit_liga"] and supplier in {None, "profit_liga"}:
         tasks.append(("profit_liga", search_profit_liga(query)))
     if not tasks:
         return [], {}
@@ -81,6 +121,39 @@ async def search_rossko(query: str) -> list[SupplierOffer]:
     return offers[:100]
 
 
+async def get_rossko_orders(*, order_ids: list[int] | None = None, limit: int = 20) -> list[RosskoOrder]:
+    ids_xml = "".join(f"<api:id>{int(value)}</api:id>" for value in (order_ids or []))
+    selector = f"<api:order_ids>{ids_xml}</api:order_ids>" if ids_xml else f"<api:limit>{max(1, min(50, limit))}</api:limit>"
+    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:api="https://api.rossko.ru/">
+ <soapenv:Body><api:GetOrders><api:KEY1>{_xml(os.environ["ROSSKO_KEY1"])}</api:KEY1><api:KEY2>{_xml(os.environ["ROSSKO_KEY2"])}</api:KEY2>{selector}</api:GetOrders></soapenv:Body>
+</soapenv:Envelope>'''
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            "https://api.rossko.ru/service/v2.1/GetOrders",
+            data=envelope.encode(),
+            headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "https://api.rossko.ru/service/v2.1/GetOrders"},
+        ) as response:
+            response.raise_for_status()
+            payload = await response.text()
+    root = ET.fromstring(payload)
+    orders: list[RosskoOrder] = []
+    for order in _elements(root, "Order"):
+        parts: list[RosskoOrderPart] = []
+        for part in _descendants(order, "part"):
+            article = _child_text(part, "partnumber")
+            price = round(_number(_child_text(part, "price")))
+            quantity = max(1, int(_number(_child_text(part, "count"))))
+            if not article or price <= 0:
+                continue
+            parts.append(RosskoOrderPart(article, _child_text(part, "name") or article, _child_text(part, "brand"), price, quantity, int(_number(_child_text(part, "status")))))
+        order_id = int(_number(_child_text(order, "id")))
+        if order_id:
+            orders.append(RosskoOrder(order_id, _child_text(order, "created_date"), _child_text(order, "delivery_date"), round(_number(_child_text(order, "total_price"))), _child_text(order, "payment_status"), parts))
+    return orders
+
+
 async def search_profit_liga(query: str) -> list[SupplierOffer]:
     """Search Profit Liga stock offers using the documented /search/items API."""
     url = os.getenv("PROFIT_LIGA_SEARCH_URL", "https://api.pr-lg.ru/search/items")
@@ -90,6 +163,40 @@ async def search_profit_liga(query: str) -> list[SupplierOffer]:
             response.raise_for_status()
             data = await response.json(content_type=None)
     return _parse_profit_liga(data)
+
+
+async def get_profit_liga_orders(*, page: int = 1, order_id: str | None = None) -> list[ProfitLigaOrder]:
+    url = os.getenv("PROFIT_LIGA_ORDERS_URL", "https://api.pr-lg.ru/orders/list")
+    params: dict[str, object] = {"secret": os.environ["PROFIT_LIGA_API_KEY"], "page": max(1, page)}
+    if order_id:
+        params["order_id"] = order_id
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+    if not isinstance(data, dict) or str(data.get("status", "")).lower() == "error":
+        raise RuntimeError(str(data.get("err") if isinstance(data, dict) else "Profit Liga отклонила запрос"))
+    rows = data.get("data", [])
+    orders: list[ProfitLigaOrder] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        parts: list[ProfitLigaOrderPart] = []
+        products = row.get("products", [])
+        for part in products if isinstance(products, list) else []:
+            if not isinstance(part, dict):
+                continue
+            article = str(part.get("article") or "").strip()
+            price = round(_number(part.get("price")))
+            quantity = max(1, int(_number(part.get("quantity"))))
+            if not article or price <= 0:
+                continue
+            parts.append(ProfitLigaOrderPart(article, str(part.get("description") or article), str(part.get("brand") or ""), price, quantity, str(part.get("status") or part.get("status_id") or "")))
+        external_id = str(row.get("order_id") or "").strip()
+        if external_id:
+            orders.append(ProfitLigaOrder(external_id, str(row.get("datetime") or ""), str(row.get("delivery_date") or ""), sum(part.purchase_price * part.quantity for part in parts), str(row.get("payment_name") or ""), parts))
+    return orders
 
 
 def _parse_profit_liga(data: Any) -> list[SupplierOffer]:

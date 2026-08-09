@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, OrderInput, PartsCatalogResult, PartsCatalogStatus, ReceiptUploadResult, SearchResults, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
+import type { Account, AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, Order, OrderInput, Organization, PartsCatalogResult, PartsCatalogStatus, ProfitLigaOrdersResult, ReceiptUploadResult, RosskoOrdersResult, SearchResults, StaffMember, StaffRole, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
 
@@ -35,6 +35,16 @@ const json = (value: unknown): RequestInit => ({ body: JSON.stringify(value) });
 export const api = {
   login: (username: string, password: string) => request<{ status: string }>("/api/login", { method: "POST", ...json({ username, password }) }),
   logout: () => request<{ status: string }>("/api/logout", { method: "POST" }),
+  account: () => request<Account>("/api/account"),
+  staff: () => request<StaffMember[]>("/api/settings/staff"),
+  createStaff: (value: { username: string; password: string; full_name: string; role: StaffRole }) => request<StaffMember>("/api/settings/staff", { method: "POST", ...json(value) }),
+  updateStaff: (id: number, value: { role?: StaffRole; active?: boolean; password?: string }) => request<StaffMember>(`/api/settings/staff/${id}`, { method: "PATCH", ...json(value) }),
+  workspace: () => request<{ id: number; name: string; city: string | null }>("/api/settings/workspace"),
+  updateWorkspace: (value: { name: string; city: string }) => request<{ id: number; name: string; city: string | null }>("/api/settings/workspace", { method: "PUT", ...json(value) }),
+  changePassword: (current_password: string, new_password: string) => request<{ status: string }>("/api/settings/password", { method: "PUT", ...json({ current_password, new_password }) }),
+  organizations: () => request<Organization[]>("/api/platform/organizations"),
+  createOrganization: (value: { name: string; city: string; owner_name: string; username: string; password: string; demo: boolean }) => request<Organization>("/api/platform/organizations", { method: "POST", ...json(value) }),
+  updateOrganizationAccess: (id: number, action: "block" | "activate" | "demo") => request<Organization>(`/api/platform/organizations/${id}/access`, { method: "POST", ...json({ action }) }),
   dashboard: () => request<Dashboard>("/api/dashboard"),
   crm: () => request<CrmData>("/api/crm"),
   search: (query: string) => request<SearchResults>(`/api/search?q=${encodeURIComponent(query)}`),
@@ -49,14 +59,19 @@ export const api = {
   },
   startDiagnostic: (carId: number, serviceOrderId?: number) => request<Diagnostic>("/api/diagnostics/start", { method: "POST", ...json({ car_id: carId, service_order_id: serviceOrderId ?? null }) }),
   updateDiagnostic: (id: number, value: { mileage: number | null; notes: string | null; status: "draft" | "completed" }) => request<Diagnostic>(`/api/diagnostics/${id}`, { method: "PUT", ...json(value) }),
+  createOrderFromDiagnostic: (id: number) => request<Order & { created_from_diagnostic: boolean }>(`/api/diagnostics/${id}/create-order`, { method: "POST" }),
   deleteDiagnostic: (id: number) => request<{ status: string }>(`/api/diagnostics/${id}`, { method: "DELETE" }),
   updateDiagnosticItem: (id: number, itemKey: string, value: DiagnosticItemInput) => request<DiagnosticItem>(`/api/diagnostics/${id}/items/${encodeURIComponent(itemKey)}`, { method: "PUT", ...json(value) }),
   uploadDiagnosticPhoto: (id: number, file: File) => request<DiagnosticPhoto>(`/api/diagnostics/${id}/photos`, { method: "POST", body: file, headers: { "Content-Type": file.type } }),
   recognizeVehicleImage: (file: File) => request<VehicleRecognition>("/api/vehicle-recognition/image", { method: "POST", body: file, headers: { "Content-Type": file.type } }),
   recognizeVehicleVin: (vin: string) => request<VehicleRecognition>("/api/vehicle-recognition/vin", { method: "POST", ...json({ vin }) }),
   partsCatalogStatus: () => request<PartsCatalogStatus>("/api/parts-catalog/status"),
-  searchParts: (query: string, markupPercent: number) => request<PartsCatalogResult>(`/api/parts-catalog/search?q=${encodeURIComponent(query)}&markup_percent=${markupPercent}`),
+  searchParts: (query: string, markupPercent: number, supplier?: "rossko" | "profit_liga") => request<PartsCatalogResult>(`/api/parts-catalog/search?q=${encodeURIComponent(query)}&markup_percent=${markupPercent}${supplier ? `&supplier=${supplier}` : ""}`),
   addPartToOrder: (offer: SupplierOffer, orderId: number, quantity: number) => request("/api/parts-catalog/add-to-order", { method: "POST", ...json({ order_id: orderId, name: `${offer.brand} ${offer.name}`.trim(), article: offer.article, quantity, purchase_price: offer.purchase_price, markup_percent: offer.markup_percent }) }),
+  rosskoOrders: (orderId: number) => request<RosskoOrdersResult>(`/api/parts-catalog/rossko-orders?order_id=${orderId}`),
+  importRosskoOrder: (orderId: number, rosskoOrderId: number, markupPercent: number, partArticles?: string[]) => request<{ items_count: number; purchase_cost: number; selling_price: number }>("/api/parts-catalog/import-rossko-order", { method: "POST", ...json({ order_id: orderId, rossko_order_id: rosskoOrderId, markup_percent: markupPercent, part_articles: partArticles }) }),
+  profitLigaOrders: (orderId: number) => request<ProfitLigaOrdersResult>(`/api/parts-catalog/profit-orders?order_id=${orderId}`),
+  importProfitLigaOrder: (orderId: number, profitOrderId: string, markupPercent: number, partArticles?: string[]) => request<{ items_count: number; purchase_cost: number; selling_price: number }>("/api/parts-catalog/import-profit-order", { method: "POST", ...json({ order_id: orderId, profit_order_id: profitOrderId, markup_percent: markupPercent, part_articles: partArticles }) }),
   saveCustomer: (data: CustomerInput, id?: number) => request(`/api/customers${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", ...json(data) }),
   deleteCustomer: (id: number) => request<{ status: string }>(`/api/customers/${id}`, { method: "DELETE" }),
   saveCar: (data: CarInput, id?: number) => request(`/api/cars${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", ...json(data) }),

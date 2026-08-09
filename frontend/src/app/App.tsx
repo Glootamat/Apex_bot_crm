@@ -9,12 +9,16 @@ const CalendarPage = lazy(() => import("../pages/CalendarPage").then((module) =>
 const OrdersPage = lazy(() => import("../pages/OrdersPage").then((module) => ({ default: module.OrdersPage })));
 const CustomersPage = lazy(() => import("../pages/CustomersPage").then((module) => ({ default: module.CustomersPage })));
 const CarsPage = lazy(() => import("../pages/CarsPage").then((module) => ({ default: module.CarsPage })));
+const CarHistoryPage = lazy(() => import("../pages/CarHistoryPage").then((module) => ({ default: module.CarHistoryPage })));
 const FinancePage = lazy(() => import("../pages/FinancePage").then((module) => ({ default: module.FinancePage })));
 const SearchPage = lazy(() => import("../pages/SearchPage").then((module) => ({ default: module.SearchPage })));
 const TrashPage = lazy(() => import("../pages/TrashPage").then((module) => ({ default: module.TrashPage })));
 const DiagnosticsIndexPage = lazy(() => import("../pages/DiagnosticsPage").then((module) => ({ default: module.DiagnosticsIndexPage })));
 const DiagnosticPage = lazy(() => import("../pages/DiagnosticsPage").then((module) => ({ default: module.DiagnosticPage })));
 const NotFoundPage = lazy(() => import("../pages/NotFoundPage").then((module) => ({ default: module.NotFoundPage })));
+const SettingsPage = lazy(() => import("../pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const OwnerPanelPage = lazy(() => import("../pages/OwnerPanelPage").then((module) => ({ default: module.OwnerPanelPage })));
+const PartsCatalogPage = lazy(() => import("../pages/PartsCatalogPage").then((module) => ({ default: module.PartsCatalogPage })));
 
 const suspense = (node: React.ReactNode) => <Suspense fallback={<Spinner />}>{node}</Suspense>;
 const router = createBrowserRouter([
@@ -25,9 +29,13 @@ const router = createBrowserRouter([
     { path: "orders", element: suspense(<OrdersPage />) },
     { path: "customers", element: suspense(<CustomersPage />) },
     { path: "cars", element: suspense(<CarsPage />) },
+    { path: "cars/:carId/history", element: suspense(<CarHistoryPage />) },
     { path: "finance", element: suspense(<FinancePage />) },
     { path: "search", element: suspense(<SearchPage />) },
     { path: "trash", element: suspense(<TrashPage />) },
+    { path: "settings", element: suspense(<SettingsPage />) },
+    { path: "owner", element: suspense(<OwnerPanelPage />) },
+    { path: "parts-catalog", element: suspense(<PartsCatalogPage />) },
     { path: "diagnostics", element: suspense(<DiagnosticsIndexPage />) },
     { path: "diagnostics/start", element: suspense(<DiagnosticPage />) },
     { path: "diagnostics/:diagnosticId", element: suspense(<DiagnosticPage />) },

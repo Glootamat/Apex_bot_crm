@@ -13,6 +13,7 @@ _AUTO_ID_TABLES = {
     "customer_phones", "contact_imports", "order_photos", "part_items",
     "receipts", "ai_usage_log", "incoming_messages", "appointments",
     "audit_log", "diagnostics", "diagnostic_items", "diagnostic_photos",
+    "organizations", "auth_accounts", "organization_memberships",
 }
 
 

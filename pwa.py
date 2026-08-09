@@ -8,9 +8,11 @@ import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
@@ -21,11 +23,12 @@ from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, 
 from fastapi.responses import FileResponse, Response as FastAPIResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from psycopg import IntegrityError as PostgresIntegrityError
 
 from database import Database
 from diagnostic_pdf import build_diagnostic_pdf
 from openrouter import OpenRouterError, analyze_receipt_image, analyze_vehicle_document
-from supplier_catalog import configured_suppliers, rounded_sale_price, search_suppliers, serialize_offer
+from supplier_catalog import configured_suppliers, get_profit_liga_orders, get_rossko_orders, rounded_sale_price, search_suppliers, serialize_offer
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,9 +67,75 @@ async def prevent_api_caching(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def bind_authentication_context(request: Request, call_next):
+    """Bind tenant identity before FastAPI moves sync handlers to worker threads."""
+    context = None
+    identity = session_identity(request.cookies.get(COOKIE_NAME))
+    if identity is not None:
+        context = db.get_auth_context(*identity)
+    token = _auth_context.set(context)
+    try:
+        if context is not None and request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            role = str(context["role"])
+            if role in {"viewer", "accountant"} and request.url.path not in {"/api/logout"}:
+                return FastAPIResponse(
+                    content=json.dumps({"detail": "Для вашей роли доступен только просмотр"}, ensure_ascii=False),
+                    status_code=status.HTTP_403_FORBIDDEN, media_type="application/json",
+                )
+            if role == "mechanic" and not (
+                request.url.path.startswith("/api/diagnostics")
+                or request.url.path.startswith("/api/orders/")
+                or request.url.path == "/api/logout"
+            ):
+                return FastAPIResponse(
+                    content=json.dumps({"detail": "Механик может изменять только работы и диагностику"}, ensure_ascii=False),
+                    status_code=status.HTTP_403_FORBIDDEN, media_type="application/json",
+                )
+        return await call_next(request)
+    finally:
+        _auth_context.reset(token)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class StaffCreatePayload(BaseModel):
+    username: str
+    password: str
+    full_name: str
+    role: str
+
+
+class StaffUpdatePayload(BaseModel):
+    role: str | None = None
+    active: bool | None = None
+    password: str | None = None
+
+
+class OrganizationCreatePayload(BaseModel):
+    name: str
+    city: str | None = None
+    owner_name: str
+    username: str
+    password: str
+    demo: bool = True
+
+
+class WorkspacePayload(BaseModel):
+    name: str
+    city: str | None = None
+
+
+class PasswordChangePayload(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class OrganizationAccessPayload(BaseModel):
+    action: str
 
 
 class CustomerPayload(BaseModel):
@@ -141,6 +210,20 @@ class CatalogAddPayload(BaseModel):
     quantity: int = 1
     purchase_price: int
     markup_percent: float = 40
+
+
+class RosskoImportPayload(BaseModel):
+    order_id: int
+    rossko_order_id: int
+    markup_percent: float = 40
+    part_articles: list[str] | None = None
+
+
+class ProfitLigaImportPayload(BaseModel):
+    order_id: int
+    profit_order_id: str
+    markup_percent: float = 40
+    part_articles: list[str] | None = None
 
 
 DIAGNOSTIC_CHECKLIST = [
@@ -219,6 +302,18 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
+def hash_password(password: str, iterations: int = 600_000) -> str:
+    if len(password) < 10:
+        raise ValueError("Пароль должен содержать не менее 10 символов")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).rstrip(b"=").decode("ascii"),
+        base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii"),
+    )
+
+
 def _session_secret() -> bytes:
     value = os.getenv("PWA_SESSION_SECRET", "")
     if len(value) < 32:
@@ -228,9 +323,9 @@ def _session_secret() -> bytes:
     return value.encode("utf-8")
 
 
-def make_session(username: str) -> str:
+def make_session(account_id: int, organization_id: int) -> str:
     payload = json.dumps(
-        {"sub": username, "exp": int(time.time()) + SESSION_SECONDS},
+        {"sub": account_id, "org": organization_id, "exp": int(time.time()) + SESSION_SECONDS},
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -239,7 +334,7 @@ def make_session(username: str) -> str:
     return encoded + "." + base64.urlsafe_b64encode(signature.digest()).rstrip(b"=").decode("ascii")
 
 
-def session_username(session: str | None) -> str | None:
+def session_identity(session: str | None) -> tuple[int, int] | None:
     if not session or "." not in session:
         return None
     encoded, raw_signature = session.split(".", 1)
@@ -250,19 +345,37 @@ def session_username(session: str | None) -> str | None:
         payload = json.loads(_b64decode(encoded))
         if int(payload["exp"]) <= int(time.time()):
             return None
-        return str(payload["sub"])
+        return int(payload["sub"]), int(payload["org"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 
-def require_user(session: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> str:
-    username = session_username(session)
-    if username is None:
+_auth_context: ContextVar[dict[str, object] | None] = ContextVar("auth_context", default=None)
+
+
+def require_user(session: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> dict[str, object]:
+    context = _auth_context.get()
+    if context is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
-    return username
+    return context
+
+
+def require_manager(context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
+    if context["role"] not in {"owner", "admin"}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Недостаточно прав для управления сотрудниками")
+    return context
+
+
+def require_platform_admin(context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
+    if not context["platform_admin"]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Доступно только владельцу платформы")
+    return context
 
 
 def owner_telegram_id() -> int:
+    context = _auth_context.get()
+    if context is not None:
+        return int(context["data_owner_telegram_id"])
     try:
         return int(os.environ["ADMIN_ID"])
     except (KeyError, ValueError) as error:
@@ -270,6 +383,9 @@ def owner_telegram_id() -> int:
 
 
 def owner_user_id() -> int:
+    context = _auth_context.get()
+    if context is not None:
+        return int(context["data_owner_user_id"])
     connection = db.connect()
     try:
         row = connection.execute(
@@ -333,21 +449,126 @@ def index() -> FileResponse:
 
 @app.post("/api/login")
 def login(data: LoginRequest, response: Response) -> dict[str, str]:
-    expected_user = os.getenv("PWA_ADMIN_USER", "admin")
+    expected_user = os.getenv("PWA_ADMIN_USER", "admin").strip().casefold()
     expected_password = os.getenv("PWA_PASSWORD_HASH", "")
-    if not (
-        secrets.compare_digest(data.username, expected_user)
-        and verify_password(data.password, expected_password)
-    ):
+    account = db.get_auth_account(data.username)
+    if account is None and secrets.compare_digest(data.username.strip().casefold(), expected_user) and verify_password(data.password, expected_password):
+        account = db.bootstrap_web_owner(
+            expected_user, expected_password, os.getenv("PWA_OWNER_NAME", "Владелец"), owner_telegram_id(),
+        )
+    if account is None or not verify_password(data.password, str(account["password_hash"])):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверный логин или пароль")
     cookie_secure = os.getenv("PWA_COOKIE_SECURE", "true").casefold() not in {
         "0", "false", "no", "нет",
     }
     response.set_cookie(
-        COOKIE_NAME, make_session(expected_user), max_age=SESSION_SECONDS,
+        COOKIE_NAME, make_session(int(account["id"]), int(account["organization_id"])), max_age=SESSION_SECONDS,
         httponly=True, secure=cookie_secure, samesite="strict", path="/",
     )
     return {"status": "ok"}
+
+
+@app.get("/api/account")
+def account(context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
+    return {key: context[key] for key in ("id", "username", "full_name", "organization_id", "organization_name", "role", "platform_admin")}
+
+
+@app.get("/api/settings/staff")
+def staff_list(context: Annotated[dict[str, object], Depends(require_manager)]) -> list[dict[str, object]]:
+    return db.list_staff(int(context["organization_id"]))
+
+
+@app.get("/api/settings/workspace")
+def workspace_get(context: Annotated[dict[str, object], Depends(require_manager)]) -> dict[str, object]:
+    workspace = db.get_workspace(int(context["organization_id"]))
+    if workspace is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Рабочее пространство не найдено")
+    return workspace
+
+
+@app.put("/api/settings/workspace")
+def workspace_update(data: WorkspacePayload, context: Annotated[dict[str, object], Depends(require_manager)]) -> dict[str, object]:
+    if not data.name.strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Укажите название автосервиса")
+    workspace = db.update_workspace(int(context["organization_id"]), data.name, data.city)
+    if workspace is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Рабочее пространство не найдено")
+    return workspace
+
+
+@app.put("/api/settings/password")
+def password_update(data: PasswordChangePayload, context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, str]:
+    account = db.get_auth_account(str(context["username"]))
+    if account is None or not verify_password(data.current_password, str(account["password_hash"])):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Текущий пароль введён неверно")
+    try:
+        db.update_account_password(int(context["id"]), hash_password(data.new_password))
+    except ValueError as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+    return {"status": "ok"}
+
+
+@app.post("/api/settings/staff", status_code=status.HTTP_201_CREATED)
+def staff_create(data: StaffCreatePayload, context: Annotated[dict[str, object], Depends(require_manager)]) -> dict[str, object]:
+    roles = {"admin", "service_advisor", "mechanic", "accountant", "viewer"}
+    if data.role not in roles:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестная роль")
+    try:
+        account_id = db.create_staff(
+            int(context["organization_id"]), data.username, hash_password(data.password), data.full_name, data.role,
+        )
+    except (ValueError, PostgresIntegrityError, sqlite3.IntegrityError) as error:
+        detail = str(error) if isinstance(error, ValueError) else "Этот логин уже занят"
+        raise HTTPException(status.HTTP_409_CONFLICT, detail) from error
+    return next(item for item in db.list_staff(int(context["organization_id"])) if int(item["id"]) == account_id)
+
+
+@app.patch("/api/settings/staff/{account_id}")
+def staff_update(account_id: int, data: StaffUpdatePayload, context: Annotated[dict[str, object], Depends(require_manager)]) -> dict[str, object]:
+    roles = {"admin", "service_advisor", "mechanic", "accountant", "viewer"}
+    if data.role is not None and data.role not in roles:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестная роль")
+    try:
+        password_hash = hash_password(data.password) if data.password else None
+    except ValueError as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+    if not db.update_staff(int(context["organization_id"]), account_id, data.role, data.active, password_hash):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Сотрудник не найден или является владельцем")
+    return next(item for item in db.list_staff(int(context["organization_id"])) if int(item["id"]) == account_id)
+
+
+@app.get("/api/platform/organizations")
+def organizations_list(_: Annotated[dict[str, object], Depends(require_platform_admin)]) -> list[dict[str, object]]:
+    return db.list_organizations()
+
+
+@app.post("/api/platform/organizations", status_code=status.HTTP_201_CREATED)
+def organization_create(data: OrganizationCreatePayload, _: Annotated[dict[str, object], Depends(require_platform_admin)]) -> dict[str, object]:
+    if not data.name.strip() or not data.owner_name.strip() or not data.username.strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Заполните название сервиса и данные владельца")
+    try:
+        organization_id = db.create_organization(
+            data.name, data.city, data.owner_name, data.username, hash_password(data.password),
+            7 if data.demo else 0,
+        )
+    except (ValueError, PostgresIntegrityError, sqlite3.IntegrityError) as error:
+        detail = str(error) if isinstance(error, ValueError) else "Этот логин уже занят"
+        raise HTTPException(status.HTTP_409_CONFLICT, detail) from error
+    return next(item for item in db.list_organizations() if int(item["id"]) == organization_id)
+
+
+@app.post("/api/platform/organizations/{organization_id}/access")
+def organization_access(
+    organization_id: int, data: OrganizationAccessPayload,
+    context: Annotated[dict[str, object], Depends(require_platform_admin)],
+) -> dict[str, object]:
+    if organization_id == int(context["organization_id"]) and data.action == "block":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Нельзя заблокировать собственный автосервис")
+    if data.action not in {"block", "activate", "demo"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестное действие")
+    if not db.update_organization_access(organization_id, data.action):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Автосервис не найден")
+    return next(item for item in db.list_organizations() if int(item["id"]) == organization_id)
 
 
 @app.post("/api/logout")
@@ -386,18 +607,20 @@ def crm_data(_: Annotated[str, Depends(require_user)]) -> dict[str, object]:
     report = db.get_report_for_telegram_user(telegram_id)
     photos = db.get_order_photos_for_telegram_user(telegram_id)
     orders = db.get_recent_orders_for_telegram_user(telegram_id, limit=300)
-    return {
-        "customers": [asdict(item) for item in db.get_customers_for_telegram_user(telegram_id)],
-        "cars": [asdict(item) for item in db.get_cars_for_telegram_user(telegram_id)],
-        "appointments": [
-            asdict(item) for item in db.get_upcoming_appointments_for_telegram_user(telegram_id, limit=200)
-        ],
-        "appointment_history": [
-            asdict(item) for item in db.get_recent_appointments_for_telegram_user(telegram_id, limit=500)
-        ],
-        "orders": [
+    customers = db.get_customers_for_telegram_user(telegram_id)
+    cars = db.get_cars_for_telegram_user(telegram_id)
+    customers_by_id = {item.id: item for item in customers}
+    cars_by_id = {item.id: item for item in cars}
+    serialized_orders = []
+    for item in orders:
+        car = cars_by_id.get(item.car_id)
+        customer = customers_by_id.get(car.customer_id) if car and car.customer_id else None
+        serialized_orders.append(
             asdict(item) | {
                 "profit": item.profit,
+                "year": car.year if car else None,
+                "customer_phone": customer.phone if customer else None,
+                "parts": [asdict(part) for part in db.get_part_items(item.id)],
                 "attachments": [
                     photo | {
                         "url": f"/api/order-photos/{str(photo['telegram_file_id'])[4:]}"
@@ -406,8 +629,17 @@ def crm_data(_: Annotated[str, Depends(require_user)]) -> dict[str, object]:
                     for photo in photos.get(item.id, [])
                 ],
             }
-            for item in orders
+        )
+    return {
+        "customers": [asdict(item) for item in customers],
+        "cars": [asdict(item) for item in cars],
+        "appointments": [
+            asdict(item) for item in db.get_upcoming_appointments_for_telegram_user(telegram_id, limit=200)
         ],
+        "appointment_history": [
+            asdict(item) for item in db.get_recent_appointments_for_telegram_user(telegram_id, limit=500)
+        ],
+        "orders": serialized_orders,
         "finance": asdict(report) | {"revenue": report.revenue, "profit": report.profit},
     }
 
@@ -749,12 +981,15 @@ def parts_catalog_status(_: Annotated[str, Depends(require_user)]) -> dict[str, 
 @app.get("/api/parts-catalog/search")
 async def parts_catalog_search(
     q: str, _: Annotated[str, Depends(require_user)], markup_percent: float | None = None,
+    supplier: str | None = None,
 ) -> dict[str, object]:
     query = q.strip()
     if len(query) < 3 or len(query) > 100:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Введите артикул или название от 3 до 100 символов")
     markup = max(0.0, min(300.0, markup_percent if markup_percent is not None else float(os.getenv("PARTS_MARKUP_PERCENT", "40"))))
-    offers, errors = await search_suppliers(query)
+    if supplier not in {None, "rossko", "profit_liga"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестный поставщик")
+    offers, errors = await search_suppliers(query, supplier)
     serialized = [serialize_offer(offer, markup, 50) for offer in offers]
     serialized.sort(key=lambda item: (int(item["sale_price"]), int(item["delivery_days"])))
     return {"query": query, "offers": serialized, "errors": errors, "suppliers": configured_suppliers(), "markup_percent": markup, "round_to": 50}
@@ -776,6 +1011,97 @@ def add_catalog_item_to_order(
     return asdict(item) | {
         "sale_total": rounded_sale_price(data.purchase_price, data.markup_percent, 50) * data.quantity,
     }
+
+
+@app.get("/api/parts-catalog/rossko-orders")
+async def rossko_orders(
+    order_id: int, _: Annotated[str, Depends(require_user)], limit: int = 20,
+) -> dict[str, object]:
+    require_order(order_id)
+    if not configured_suppliers()["rossko"]:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "ROSSKO не подключён")
+    try:
+        orders = await get_rossko_orders(limit=limit)
+    except (ClientError, TimeoutError, ValueError) as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Не удалось получить заказы ROSSKO: {error}") from error
+    imported = db.imported_supplier_order_ids(order_id, "rossko")
+    return {
+        "orders": [asdict(item) | {"imported": str(item.id) in imported} for item in orders],
+        "markup_percent": max(0.0, float(os.getenv("PARTS_MARKUP_PERCENT", "40"))),
+    }
+
+
+@app.post("/api/parts-catalog/import-rossko-order")
+async def import_rossko_order(
+    data: RosskoImportPayload, _: Annotated[str, Depends(require_user)],
+) -> dict[str, object]:
+    require_order(data.order_id)
+    markup = max(0.0, min(300.0, data.markup_percent))
+    try:
+        orders = await get_rossko_orders(order_ids=[data.rossko_order_id])
+    except (ClientError, TimeoutError, ValueError) as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Не удалось получить заказ ROSSKO: {error}") from error
+    if not orders:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Заказ ROSSKO не найден")
+    order = orders[0]
+    active_parts = [part for part in order.parts if part.status not in {7, 8, 9, 34, 35, 36}]
+    if data.part_articles is not None:
+        requested = {article.strip() for article in data.part_articles if article.strip()}
+        active_parts = [part for part in active_parts if part.article in requested]
+    if not active_parts:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "В заказе нет доступных для импорта позиций")
+    parts = [(f"{part.brand} {part.name}".strip(), part.article, part.quantity, part.purchase_price) for part in active_parts]
+    try:
+        count, purchase, sale = db.import_supplier_order(data.order_id, "rossko", str(order.id), parts, markup, 50)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Этот заказ ROSSKO уже импортирован") from error
+    return {"items_count": count, "purchase_cost": purchase, "selling_price": sale, "rossko_order_id": order.id}
+
+
+@app.get("/api/parts-catalog/profit-orders")
+async def profit_liga_orders(
+    order_id: int, _: Annotated[str, Depends(require_user)], page: int = 1,
+) -> dict[str, object]:
+    require_order(order_id)
+    if not configured_suppliers()["profit_liga"]:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Profit Liga не подключена")
+    try:
+        orders = await get_profit_liga_orders(page=page)
+    except (ClientError, TimeoutError, ValueError, RuntimeError) as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Не удалось получить заказы Profit Liga: {error}") from error
+    imported = db.imported_supplier_order_ids(order_id, "profit_liga")
+    return {
+        "orders": [asdict(item) | {"imported": str(item.id) in imported} for item in orders],
+        "markup_percent": max(0.0, float(os.getenv("PARTS_MARKUP_PERCENT", "40"))),
+    }
+
+
+@app.post("/api/parts-catalog/import-profit-order")
+async def import_profit_liga_order(
+    data: ProfitLigaImportPayload, _: Annotated[str, Depends(require_user)],
+) -> dict[str, object]:
+    require_order(data.order_id)
+    markup = max(0.0, min(300.0, data.markup_percent))
+    try:
+        orders = await get_profit_liga_orders(order_id=data.profit_order_id)
+    except (ClientError, TimeoutError, ValueError, RuntimeError) as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Не удалось получить заказ Profit Liga: {error}") from error
+    if not orders:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Заказ Profit Liga не найден")
+    order = orders[0]
+    inactive_words = ("отмен", "возврат", "отказ")
+    active_parts = [part for part in order.parts if not any(word in part.status.lower() for word in inactive_words)]
+    if data.part_articles is not None:
+        requested = {article.strip() for article in data.part_articles if article.strip()}
+        active_parts = [part for part in active_parts if part.article in requested]
+    if not active_parts:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "В заказе нет доступных для импорта позиций")
+    parts = [(f"{part.brand} {part.name}".strip(), part.article, part.quantity, part.purchase_price) for part in active_parts]
+    try:
+        count, purchase, sale = db.import_supplier_order(data.order_id, "profit_liga", str(order.id), parts, markup, 50)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Этот заказ Profit Liga уже импортирован") from error
+    return {"items_count": count, "purchase_cost": purchase, "selling_price": sale, "profit_order_id": order.id}
 
 
 @app.get("/api/diagnostics")
@@ -824,7 +1150,7 @@ def diagnostic_pdf(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Диагностическая карта не найдена")
     content = build_diagnostic_pdf(
         result,
-        logo_path=BASE_DIR / "frontend" / "public" / "assets" / "brand" / "apex-logo.png",
+        logo_path=BASE_DIR / "frontend" / "public" / "assets" / "brand" / "apex-report-logo-approved.png",
         photo_dir=DIAGNOSTIC_UPLOAD_DIR,
     )
     filename = f"apex-diagnostic-{diagnostic_id}.pdf"
@@ -833,6 +1159,20 @@ def diagnostic_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.post("/api/diagnostics/{diagnostic_id}/create-order")
+def create_order_from_diagnostic(
+    diagnostic_id: int, _: Annotated[str, Depends(require_user)],
+) -> dict[str, object]:
+    result = db.create_order_from_diagnostic(owner_user_id(), diagnostic_id)
+    if result is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Отметьте неисправности или добавьте рекомендации перед созданием заказа",
+        )
+    order, created = result
+    return asdict(order) | {"profit": order.profit, "created_from_diagnostic": created}
 
 
 @app.put("/api/diagnostics/{diagnostic_id}")

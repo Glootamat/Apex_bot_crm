@@ -1,11 +1,16 @@
 import {
   Camera,
   Check,
+  CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleAlert,
   ClipboardCheck,
   FileDown,
+  FileImage,
+  FolderOpen,
   Gauge,
+  Images,
   Search,
   Save,
   Share2,
@@ -15,17 +20,19 @@ import {
   XCircle,
 } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Button,
   Card,
   EmptyState,
   inputClass,
+  Modal,
   Spinner,
 } from "../components/ui";
 import { useCrm } from "../features/crm/useCrm";
 import { api } from "../lib/api";
+import { exportDiagnosticImage } from "../lib/diagnosticImage";
 import { customerName, formatDateTime, money } from "../lib/format";
 import { queryClient } from "../lib/query";
 import type {
@@ -291,6 +298,14 @@ function DiagnosticCard({
   queryKey: readonly unknown[];
 }) {
   const [statusFilter, setStatusFilter] = useState<DiagnosticStatus | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [photoSourceOpen, setPhotoSourceOpen] = useState(false);
+  const navigate = useNavigate();
+  const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
+  const organizationName = account.data?.organization_name?.trim() || "APEX AUTO";
+  const cameraInput = useRef<HTMLInputElement>(null);
+  const galleryInput = useRef<HTMLInputElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   const updateLocal = (updater: (current: Diagnostic) => Diagnostic) =>
     queryClient.setQueryData<Diagnostic>(queryKey, (current) =>
       current ? updater(current) : current,
@@ -325,6 +340,18 @@ function DiagnosticCard({
         photos: [...current.photos, photo],
       })),
   });
+  const orderMutation = useMutation({
+    mutationFn: () => api.createOrderFromDiagnostic(value.id),
+    onSuccess: async (order) => {
+      updateLocal((current) => ({ ...current, service_order_id: order.id }));
+      await queryClient.invalidateQueries({ queryKey: ["crm"] });
+      void navigate(`/parts-catalog?order_id=${order.id}`);
+    },
+  });
+  const uploadPhoto = (file?: File) => {
+    if (file) photoMutation.mutate(file);
+    setPhotoSourceOpen(false);
+  };
   const savePdf = (blob: Blob) => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -337,23 +364,14 @@ function DiagnosticCard({
   };
   const pdfMutation = useMutation({
     mutationFn: () => api.diagnosticPdf(value.id),
-    onSuccess: savePdf,
-  });
-  const sharePdfMutation = useMutation({
-    mutationFn: () => api.diagnosticPdf(value.id),
-    onSuccess: async (blob) => {
-      const filename = `apex-diagnostic-${value.id}.pdf`;
-      const file = new File([blob], filename, { type: "application/pdf" });
-      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
-        try {
-          await navigator.share({ title: `Диагностическая карта #${value.id}`, files: [file] });
-          return;
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") return;
-        }
-      }
+    onSuccess: (blob) => {
       savePdf(blob);
+      setExportOpen(false);
     },
+  });
+  const imageMutation = useMutation({
+    mutationFn: (share: boolean) => exportDiagnosticImage(value, share),
+    onSuccess: () => setExportOpen(false),
   });
   const grouped = useMemo(
     () =>
@@ -385,49 +403,53 @@ function DiagnosticCard({
   };
 
   return (
-    <article className="diagnostic-print grid gap-5">
-      <header className="grid gap-3 print:hidden sm:flex sm:items-center">
-        <div className="min-w-0 sm:flex-1">
-          <p className="text-sm font-bold text-apex">
-            ДИАГНОСТИЧЕСКАЯ КАРТА #{value.id}
-          </p>
-          <h1 className="text-3xl font-black leading-tight break-normal">
-            {value.brand} {value.model}
-          </h1>
+    <article className="diagnostic-print grid gap-3">
+      <header className="grid gap-2 print:hidden sm:flex sm:items-center">
+        <div className="min-w-0 sm:flex-1 [&>p:last-child]:hidden">
+          <p className="text-xl font-black tracking-tight"><span className="text-white">{organizationName}</span> <span className="ml-2 text-xs font-bold text-muted">Диагностика №{value.id}</span></p>
+          <p className="text-xl font-black tracking-tight"><span className="text-white">APEX</span> <span className="text-apex">AUTO</span> <span className="ml-2 text-xs font-bold text-muted">ДИАГНОСТИКА №{value.id}</span></p>
         </div>
-        <div className="grid grid-cols-2 gap-2 sm:flex">
-          <Button variant="secondary" onClick={() => pdfMutation.mutate()} disabled={pdfMutation.isPending}>
-            <FileDown size={17} />
-            {pdfMutation.isPending ? "Сохраняю…" : "Сохранить PDF"}
+        <div className="grid min-w-0 grid-cols-[44px_44px_minmax(0,1fr)] gap-2 sm:grid-cols-[44px_44px_130px]">
+          <Button className="size-11 min-h-0 border border-line bg-panel p-0 hover:border-apex/50 hover:bg-panel-soft" variant="secondary" onClick={() => setExportOpen((current) => !current)} disabled={pdfMutation.isPending || imageMutation.isPending} aria-label="Сохранить" title="Сохранить">
+            <Save className="shrink-0" size={21} />
           </Button>
-          <Button variant="secondary" onClick={() => sharePdfMutation.mutate()} disabled={sharePdfMutation.isPending}>
-            <Share2 size={17} />
-            {sharePdfMutation.isPending ? "Готовлю…" : "Поделиться PDF"}
+          <Button className="size-11 min-h-0 border border-line bg-panel p-0 hover:border-apex/50 hover:bg-panel-soft" variant="secondary" onClick={() => imageMutation.mutate(true)} disabled={imageMutation.isPending} aria-label="Отправить" title="Отправить">
+            <Share2 className="shrink-0" size={21} />
           </Button>
-          <Button className="col-span-2 sm:col-span-1" onClick={complete} disabled={cardMutation.isPending}>
+          <Button className={value.status === "completed" ? "min-w-0 whitespace-nowrap border border-line bg-panel px-2 text-xs text-white hover:border-apex/50 hover:bg-panel-soft sm:text-sm" : "min-w-0 whitespace-nowrap px-2 text-xs sm:text-sm"} variant={value.status === "completed" ? "secondary" : "primary"} onClick={complete} disabled={cardMutation.isPending}>
             {value.status === "completed" ? (
-              <Wrench size={17} />
+              <Wrench className="shrink-0" size={17} />
             ) : (
-              <Save size={17} />
+              <CheckCircle2 className="shrink-0" size={17} />
             )}
-            {value.status === "completed" ? "Вернуть в работу" : "Завершить"}
+            {value.status === "completed" ? "В работу" : "Завершить"}
           </Button>
         </div>
       </header>
 
-      <Card className="grid gap-4 md:grid-cols-[1fr_auto]">
-        <div>
-          <p className="text-sm text-muted">
+      {exportOpen && (
+        <Card className="grid gap-3 border-apex/40 print:hidden sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <h2 className="font-black">Выберите формат отчёта</h2>
+            <p className="text-sm text-muted">Логотип, результаты диагностики, работы и запчасти будут добавлены автоматически.</p>
+          </div>
+          <Button variant="secondary" onClick={() => pdfMutation.mutate()}><FileDown size={17} />Сохранить PDF</Button>
+          <Button variant="secondary" onClick={() => imageMutation.mutate(false)}><FileImage size={17} />Сохранить картинкой</Button>
+        </Card>
+      )}
+
+      <Card className="grid gap-3 overflow-hidden border-l-4 border-l-apex bg-gradient-to-br from-panel to-panel-soft p-3 md:grid-cols-[1fr_auto] md:items-center">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-black leading-tight break-normal sm:text-3xl">{value.brand} {value.model}</h1>
+          <p className="truncate text-sm text-muted">
             {value.plate_number || "Без госномера"}
             {value.vin ? ` · ${value.vin}` : ""}
           </p>
-          <p className="mt-1 font-semibold">
-            {customerName(value.customer_name)}
-          </p>
-          <label className="mt-3 flex max-w-xs items-center gap-2 text-sm text-muted">
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2"><p className="font-semibold"><span className="mr-2 text-xs uppercase text-muted">Клиент</span>{customerName(value.customer_name)}</p>
+          <label className="flex max-w-56 items-center gap-2 text-sm text-muted">
             <Gauge size={17} />
             <input
-              className={`${inputClass} min-h-10 py-1`}
+              className={`${inputClass} min-h-9 py-1`}
               type="number"
               min="0"
               value={value.mileage ?? ""}
@@ -448,7 +470,7 @@ function DiagnosticCard({
               }
               placeholder="Пробег, км"
             />
-          </label>
+          </label></div>
         </div>
         <ProgressRing checked={checked} total={value.items.length} />
       </Card>
@@ -507,13 +529,13 @@ function DiagnosticCard({
         </Card>
       )}
 
-      <Card className="print:hidden">
-        <h2 className="font-black">Как заполнять карту</h2>
-        <p className="mt-1 text-sm text-muted">
+      <details className="rounded-xl border border-line bg-panel px-3 py-2 print:hidden">
+        <summary className="cursor-pointer text-sm font-bold text-muted">Подсказка по заполнению</summary>
+        <p className="mt-2 text-sm text-muted">
           Выберите состояние каждого узла. Для деталей подвески состояние
           указывается отдельно для левой и правой стороны.
         </p>
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-2 flex flex-wrap gap-2">
           {statusOrder.map((status) => (
             <span
               key={status}
@@ -523,9 +545,9 @@ function DiagnosticCard({
             </span>
           ))}
         </div>
-      </Card>
+      </details>
 
-      <nav className="grid grid-cols-2 gap-2 sm:grid-cols-4 print:hidden">
+      <nav className="flex gap-2 overflow-x-auto pb-1 print:hidden">
         {sections.map(([key, label]) => {
           const items = grouped[key] ?? [];
           const done = items.filter(isChecked).length;
@@ -537,7 +559,7 @@ function DiagnosticCard({
                   .getElementById(`diagnostic-${key}`)
                   ?.scrollIntoView({ behavior: "smooth", block: "start" })
               }
-              className="rounded-xl border border-line bg-panel p-3 text-left transition hover:border-apex"
+              className="min-w-36 shrink-0 rounded-xl border border-line bg-panel px-3 py-2 text-left transition hover:border-apex"
             >
               <strong className="block text-sm">{label}</strong>
               <span className="text-xs text-muted">
@@ -554,8 +576,8 @@ function DiagnosticCard({
           key={sectionKey}
           className="scroll-mt-20"
         >
-          <div className="mb-3 flex items-end justify-between">
-            <h2 className="text-xl font-black">{title}</h2>
+          <div className="mb-2 flex items-end justify-between">
+            <h2 className="text-lg font-black">{title}</h2>
             <span className="text-sm text-muted">
               {(grouped[sectionKey] ?? []).filter(isChecked).length}/
               {(grouped[sectionKey] ?? []).length}
@@ -573,9 +595,9 @@ function DiagnosticCard({
         </section>
       ))}
 
-      <Card>
+      <Card className="p-3">
         <h2 className="font-black">Фото диагностики</h2>
-        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
           {value.photos.map((photo) => (
             <a key={photo.id} href={photo.url} target="_blank" rel="noreferrer">
               <img
@@ -585,32 +607,33 @@ function DiagnosticCard({
               />
             </a>
           ))}
-          <label className="grid aspect-square cursor-pointer place-items-center rounded-xl border border-dashed border-line text-center text-sm text-muted transition hover:border-apex hover:text-apex print:hidden">
+          <button type="button" onClick={() => setPhotoSourceOpen(true)} disabled={photoMutation.isPending} className="grid aspect-square cursor-pointer place-items-center rounded-xl border border-dashed border-line text-center text-sm text-muted transition hover:border-apex hover:text-apex disabled:opacity-50 print:hidden">
             <span>
               <Camera className="mx-auto mb-2" />
               {photoMutation.isPending ? "Загрузка…" : "Добавить фото"}
             </span>
-            <input
-              className="sr-only"
-              type="file"
-              accept="image/jpeg,image/png,image/webp"
-              capture="environment"
-              disabled={photoMutation.isPending}
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) photoMutation.mutate(file);
-                event.currentTarget.value = "";
-              }}
-            />
-          </label>
+          </button>
+          <input ref={cameraInput} className="sr-only" type="file" accept="image/*" capture="environment" onChange={(event) => { uploadPhoto(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+          <input ref={galleryInput} className="sr-only" type="file" accept="image/*" onChange={(event) => { uploadPhoto(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+          <input ref={fileInput} className="sr-only" type="file" accept=".jpg,.jpeg,.png,.webp" onChange={(event) => { uploadPhoto(event.target.files?.[0]); event.currentTarget.value = ""; }} />
         </div>
       </Card>
 
-      <Card>
+      {photoSourceOpen && (
+        <Modal title="Добавить фото" onClose={() => setPhotoSourceOpen(false)}>
+          <div className="grid grid-cols-3 gap-2">
+            <Button className="min-h-24 flex-col" variant="secondary" onClick={() => cameraInput.current?.click()}><Camera size={25} />Камера</Button>
+            <Button className="min-h-24 flex-col" variant="secondary" onClick={() => galleryInput.current?.click()}><Images size={25} />Галерея</Button>
+            <Button className="min-h-24 flex-col" variant="secondary" onClick={() => fileInput.current?.click()}><FolderOpen size={25} />Файл</Button>
+          </div>
+        </Modal>
+      )}
+
+      <Card className="p-3">
         <label className="grid gap-2">
           <span className="font-black">Итоговый комментарий мастера</span>
           <textarea
-            className={`${inputClass} min-h-28 resize-y`}
+            className={`${inputClass} min-h-20 resize-y`}
             value={value.notes ?? ""}
             onChange={(event) =>
               updateLocal((current) => ({
@@ -630,9 +653,9 @@ function DiagnosticCard({
         </label>
       </Card>
 
-      <Card className="diagnostic-summary">
-        <h2 className="text-xl font-black">Рекомендованные работы</h2>
-        <div className="mt-3 grid gap-2">
+      <Card className="diagnostic-summary p-3">
+        <h2 className="text-lg font-black">Рекомендованные работы</h2>
+        <div className="mt-2 grid gap-1.5">
           {value.items
             .filter(
               (item) =>
@@ -645,7 +668,7 @@ function DiagnosticCard({
             .map((item) => (
               <div
                 key={item.id}
-                className="flex flex-wrap items-center gap-2 rounded-xl bg-panel-soft p-3"
+                className="flex flex-wrap items-center gap-2 rounded-xl bg-panel-soft px-3 py-2"
               >
                 <span
                   className={`size-2 rounded-full ${hasCritical(item) ? "bg-danger" : "bg-apex"}`}
@@ -664,7 +687,24 @@ function DiagnosticCard({
             (item) => item.recommendation || hasIssue(item),
           ) && <p className="text-muted">Проблем и рекомендаций пока нет.</p>}
         </div>
+        <div className="mt-3 grid gap-2 border-t border-line pt-3 sm:grid-cols-[1fr_auto] sm:items-center">
+          <div>
+            <p className="font-bold">Смета и заказ-наряд</p>
+            <p className="text-sm text-muted">Работы будут перенесены автоматически, запчасти — без артикула со статусом «Требуется подбор».</p>
+          </div>
+          {value.service_order_id ? (
+            <Button variant="secondary" onClick={() => orderMutation.mutate()} disabled={orderMutation.isPending}><ClipboardCheck size={17} />{orderMutation.isPending ? "Обновляю заказ…" : `Подобрать запчасти · заказ №${value.service_order_id}`}</Button>
+          ) : (
+            <Button onClick={() => orderMutation.mutate()} disabled={orderMutation.isPending}><ClipboardCheck size={17} />{orderMutation.isPending ? "Создаю…" : "Создать заказ-наряд"}</Button>
+          )}
+          {orderMutation.error && <p className="text-sm text-danger sm:col-span-2">{orderMutation.error instanceof Error ? orderMutation.error.message : "Не удалось создать заказ-наряд"}</p>}
+        </div>
       </Card>
+
+      <Button className="min-h-14 text-base print:hidden" onClick={complete} disabled={cardMutation.isPending}>
+        {value.status === "completed" ? <Wrench size={19} /> : <Check size={19} />}
+        {value.status === "completed" ? "Вернуть диагностику в работу" : "Завершить диагностику"}
+      </Button>
     </article>
   );
 }
@@ -678,12 +718,18 @@ function DiagnosticRow({
 }) {
   const sided = item.left_status !== null || item.right_status !== null;
   const issue = hasIssue(item);
+  const [expanded, setExpanded] = useState(false);
+  const status = worstStatus(item);
   return (
-    <div className="grid gap-3 p-3 sm:p-4">
-      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center">
-        <strong className="min-w-0 flex-1 break-words">{item.label}</strong>
+    <div className={`grid border-l-4 ${hasCritical(item) ? "border-l-danger bg-danger/5" : issue ? "border-l-apex bg-apex/5" : status === "ok" ? "border-l-success" : "border-l-transparent"}`}>
+      <button type="button" onClick={() => setExpanded((current) => !current)} className="flex min-h-14 min-w-0 items-center gap-2 px-3 py-2 text-left">
+        <strong className="min-w-0 flex-1 break-words text-sm sm:text-base">{item.label}</strong>
+        <span className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-bold ${statusMeta[status].className}`}>{statusMeta[status].label}</span>
+        {expanded ? <ChevronDown className="shrink-0 text-muted" size={19} /> : <ChevronRight className="shrink-0 text-muted" size={19} />}
+      </button>
+      {expanded && <div className="grid gap-2 border-t border-line px-3 pb-3 pt-2">
         {sided ? (
-          <div className="grid grid-cols-2 gap-2 print:hidden sm:min-w-[25rem]">
+          <div className="grid grid-cols-2 gap-2 print:hidden">
             <StatusSelect
               label="Левая сторона"
               value={item.left_status}
@@ -696,7 +742,7 @@ function DiagnosticRow({
             />
           </div>
         ) : (
-          <div className="w-full print:hidden sm:w-48">
+          <div className="w-full print:hidden">
             <StatusSelect
               label="Состояние"
               value={item.status}
@@ -704,14 +750,9 @@ function DiagnosticRow({
             />
           </div>
         )}
-        <span
-          className={`hidden rounded-lg border px-2 py-1 text-xs font-bold print:inline ${statusMeta[worstStatus(item)].className}`}
-        >
-          {statusMeta[worstStatus(item)].label}
-        </span>
-      </div>
+        <span className={`hidden rounded-lg border px-2 py-1 text-xs font-bold print:inline ${statusMeta[status].className}`}>{statusMeta[status].label}</span>
       {issue && (
-        <div className="grid gap-2 md:grid-cols-[1fr_1fr_150px]">
+        <div className="grid gap-2 md:grid-cols-[1fr_1fr_130px]">
           <input
             className={inputClass}
             defaultValue={item.comment ?? ""}
@@ -740,6 +781,7 @@ function DiagnosticRow({
           />
         </div>
       )}
+      </div>}
     </div>
   );
 }
@@ -761,7 +803,7 @@ function StatusSelect({
         aria-label={label}
         value={status}
         onChange={(event) => onChange(event.target.value as DiagnosticStatus)}
-        className={`min-h-11 min-w-0 rounded-xl border px-3 text-sm font-bold outline-none focus:ring-2 focus:ring-apex/30 ${statusMeta[status].className}`}
+        className={`min-h-9 min-w-0 rounded-lg border px-2 text-sm font-bold outline-none focus:ring-2 focus:ring-apex/30 ${statusMeta[status].className}`}
       >
         {statusOrder.map((option) => (
           <option key={option} value={option} className="bg-panel text-white">
@@ -776,13 +818,13 @@ function ProgressRing({ checked, total }: { checked: number; total: number }) {
   const percent = total ? Math.round((checked / total) * 100) : 0;
   return (
     <div
-      className="relative grid size-28 place-items-center rounded-full"
+      className="relative grid size-20 place-items-center rounded-full"
       style={{ background: `conic-gradient(#ffd600 ${percent}%, #26313c 0)` }}
     >
-      <div className="grid size-20 place-items-center rounded-full bg-panel text-center">
+      <div className="grid size-14 place-items-center rounded-full bg-panel text-center">
         <span>
-          <strong className="block text-2xl">{checked}</strong>
-          <small className="text-muted">из {total}</small>
+          <strong className="block text-lg leading-none">{checked}</strong>
+          <small className="text-[10px] text-muted">из {total}</small>
         </span>
       </div>
     </div>
@@ -804,12 +846,12 @@ function Stat({
   onClick: () => void;
 }) {
   return (
-    <button type="button" onClick={onClick} aria-pressed={active} className={`flex min-w-0 items-center gap-3 rounded-2xl border bg-panel p-3 text-left shadow-card transition hover:border-apex/60 ${active ? "border-apex ring-2 ring-apex/20" : "border-line"}`}>
-      <span className={`${color} [&>svg]:size-5`}>{icon}</span>
-      <span>
-        <strong className="block text-xl">{value}</strong>
-        <small className="text-muted">{label}</small>
+    <button type="button" onClick={onClick} aria-pressed={active} className={`flex min-w-0 items-center gap-2 rounded-xl border bg-gradient-to-br from-panel to-panel-soft p-2 text-left shadow-card transition hover:border-apex/60 ${active ? "border-apex ring-2 ring-apex/20" : "border-line"}`}>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className={`${color} [&>svg]:size-5`}>{icon}</span>
+        <small className="truncate text-muted">{label}</small>
       </span>
+      <strong className={`ml-auto block text-2xl ${color}`}>{value}</strong>
     </button>
   );
 }

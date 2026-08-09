@@ -24,6 +24,12 @@ img, svg { max-width: 100%; }
 button, input, textarea, select { font: inherit; }
 input, textarea, select { min-width: 0; max-width: 100%; }
 button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+.settings-compact section { padding: .75rem; }
+.app-compact main { padding-top: .75rem; padding-bottom: .75rem; }
+.app-compact main > div { gap: 1rem; }
+.app-compact main section { padding: .75rem; }
+.app-reduce-motion *, .app-reduce-motion *::before, .app-reduce-motion *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 .boot-screen { display: grid; min-height: 100dvh; place-items: center; color: #96a1ad; background: #090d12; }
 .bg-login { background: radial-gradient(circle at top, rgba(255, 214, 0, .16), transparent 35%), #090d12; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }

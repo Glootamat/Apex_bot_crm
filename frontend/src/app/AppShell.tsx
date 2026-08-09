@@ -7,6 +7,8 @@ import {
   LogOut,
   Menu,
   Search,
+  Settings,
+  ShieldCheck,
   Trash2,
   UserRound,
   WalletCards,
@@ -33,6 +35,7 @@ import {
   type DetailModalState,
 } from "../features/crm/DetailModal";
 import { BrandedLoader, Button } from "../components/ui";
+import { useAppSettings, type ModuleKey } from "../lib/settings";
 
 export type AppOutlet = {
   openEntity: (value: NonNullable<EntityModalState>) => void;
@@ -58,6 +61,11 @@ const mobileNavigation = [
   navigation[6]!,
 ];
 
+const moduleByPath: Partial<Record<string, ModuleKey>> = {
+  "/calendar": "calendar", "/orders": "orders", "/diagnostics": "diagnostics",
+  "/customers": "customers", "/cars": "cars", "/finance": "finance", "/trash": "trash",
+};
+
 export function AppShell() {
   const [menuOpen, setMenuOpen] = useState(false);
   const swipeStart = useRef<{ x: number; y: number; tracking: boolean } | null>(
@@ -68,6 +76,15 @@ export function AppShell() {
   const location = useLocation();
   const navigate = useNavigate();
   const crm = useCrm();
+  const settings = useAppSettings();
+  const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
+  const organizationName = account.data?.organization_name?.trim() || "APEX AUTO";
+  const isApexOrganization = organizationName.toLocaleLowerCase("ru") === "apex auto";
+  const memberName = account.data?.full_name?.trim() || account.data?.username || "Пользователь";
+  const roleName = account.data?.role === "owner" ? "Владелец" : "Сотрудник";
+  const isVisible = (path: string) => !moduleByPath[path] || settings.modules[moduleByPath[path]];
+  const visibleNavigation = navigation.filter((item) => isVisible(item.to));
+  const visibleMobileNavigation = mobileNavigation.filter((item) => isVisible(item.to));
   const auth = useQuery({
     queryKey: ["auth-check"],
     queryFn: api.dashboard,
@@ -80,6 +97,21 @@ export function AppShell() {
       void navigate("/login", { replace: true });
     },
   });
+
+  useEffect(() => {
+    if (!settings.autoLockMinutes) return;
+    let timer = window.setTimeout(() => logout.mutate(), settings.autoLockMinutes * 60_000);
+    const resetTimer = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => logout.mutate(), settings.autoLockMinutes * 60_000);
+    };
+    const events = ["pointerdown", "keydown", "touchstart"] as const;
+    events.forEach((event) => window.addEventListener(event, resetTimer, { passive: true }));
+    return () => {
+      window.clearTimeout(timer);
+      events.forEach((event) => window.removeEventListener(event, resetTimer));
+    };
+  }, [logout.mutate, settings.autoLockMinutes]);
 
   const markModalInHistory = useCallback(() => {
     if (!window.history.state?.apexModal) {
@@ -193,21 +225,21 @@ export function AppShell() {
 
   const closeMenu = () => setMenuOpen(false);
   return (
-    <div className="min-h-dvh w-full max-w-full overflow-x-hidden bg-canvas text-white">
+    <div className={`min-h-dvh w-full max-w-full overflow-x-hidden bg-canvas text-white ${settings.compactMode ? "app-compact" : ""} ${settings.reduceMotion ? "app-reduce-motion" : ""}`}>
       <aside
         className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-line bg-sidebar p-4 transition-transform lg:translate-x-0 ${menuOpen ? "translate-x-0" : "-translate-x-full"}`}
       >
         <div className="mb-7 flex items-center justify-between px-2">
           <div className="flex min-w-0 items-center gap-3">
-            <img
+            {isApexOrganization ? <img
               className="size-14 shrink-0 rounded-2xl object-cover shadow-[0_8px_24px_rgba(255,214,0,.14)]"
               src="/assets/brand/apex-logo.png"
               width="56"
               height="56"
               alt="Apex CRM"
-            />
-            <p className="min-w-0 text-xl font-black leading-none tracking-tight text-white">
-              APEX <span className="text-apex">AUTO</span>
+            /> : <div className="grid size-14 shrink-0 place-items-center rounded-2xl bg-apex/15 text-2xl font-black text-apex shadow-[0_8px_24px_rgba(255,214,0,.14)]" aria-label={organizationName}>{organizationName.slice(0, 1).toLocaleUpperCase("ru")}</div>}
+            <p className="min-w-0 truncate text-xl font-black leading-none tracking-tight text-white">
+              {organizationName}
             </p>
           </div>
           <Button
@@ -220,7 +252,7 @@ export function AppShell() {
           </Button>
         </div>
         <nav className="grid gap-1" aria-label="Основная навигация">
-          {navigation.map(({ to, label, icon: Icon }) => (
+          {visibleNavigation.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}
@@ -236,6 +268,30 @@ export function AppShell() {
           ))}
         </nav>
         <div className="mt-auto border-t border-line pt-4">
+          {Boolean(account.data?.platform_admin) && <NavLink
+            to="/owner"
+            onClick={closeMenu}
+            className={({ isActive }) => `mb-1 flex min-h-12 items-center gap-3 rounded-xl px-3 text-sm font-semibold transition ${isActive ? "bg-apex text-black" : "text-muted hover:bg-panel-soft hover:text-white"}`}
+          >
+            <ShieldCheck size={20} />
+            Панель владельца
+          </NavLink>}
+          {account.data && (
+            <div className="mb-3 rounded-xl border border-line bg-panel-soft px-3 py-2.5">
+              <p className="truncate text-sm font-bold text-white">{memberName}</p>
+              <p className="mt-0.5 truncate text-xs text-muted">
+                {organizationName} · {roleName}
+              </p>
+            </div>
+          )}
+          <NavLink
+            to="/settings"
+            onClick={closeMenu}
+            className={({ isActive }) => `mb-1 flex min-h-12 items-center gap-3 rounded-xl px-3 text-sm font-semibold transition ${isActive ? "bg-apex text-black" : "text-muted hover:bg-panel-soft hover:text-white"}`}
+          >
+            <Settings size={20} />
+            Настройки
+          </NavLink>
           <button
             className="flex min-h-12 w-full items-center gap-3 rounded-xl px-3 text-sm font-semibold text-muted hover:bg-panel-soft hover:text-white"
             onClick={() => logout.mutate()}
@@ -294,7 +350,7 @@ export function AppShell() {
         className="fixed inset-x-0 bottom-0 z-20 grid grid-cols-5 border-t border-line bg-sidebar/95 px-1 pb-[max(.35rem,env(safe-area-inset-bottom))] pt-1 backdrop-blur-xl lg:hidden"
         aria-label="Мобильная навигация"
       >
-        {mobileNavigation.map(({ to, label, icon: Icon }) => (
+        {visibleMobileNavigation.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}
