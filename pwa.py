@@ -971,16 +971,16 @@ async def recognize_vehicle_vin(
 
 
 @app.get("/api/parts-catalog/status")
-def parts_catalog_status(_: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+def parts_catalog_status(context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, object]:
     return {
-        "suppliers": configured_suppliers(),
+        "suppliers": configured_suppliers() if context["platform_admin"] else {"rossko": False, "profit_liga": False},
         "default_markup_percent": max(0.0, float(os.getenv("PARTS_MARKUP_PERCENT", "40"))),
     }
 
 
 @app.get("/api/parts-catalog/search")
 async def parts_catalog_search(
-    q: str, _: Annotated[str, Depends(require_user)], markup_percent: float | None = None,
+    q: str, _: Annotated[dict[str, object], Depends(require_platform_admin)], markup_percent: float | None = None,
     supplier: str | None = None,
 ) -> dict[str, object]:
     query = q.strip()
@@ -1015,7 +1015,7 @@ def add_catalog_item_to_order(
 
 @app.get("/api/parts-catalog/rossko-orders")
 async def rossko_orders(
-    order_id: int, _: Annotated[str, Depends(require_user)], limit: int = 20,
+    order_id: int, _: Annotated[dict[str, object], Depends(require_platform_admin)], limit: int = 20,
 ) -> dict[str, object]:
     require_order(order_id)
     if not configured_suppliers()["rossko"]:
@@ -1033,7 +1033,7 @@ async def rossko_orders(
 
 @app.post("/api/parts-catalog/import-rossko-order")
 async def import_rossko_order(
-    data: RosskoImportPayload, _: Annotated[str, Depends(require_user)],
+    data: RosskoImportPayload, _: Annotated[dict[str, object], Depends(require_platform_admin)],
 ) -> dict[str, object]:
     require_order(data.order_id)
     markup = max(0.0, min(300.0, data.markup_percent))
@@ -1060,7 +1060,7 @@ async def import_rossko_order(
 
 @app.get("/api/parts-catalog/profit-orders")
 async def profit_liga_orders(
-    order_id: int, _: Annotated[str, Depends(require_user)], page: int = 1,
+    order_id: int, _: Annotated[dict[str, object], Depends(require_platform_admin)], page: int = 1,
 ) -> dict[str, object]:
     require_order(order_id)
     if not configured_suppliers()["profit_liga"]:
@@ -1078,7 +1078,7 @@ async def profit_liga_orders(
 
 @app.post("/api/parts-catalog/import-profit-order")
 async def import_profit_liga_order(
-    data: ProfitLigaImportPayload, _: Annotated[str, Depends(require_user)],
+    data: ProfitLigaImportPayload, _: Annotated[dict[str, object], Depends(require_platform_admin)],
 ) -> dict[str, object]:
     require_order(data.order_id)
     markup = max(0.0, min(300.0, data.markup_percent))

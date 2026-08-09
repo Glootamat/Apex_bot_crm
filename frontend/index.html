@@ -8,10 +8,15 @@
     <link rel="icon" type="image/png" sizes="192x192" href="/assets/icons/icon-192.png" />
     <link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <style>
+      html, body, #root { width: 100%; min-height: 100dvh; margin: 0; background: #ffd600; }
+      .boot-screen { display: grid; min-height: 100dvh; place-items: center; overflow: hidden; background: #ffd600; }
+      .boot-screen img { width: min(72vw, 420px); height: auto; object-fit: contain; }
+    </style>
     <title>Apex CRM</title>
   </head>
   <body>
-    <div id="root"><div class="boot-screen">Загрузка Apex CRM…</div></div>
+    <div id="root"><div class="boot-screen" role="status" aria-label="Загрузка приложения"><img src="/assets/brand/apex-logo.png" alt="Apex CRM" /></div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -84,7 +84,6 @@ export function AppShell() {
   const roleName = account.data?.role === "owner" ? "Владелец" : "Сотрудник";
   const isVisible = (path: string) => !moduleByPath[path] || settings.modules[moduleByPath[path]];
   const visibleNavigation = navigation.filter((item) => isVisible(item.to));
-  const visibleMobileNavigation = mobileNavigation.filter((item) => isVisible(item.to));
   const auth = useQuery({
     queryKey: ["auth-check"],
     queryFn: api.dashboard,
@@ -350,7 +349,7 @@ export function AppShell() {
         className="fixed inset-x-0 bottom-0 z-20 grid grid-cols-5 border-t border-line bg-sidebar/95 px-1 pb-[max(.35rem,env(safe-area-inset-bottom))] pt-1 backdrop-blur-xl lg:hidden"
         aria-label="Мобильная навигация"
       >
-        {visibleMobileNavigation.map(({ to, label, icon: Icon }) => (
+        {mobileNavigation.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}

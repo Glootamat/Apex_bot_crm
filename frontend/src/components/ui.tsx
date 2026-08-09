@@ -40,7 +40,7 @@ export function Spinner({ label = "Загрузка" }: { label?: string }) {
 
 export function BrandedLoader({ label = "Открываю Apex CRM…" }: { label?: string }) {
   return <div className="fixed inset-0 z-[100] grid min-h-dvh place-items-center overflow-hidden bg-[#ffd600]" role="status" aria-label={label}>
-    <img className="h-full w-full object-contain" src="/assets/brand/apex-logo.png" alt="Apex CRM" />
+    <img className="h-auto w-[min(72vw,420px)] object-contain" src="/assets/brand/apex-logo.png" alt="Apex CRM" />
     <span className="sr-only">{label}</span>
   </div>;
 }

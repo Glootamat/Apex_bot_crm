@@ -30,7 +30,8 @@ button:disabled { cursor: not-allowed; }
 .app-compact main > div { gap: 1rem; }
 .app-compact main section { padding: .75rem; }
 .app-reduce-motion *, .app-reduce-motion *::before, .app-reduce-motion *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
-.boot-screen { display: grid; min-height: 100dvh; place-items: center; color: #96a1ad; background: #090d12; }
+.boot-screen { display: grid; min-height: 100dvh; place-items: center; overflow: hidden; background: #ffd600; }
+.boot-screen img { width: min(72vw, 420px); height: auto; object-fit: contain; }
 .bg-login { background: radial-gradient(circle at top, rgba(255, 214, 0, .16), transparent 35%), #090d12; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 
