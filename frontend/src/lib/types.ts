@@ -17,14 +17,29 @@ export type Order = {
   customer_name: string | null; concern: string | null; agreed_amount: number | null;
   recommendations: string | null; completed_at: string | null; archived_at: string | null;
   parts_source: string | null; mileage_at_visit: number | null; profit: number;
+  attachments?: OrderAttachment[];
 };
+export type OrderAttachment = { id: number; service_order_id?: number; photo_type: "work" | "receipt"; caption: string | null; created_at?: string; url: string | null };
+export type ReceiptUploadResult = OrderAttachment & { recognized: boolean; recognition_error?: string; receipt_id?: number; items_count?: number; purchase_cost?: number; markup_percent?: number; markup_profit?: number; selling_price?: number };
 export type Finance = {
   orders: number; no_shows: number; labor_revenue: number; parts_revenue: number;
   parts_cost: number; parts_profit: number; today_profit: number; revenue: number; profit: number;
 };
-export type CrmData = { customers: Customer[]; cars: Car[]; appointments: Appointment[]; orders: Order[]; finance: Finance };
+export type CrmData = { customers: Customer[]; cars: Car[]; appointments: Appointment[]; appointment_history: Appointment[]; orders: Order[]; finance: Finance };
 export type Dashboard = { today_profit: number; active_orders: number; upcoming_appointments: number; orders: Order[]; appointments: Appointment[] };
 export type SearchResults = { customers: Customer[]; cars: Car[]; orders: Order[]; appointments: Appointment[] };
+export type TrashItem = { kind: "customer" | "car" | "appointment" | "order"; id: number; title: string; subtitle: string; archived_at: string };
+export type TrashData = { retention_days: number; items: TrashItem[] };
+export type DiagnosticStatus = "unchecked" | "ok" | "attention" | "critical";
+export type DiagnosticItem = { id: number; section_key: string; item_key: string; label: string; status: DiagnosticStatus; left_status: DiagnosticStatus | null; right_status: DiagnosticStatus | null; comment: string | null; recommendation: string | null; estimated_cost: number | null; updated_at: string };
+export type DiagnosticPhoto = { id: number; filename: string; caption: string | null; created_at: string; url: string };
+export type Diagnostic = { id: number; car_id: number; service_order_id: number | null; mileage: number | null; status: "draft" | "completed"; notes: string | null; created_at: string; updated_at: string; completed_at: string | null; brand: string; model: string; year: number | null; plate_number: string | null; vin: string | null; customer_name: string | null; items: DiagnosticItem[]; photos: DiagnosticPhoto[] };
+export type DiagnosticSummary = { id: number; car_id: number; service_order_id: number | null; mileage: number | null; status: "draft" | "completed"; created_at: string; updated_at: string; completed_at: string | null; brand: string; model: string; plate_number: string | null; checked: number; total: number; critical: number; attention: number };
+export type DiagnosticItemInput = Partial<Pick<DiagnosticItem, "status" | "left_status" | "right_status" | "comment" | "recommendation" | "estimated_cost">>;
+export type VehicleRecognition = { document_type: "vin_plate" | "pts" | "sts" | "vin_text" | "unknown"; vin: string | null; plate_number: string | null; brand: string | null; model: string | null; year: number | null; confidence: "high" | "medium" | "low" };
+export type SupplierOffer = { supplier: string; offer_id: string; brand: string; article: string; name: string; purchase_price: number; quantity: number; delivery_days: number; warehouse: string | null; sale_price: number; profit: number; markup_percent: number; round_to: 50 };
+export type PartsCatalogResult = { query: string; offers: SupplierOffer[]; errors: Record<string, string>; suppliers: Record<"rossko" | "profit_liga", boolean>; markup_percent: number; round_to: 50 };
+export type PartsCatalogStatus = { suppliers: Record<"rossko" | "profit_liga", boolean>; default_markup_percent: number };
 
 export type CustomerInput = { full_name: string; phone: string | null };
 export type CarInput = { customer_id: number | null; brand: string; model: string; year: number | null; plate_number: string | null; vin: string | null; mileage: number | null };

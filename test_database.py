@@ -707,6 +707,57 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(db.purge_archived(user_id)["orders"], 1)
             self.assertEqual(db.count_archived(user_id)["orders"], 0)
 
+    def test_deleted_appointment_can_be_restored_from_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4011, "Master", None)
+            car_id = db.add_car(user_id, "Lada", "Vesta")
+            appointment_id = db.add_appointment(car_id, "Diagnostics", "2030-01-01T10:00:00")
+
+            self.assertTrue(db.delete_appointment(user_id, appointment_id))
+            self.assertIsNone(db.get_appointment_for_telegram_user(4011, appointment_id))
+            self.assertEqual(db.get_trash(user_id)[0]["kind"], "appointment")
+            self.assertTrue(db.restore_archived(user_id, "appointment", appointment_id))
+            self.assertIsNotNone(db.get_appointment_for_telegram_user(4011, appointment_id))
+
+    def test_diagnostic_card_tracks_progress_and_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4012, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio", mileage=125000)
+            checklist = [
+                ("general", "body", "Кузов", False),
+                ("suspension", "bearings", "Подшипники", True),
+            ]
+
+            card = db.start_diagnostic(user_id, car_id, None, checklist)
+            self.assertIsNotNone(card)
+            assert card is not None
+            self.assertEqual(card["mileage"], 125000)
+            self.assertEqual(len(card["items"]), 2)
+            updated = db.update_diagnostic_item(
+                user_id, int(card["id"]), "bearings",
+                left_status="ok", right_status="critical",
+                recommendation="Заменить правый подшипник", estimated_cost=5000,
+            )
+            self.assertEqual(updated["right_status"], "critical")
+            completed = db.update_diagnostic(
+                user_id, int(card["id"]), mileage=125100,
+                notes="Проверено", status="completed",
+            )
+            self.assertEqual(completed["status"], "completed")
+            summary = db.list_diagnostics(user_id)[0]
+            self.assertEqual(summary["checked"], 1)
+            self.assertEqual(summary["critical"], 1)
+
+            other_user_id = db.add_or_update_user(4013, "Other", None)
+            self.assertIsNone(db.delete_diagnostic(other_user_id, int(card["id"])))
+            self.assertEqual(db.delete_diagnostic(user_id, int(card["id"])), [])
+            self.assertIsNone(db.get_diagnostic(user_id, int(card["id"])))
+            self.assertEqual(db.list_diagnostics(user_id), [])
+
     def test_phone_and_plate_are_normalized_for_future_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")
@@ -786,3 +837,20 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(overview.receipt.total_cost, 1533)
             self.assertEqual(len(overview.items), 2)
             self.assertEqual(overview.items[0].article, "BD3619")
+
+    def test_catalog_part_updates_order_totals_with_markup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(4001, "Master", None)
+            car_id = db.add_car(user_id, "Kia", "Rio")
+            order = db.add_service_order(car_id, "Service", 1000, 0, 0)
+
+            item = db.add_catalog_part(order.id, "Oil filter", "OF-1", 2, 500, 40)
+
+            self.assertEqual(item.total_cost, 1000)
+            self.assertEqual(item.markup_percent, 40)
+            updated = db.get_service_order(order.id)
+            self.assertEqual(updated.parts_cost, 1000)
+            self.assertEqual(updated.parts_revenue, 1400)
+            self.assertEqual(updated.profit, 1400)

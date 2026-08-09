@@ -22,7 +22,7 @@ export function EmptyState({ children }: PropsWithChildren) {
 export function Modal({ title, children, onClose }: PropsWithChildren<{ title: string; onClose: () => void }>) {
   return <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-sm sm:items-center sm:p-5" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section role="dialog" aria-modal="true" aria-labelledby="modal-title" className="max-h-[94dvh] min-w-0 w-full max-w-full overflow-x-hidden overflow-y-auto rounded-t-3xl border border-line bg-panel p-4 shadow-2xl sm:max-w-2xl sm:rounded-3xl sm:p-6">
-      <header className="mb-5 flex items-center justify-between gap-4"><h2 id="modal-title" className="text-xl font-black">{title}</h2><Button variant="ghost" className="size-11 p-0" onClick={onClose} aria-label="Закрыть"><X size={20} /></Button></header>
+      <header className="mb-5 flex items-center gap-2"><h2 id="modal-title" className="min-w-0 flex-1 break-words text-xl font-black">{title}</h2><Button variant="ghost" className="size-11 shrink-0 p-0" onClick={onClose} aria-label="Закрыть"><X size={20} /></Button></header>
       {children}
     </section>
   </div>;
@@ -36,4 +36,11 @@ export const inputClass = "min-h-12 w-full rounded-xl border border-line bg-canv
 
 export function Spinner({ label = "Загрузка" }: { label?: string }) {
   return <div className="flex min-h-56 items-center justify-center gap-3 text-muted" role="status"><span className="size-5 animate-spin rounded-full border-2 border-line border-t-apex" /><span>{label}</span></div>;
+}
+
+export function BrandedLoader({ label = "Открываю Apex CRM…" }: { label?: string }) {
+  return <div className="fixed inset-0 z-[100] grid min-h-dvh place-items-center overflow-hidden bg-[#ffd600]" role="status" aria-label={label}>
+    <img className="h-full w-full object-contain" src="/assets/brand/apex-logo.png" alt="Apex CRM" />
+    <span className="sr-only">{label}</span>
+  </div>;
 }

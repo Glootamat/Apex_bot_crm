@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { Camera, ScanLine } from "lucide-react";
+import { useEffect, useRef } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api, ApiError } from "../../lib/api";
 import { refreshCrm } from "../../lib/query";
@@ -21,6 +22,7 @@ const number = (data: FormData, key: string) => { const value = text(data, key);
 const requiredNumber = (data: FormData, key: string) => Number(text(data, key));
 
 export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props) {
+  const formRef = useRef<HTMLFormElement>(null);
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", close);
@@ -46,6 +48,25 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
     },
     onSuccess: async () => { await refreshCrm(); onSaved?.(); onClose(); },
   });
+  const applyVehicleRecognition = (result: Awaited<ReturnType<typeof api.recognizeVehicleImage>>) => {
+    const form = formRef.current;
+    if (!form) return;
+    const set = (name: string, value: string | number | null) => {
+      if (value == null || value === "") return;
+      const input = form.elements.namedItem(name);
+      if (input instanceof HTMLInputElement) input.value = String(value);
+    };
+    set("vin", result.vin); set("plate_number", result.plate_number);
+    set("brand", result.brand); set("model", result.model); set("year", result.year);
+  };
+  const recognition = useMutation({
+    mutationFn: ({ file, vin }: { file?: File; vin?: string }) => file ? api.recognizeVehicleImage(file) : api.recognizeVehicleVin(vin ?? ""),
+    onSuccess: applyVehicleRecognition,
+  });
+  const recognizeTypedVin = () => {
+    const input = formRef.current?.elements.namedItem("vin");
+    if (input instanceof HTMLInputElement) recognition.mutate({ vin: input.value });
+  };
 
   const edit = Boolean(entity.value);
   const title = `${edit ? "Изменить" : "Создать"} ${{ customer: "клиента", car: "автомобиль", appointment: "запись", order: "заказ-наряд" }[entity.kind]}`;
@@ -53,18 +74,21 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
   const error = mutation.error instanceof ApiError ? mutation.error.message : mutation.error ? "Не удалось сохранить" : "";
 
   return <Modal title={title} onClose={onClose}>
-    <form className="grid gap-4 sm:grid-cols-2" onSubmit={submit}>
+    <form ref={formRef} className="grid gap-4 sm:grid-cols-2" onSubmit={submit}>
       {entity.kind === "customer" && <>
         <Field label="Имя клиента" full><input className={inputClass} name="full_name" defaultValue={entity.value?.full_name ?? ""} placeholder="Если неизвестно — оставьте пустым" /></Field>
         <Field label="Телефон" full><input className={inputClass} name="phone" type="tel" inputMode="tel" defaultValue={entity.value?.phone ?? ""} placeholder="+7 900 000-00-00" /></Field>
       </>}
       {entity.kind === "car" && <>
+        <label className="inline-flex min-h-12 cursor-pointer items-center justify-center gap-2 rounded-xl border border-apex/40 bg-apex/10 px-4 py-2 text-sm font-bold text-apex transition hover:bg-apex/15 sm:col-span-2"><Camera size={18} />{recognition.isPending ? "Распознаю…" : "Сканировать VIN / ПТС / СТС"}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={recognition.isPending} onChange={(event) => { const file = event.target.files?.[0]; if (file) recognition.mutate({ file }); event.currentTarget.value = ""; }} /></label>
+        {recognition.data && <p className="rounded-xl bg-success/10 p-3 text-sm text-success sm:col-span-2">Распознано: {[recognition.data.brand, recognition.data.model, recognition.data.year, recognition.data.vin].filter(Boolean).join(" · ") || "проверьте изображение"}. Поля заполнены автоматически — проверьте перед сохранением.</p>}
+        {recognition.error && <p className="rounded-xl bg-danger/10 p-3 text-sm text-danger sm:col-span-2">Не удалось распознать VIN или документ. Сделайте фото без бликов либо введите VIN вручную.</p>}
         <Field label="Клиент" full><select className={inputClass} name="customer_id" defaultValue={entity.value?.customer_id ?? entity.customerId ?? ""}><option value="">Без клиента</option>{customers.map((item) => <option key={item.id} value={item.id}>{item.full_name}{item.phone ? ` · ${item.phone}` : ""}</option>)}</select></Field>
         <Field label="Марка"><input className={inputClass} name="brand" required defaultValue={entity.value?.brand ?? ""} /></Field>
         <Field label="Модель"><input className={inputClass} name="model" required defaultValue={entity.value?.model ?? ""} /></Field>
         <Field label="Год"><input className={inputClass} name="year" type="number" min="1900" max="2100" defaultValue={entity.value?.year ?? ""} /></Field>
         <Field label="Госномер"><input className={inputClass} name="plate_number" defaultValue={entity.value?.plate_number ?? ""} /></Field>
-        <Field label="VIN" full><input className={inputClass} name="vin" maxLength={17} defaultValue={entity.value?.vin ?? ""} /></Field>
+        <Field label="VIN" full><div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input className={inputClass} name="vin" maxLength={17} defaultValue={entity.value?.vin ?? ""} autoCapitalize="characters" placeholder="17 символов" /><Button type="button" variant="secondary" onClick={recognizeTypedVin} disabled={recognition.isPending}><ScanLine size={18} />Определить авто</Button></div></Field>
         <Field label="Пробег"><input className={inputClass} name="mileage" type="number" min="0" defaultValue={entity.value?.mileage ?? ""} /></Field>
       </>}
       {entity.kind === "appointment" && <>

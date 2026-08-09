@@ -1,0 +1,864 @@
+import {
+  Camera,
+  Check,
+  ChevronRight,
+  CircleAlert,
+  ClipboardCheck,
+  FileDown,
+  Gauge,
+  Search,
+  Save,
+  Share2,
+  Trash2,
+  Wrench,
+  X,
+  XCircle,
+} from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Button,
+  Card,
+  EmptyState,
+  inputClass,
+  Spinner,
+} from "../components/ui";
+import { useCrm } from "../features/crm/useCrm";
+import { api } from "../lib/api";
+import { customerName, formatDateTime, money } from "../lib/format";
+import { queryClient } from "../lib/query";
+import type {
+  Diagnostic,
+  DiagnosticItem,
+  DiagnosticItemInput,
+  DiagnosticStatus,
+} from "../lib/types";
+
+const sections = [
+  ["general", "Основное"],
+  ["front_suspension", "Передняя подвеска"],
+  ["rear_suspension", "Задняя подвеска"],
+  ["brakes", "Тормозная система"],
+  ["engine", "Двигатель"],
+  ["body", "Кузов и салон"],
+  ["electrics", "Электрика"],
+  ["ac", "Климат"],
+] as const;
+
+const statusMeta: Record<
+  DiagnosticStatus,
+  { label: string; short: string; className: string }
+> = {
+  unchecked: {
+    label: "Не проверено",
+    short: "—",
+    className: "border-line bg-panel-soft text-muted",
+  },
+  ok: {
+    label: "Норма",
+    short: "✓",
+    className: "border-success/40 bg-success/10 text-success",
+  },
+  attention: {
+    label: "Внимание",
+    short: "!",
+    className: "border-apex/50 bg-apex/10 text-apex",
+  },
+  critical: {
+    label: "Неисправно",
+    short: "×",
+    className: "border-danger/50 bg-danger/10 text-danger",
+  },
+};
+const statusOrder: DiagnosticStatus[] = [
+  "unchecked",
+  "ok",
+  "attention",
+  "critical",
+];
+
+function normalizeSearchValue(value: unknown) {
+  return String(value ?? "")
+    .toLocaleLowerCase("ru-RU")
+    .replace(/ё/g, "е")
+    .replace(/[^a-zа-я0-9]+/gi, "");
+}
+
+function normalizeVehicleCode(value: unknown) {
+  return normalizeSearchValue(value)
+    .replace(/а/g, "a").replace(/в/g, "b").replace(/е/g, "e")
+    .replace(/к/g, "k").replace(/м/g, "m").replace(/н/g, "h")
+    .replace(/о/g, "o").replace(/р/g, "p").replace(/с/g, "c")
+    .replace(/т/g, "t").replace(/у/g, "y").replace(/х/g, "x");
+}
+
+export function DiagnosticsIndexPage() {
+  const navigate = useNavigate();
+  const [vehicleSearch, setVehicleSearch] = useState("");
+  const crm = useCrm();
+  const diagnostics = useQuery({
+    queryKey: ["diagnostics"],
+    queryFn: () => api.diagnostics(),
+  });
+  const deleteDiagnostic = useMutation({
+    mutationFn: (id: number) => api.deleteDiagnostic(id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["diagnostics"] }),
+    onError: () => window.alert("Не удалось удалить диагностическую карту"),
+  });
+  const confirmDeleteDiagnostic = (id: number) => {
+    if (window.confirm("Удалить диагностическую карту без возможности восстановления?")) {
+      deleteDiagnostic.mutate(id);
+    }
+  };
+  const cars = crm.data?.cars ?? [];
+  const customersById = useMemo(
+    () => new Map((crm.data?.customers ?? []).map((customer) => [customer.id, customer])),
+    [crm.data?.customers],
+  );
+  const filteredCars = useMemo(() => {
+    const terms = vehicleSearch.trim().split(/\s+/).filter(Boolean);
+    if (!terms.length) return cars;
+    return cars.filter((car) => {
+      const customer = car.customer_id ? customersById.get(car.customer_id) : undefined;
+      const text = [
+        car.brand, car.model, car.year, car.plate_number, car.vin, car.mileage,
+        customer?.full_name, customer?.phone,
+      ].map(normalizeSearchValue).join(" ");
+      const vehicleCodes = [car.plate_number, car.vin].map(normalizeVehicleCode).join(" ");
+      return terms.every((term) =>
+        text.includes(normalizeSearchValue(term)) ||
+        vehicleCodes.includes(normalizeVehicleCode(term)),
+      );
+    });
+  }, [cars, customersById, vehicleSearch]);
+  if (crm.isPending || diagnostics.isPending)
+    return <Spinner label="Открываю диагностику…" />;
+  return (
+    <div className="grid gap-5">
+      <header>
+        <p className="text-sm font-bold text-apex">ТЕХНИЧЕСКОЕ СОСТОЯНИЕ</p>
+        <h1 className="text-3xl font-black">Диагностика автомобилей</h1>
+        <p className="mt-1 text-muted">
+          Выберите автомобиль — черновик откроется сразу, без лишних форм.
+        </p>
+      </header>
+      <section>
+        <h2 className="mb-3 text-lg font-black">Начать диагностику</h2>
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <label className="relative block flex-1">
+            <Search className="pointer-events-none absolute left-4 top-1/2 size-5 -translate-y-1/2 text-muted" />
+            <input
+              value={vehicleSearch}
+              onChange={(event) => setVehicleSearch(event.target.value)}
+              className={`${inputClass} w-full pl-12 pr-12`}
+              placeholder="Клиент, телефон, марка, модель, госномер или VIN"
+              autoComplete="off"
+              aria-label="Поиск автомобиля для диагностики"
+            />
+            {vehicleSearch && (
+              <button
+                type="button"
+                onClick={() => setVehicleSearch("")}
+                className="absolute right-3 top-1/2 grid size-8 -translate-y-1/2 place-items-center rounded-lg text-muted transition hover:bg-panel-soft hover:text-white"
+                aria-label="Очистить поиск"
+              >
+                <X className="size-4" />
+              </button>
+            )}
+          </label>
+          {vehicleSearch && <span className="shrink-0 text-sm text-muted">Найдено: {filteredCars.length}</span>}
+        </div>
+        {filteredCars.length ? (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {filteredCars.map((car) => (
+            <button
+              key={car.id}
+              onClick={() =>
+                void navigate(`/diagnostics/start?car_id=${car.id}`)
+              }
+              className="flex min-w-0 items-center gap-3 rounded-2xl border border-line bg-panel p-4 text-left transition hover:border-apex/50"
+            >
+              <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-apex/10 text-apex">
+                <ClipboardCheck />
+              </span>
+              <span className="min-w-0">
+                <strong className="block break-words">
+                  {car.brand} {car.model}
+                </strong>
+                <span className="text-sm text-muted">
+                  {car.plate_number || car.vin || "Без номера"}
+                </span>
+                {car.customer_id && customersById.get(car.customer_id) && (
+                  <span className="block truncate text-xs text-muted">
+                    {customersById.get(car.customer_id)?.full_name}
+                    {customersById.get(car.customer_id)?.phone ? ` · ${customersById.get(car.customer_id)?.phone}` : ""}
+                  </span>
+                )}
+              </span>
+              <ChevronRight className="ml-auto shrink-0 text-muted" />
+            </button>
+          ))}
+        </div>
+        ) : (
+          <EmptyState>По запросу «{vehicleSearch}» автомобиль не найден. Проверьте данные или очистите поиск.</EmptyState>
+        )}
+      </section>
+      <section>
+        <h2 className="mb-3 text-lg font-black">Последние карты</h2>
+        {diagnostics.data?.length ? (
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {diagnostics.data.map((item) => (
+              <Card
+                key={item.id}
+                className="cursor-pointer transition hover:border-apex/50"
+                onClick={() => void navigate(`/diagnostics/${item.id}`)}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-bold text-apex">
+                      {item.status === "completed" ? "ЗАВЕРШЕНА" : "ЧЕРНОВИК"}
+                    </p>
+                    <h3 className="font-black">
+                      {item.brand} {item.model}
+                    </h3>
+                    <p className="text-sm text-muted">
+                      {formatDateTime(item.created_at)}
+                    </p>
+                  </div>
+                  <span className="rounded-full bg-panel-soft px-3 py-1 text-sm font-bold">
+                    {item.checked}/{item.total}
+                  </span>
+                </div>
+                <div className="mt-4 flex items-end justify-between gap-3">
+                  <div className="flex flex-wrap gap-3 text-sm">
+                    <span className="text-apex">Внимание: {item.attention}</span>
+                    <span className="text-danger">
+                      Неисправно: {item.critical}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      confirmDeleteDiagnostic(item.id);
+                    }}
+                    disabled={deleteDiagnostic.isPending}
+                    className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs font-bold text-muted transition hover:bg-danger/10 hover:text-danger disabled:opacity-50"
+                    aria-label="Удалить диагностическую карту"
+                  >
+                    <Trash2 className="size-3.5" />
+                    Удалить
+                  </button>
+                </div>
+              </Card>
+            ))}
+          </div>
+        ) : (
+          <EmptyState>Диагностик пока нет</EmptyState>
+        )}
+      </section>
+    </div>
+  );
+}
+
+export function DiagnosticPage() {
+  const { diagnosticId } = useParams();
+  const [search] = useSearchParams();
+  const id = diagnosticId ? Number(diagnosticId) : null;
+  const carId = Number(search.get("car_id"));
+  const orderId = Number(search.get("order_id")) || undefined;
+  const queryKey = ["diagnostic", id ?? "start", carId, orderId] as const;
+  const diagnostic = useQuery({
+    queryKey,
+    queryFn: () =>
+      id ? api.diagnostic(id) : api.startDiagnostic(carId, orderId),
+    enabled: Boolean(id || carId),
+  });
+  if (!id && !carId) return <EmptyState>Автомобиль не выбран</EmptyState>;
+  if (diagnostic.isPending)
+    return <Spinner label="Готовлю карту диагностики…" />;
+  if (diagnostic.isError || !diagnostic.data)
+    return <EmptyState>Не удалось открыть диагностическую карту</EmptyState>;
+  return <DiagnosticCard value={diagnostic.data} queryKey={queryKey} />;
+}
+
+function DiagnosticCard({
+  value,
+  queryKey,
+}: {
+  value: Diagnostic;
+  queryKey: readonly unknown[];
+}) {
+  const [statusFilter, setStatusFilter] = useState<DiagnosticStatus | null>(null);
+  const updateLocal = (updater: (current: Diagnostic) => Diagnostic) =>
+    queryClient.setQueryData<Diagnostic>(queryKey, (current) =>
+      current ? updater(current) : current,
+    );
+  const itemMutation = useMutation({
+    mutationFn: ({ key, input }: { key: string; input: DiagnosticItemInput }) =>
+      api.updateDiagnosticItem(value.id, key, input),
+    onSuccess: (item) =>
+      updateLocal((current) => ({
+        ...current,
+        items: current.items.map((old) =>
+          old.item_key === item.item_key ? item : old,
+        ),
+      })),
+  });
+  const cardMutation = useMutation({
+    mutationFn: (input: {
+      mileage: number | null;
+      notes: string | null;
+      status: "draft" | "completed";
+    }) => api.updateDiagnostic(value.id, input),
+    onSuccess: (card) => {
+      queryClient.setQueryData(queryKey, card);
+      void queryClient.invalidateQueries({ queryKey: ["diagnostics"] });
+    },
+  });
+  const photoMutation = useMutation({
+    mutationFn: (file: File) => api.uploadDiagnosticPhoto(value.id, file),
+    onSuccess: (photo) =>
+      updateLocal((current) => ({
+        ...current,
+        photos: [...current.photos, photo],
+      })),
+  });
+  const savePdf = (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `apex-diagnostic-${value.id}.pdf`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  };
+  const pdfMutation = useMutation({
+    mutationFn: () => api.diagnosticPdf(value.id),
+    onSuccess: savePdf,
+  });
+  const sharePdfMutation = useMutation({
+    mutationFn: () => api.diagnosticPdf(value.id),
+    onSuccess: async (blob) => {
+      const filename = `apex-diagnostic-${value.id}.pdf`;
+      const file = new File([blob], filename, { type: "application/pdf" });
+      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
+        try {
+          await navigator.share({ title: `Диагностическая карта #${value.id}`, files: [file] });
+          return;
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+        }
+      }
+      savePdf(blob);
+    },
+  });
+  const grouped = useMemo(
+    () =>
+      Object.fromEntries(
+        sections.map(([key]) => [
+          key,
+          value.items.filter((item) => item.section_key === key),
+        ]),
+      ),
+    [value.items],
+  );
+  const counts = useMemo(() => summarize(value.items), [value.items]);
+  const filteredItems = statusFilter ? value.items.filter((item) => worstStatus(item) === statusFilter) : [];
+  const checked = value.items.filter(isChecked).length;
+  const complete = () =>
+    cardMutation.mutate({
+      mileage: value.mileage,
+      notes: value.notes,
+      status: value.status === "completed" ? "draft" : "completed",
+    });
+  const patchItem = (item: DiagnosticItem, input: DiagnosticItemInput) => {
+    updateLocal((current) => ({
+      ...current,
+      items: current.items.map((old) =>
+        old.item_key === item.item_key ? { ...old, ...input } : old,
+      ),
+    }));
+    itemMutation.mutate({ key: item.item_key, input });
+  };
+
+  return (
+    <article className="diagnostic-print grid gap-5">
+      <header className="grid gap-3 print:hidden sm:flex sm:items-center">
+        <div className="min-w-0 sm:flex-1">
+          <p className="text-sm font-bold text-apex">
+            ДИАГНОСТИЧЕСКАЯ КАРТА #{value.id}
+          </p>
+          <h1 className="text-3xl font-black leading-tight break-normal">
+            {value.brand} {value.model}
+          </h1>
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:flex">
+          <Button variant="secondary" onClick={() => pdfMutation.mutate()} disabled={pdfMutation.isPending}>
+            <FileDown size={17} />
+            {pdfMutation.isPending ? "Сохраняю…" : "Сохранить PDF"}
+          </Button>
+          <Button variant="secondary" onClick={() => sharePdfMutation.mutate()} disabled={sharePdfMutation.isPending}>
+            <Share2 size={17} />
+            {sharePdfMutation.isPending ? "Готовлю…" : "Поделиться PDF"}
+          </Button>
+          <Button className="col-span-2 sm:col-span-1" onClick={complete} disabled={cardMutation.isPending}>
+            {value.status === "completed" ? (
+              <Wrench size={17} />
+            ) : (
+              <Save size={17} />
+            )}
+            {value.status === "completed" ? "Вернуть в работу" : "Завершить"}
+          </Button>
+        </div>
+      </header>
+
+      <Card className="grid gap-4 md:grid-cols-[1fr_auto]">
+        <div>
+          <p className="text-sm text-muted">
+            {value.plate_number || "Без госномера"}
+            {value.vin ? ` · ${value.vin}` : ""}
+          </p>
+          <p className="mt-1 font-semibold">
+            {customerName(value.customer_name)}
+          </p>
+          <label className="mt-3 flex max-w-xs items-center gap-2 text-sm text-muted">
+            <Gauge size={17} />
+            <input
+              className={`${inputClass} min-h-10 py-1`}
+              type="number"
+              min="0"
+              value={value.mileage ?? ""}
+              onChange={(event) =>
+                updateLocal((current) => ({
+                  ...current,
+                  mileage: event.target.value
+                    ? Number(event.target.value)
+                    : null,
+                }))
+              }
+              onBlur={() =>
+                cardMutation.mutate({
+                  mileage: value.mileage,
+                  notes: value.notes,
+                  status: value.status,
+                })
+              }
+              placeholder="Пробег, км"
+            />
+          </label>
+        </div>
+        <ProgressRing checked={checked} total={value.items.length} />
+      </Card>
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <Stat
+          label="Норма"
+          value={counts.ok}
+          color="text-success"
+          icon={<Check />}
+          active={statusFilter === "ok"}
+          onClick={() => setStatusFilter((current) => current === "ok" ? null : "ok")}
+        />
+        <Stat
+          label="Внимание"
+          value={counts.attention}
+          color="text-apex"
+          icon={<CircleAlert />}
+          active={statusFilter === "attention"}
+          onClick={() => setStatusFilter((current) => current === "attention" ? null : "attention")}
+        />
+        <Stat
+          label="Неисправно"
+          value={counts.critical}
+          color="text-danger"
+          icon={<XCircle />}
+          active={statusFilter === "critical"}
+          onClick={() => setStatusFilter((current) => current === "critical" ? null : "critical")}
+        />
+        <Stat
+          label="Не проверено"
+          value={counts.unchecked}
+          color="text-muted"
+          icon={<span>—</span>}
+          active={statusFilter === "unchecked"}
+          onClick={() => setStatusFilter((current) => current === "unchecked" ? null : "unchecked")}
+        />
+      </div>
+
+      {statusFilter && (
+        <Card className="scroll-mt-20" id="diagnostic-status-details">
+          <div className="flex items-center justify-between gap-3">
+            <div><p className="text-xs font-bold uppercase tracking-wide text-muted">Выбранный статус</p><h2 className="text-xl font-black">{statusMeta[statusFilter].label}: {filteredItems.length}</h2></div>
+            <Button variant="ghost" onClick={() => setStatusFilter(null)}>Скрыть</Button>
+          </div>
+          <div className="mt-3 grid gap-2">
+            {filteredItems.map((item) => (
+              <button key={item.id} type="button" onClick={() => document.getElementById(`diagnostic-${item.section_key}`)?.scrollIntoView({ behavior: "smooth", block: "start" })} className="rounded-xl bg-panel-soft p-3 text-left transition hover:bg-line">
+                <strong className="block">{item.label}</strong>
+                <span className="mt-1 block text-sm text-muted">{statusDescription(item)}</span>
+                {(item.comment || item.recommendation) && <span className="mt-1 block text-sm">{[item.comment, item.recommendation].filter(Boolean).join(" · ")}</span>}
+              </button>
+            ))}
+            {!filteredItems.length && <p className="rounded-xl bg-panel-soft p-4 text-sm text-muted">Пунктов с таким статусом нет.</p>}
+          </div>
+        </Card>
+      )}
+
+      <Card className="print:hidden">
+        <h2 className="font-black">Как заполнять карту</h2>
+        <p className="mt-1 text-sm text-muted">
+          Выберите состояние каждого узла. Для деталей подвески состояние
+          указывается отдельно для левой и правой стороны.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {statusOrder.map((status) => (
+            <span
+              key={status}
+              className={`rounded-lg border px-2.5 py-1.5 text-xs font-bold ${statusMeta[status].className}`}
+            >
+              {statusMeta[status].label}
+            </span>
+          ))}
+        </div>
+      </Card>
+
+      <nav className="grid grid-cols-2 gap-2 sm:grid-cols-4 print:hidden">
+        {sections.map(([key, label]) => {
+          const items = grouped[key] ?? [];
+          const done = items.filter(isChecked).length;
+          return (
+            <button
+              key={key}
+              onClick={() =>
+                document
+                  .getElementById(`diagnostic-${key}`)
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+              className="rounded-xl border border-line bg-panel p-3 text-left transition hover:border-apex"
+            >
+              <strong className="block text-sm">{label}</strong>
+              <span className="text-xs text-muted">
+                {done}/{items.length}
+              </span>
+            </button>
+          );
+        })}
+      </nav>
+
+      {sections.map(([sectionKey, title]) => (
+        <section
+          id={`diagnostic-${sectionKey}`}
+          key={sectionKey}
+          className="scroll-mt-20"
+        >
+          <div className="mb-3 flex items-end justify-between">
+            <h2 className="text-xl font-black">{title}</h2>
+            <span className="text-sm text-muted">
+              {(grouped[sectionKey] ?? []).filter(isChecked).length}/
+              {(grouped[sectionKey] ?? []).length}
+            </span>
+          </div>
+          <Card className="divide-y divide-line p-0">
+            {(grouped[sectionKey] ?? []).map((item) => (
+              <DiagnosticRow
+                key={item.id}
+                item={item}
+                patch={(input) => patchItem(item, input)}
+              />
+            ))}
+          </Card>
+        </section>
+      ))}
+
+      <Card>
+        <h2 className="font-black">Фото диагностики</h2>
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {value.photos.map((photo) => (
+            <a key={photo.id} href={photo.url} target="_blank" rel="noreferrer">
+              <img
+                className="aspect-square w-full rounded-xl object-cover"
+                src={photo.url}
+                alt={photo.caption || "Фото диагностики"}
+              />
+            </a>
+          ))}
+          <label className="grid aspect-square cursor-pointer place-items-center rounded-xl border border-dashed border-line text-center text-sm text-muted transition hover:border-apex hover:text-apex print:hidden">
+            <span>
+              <Camera className="mx-auto mb-2" />
+              {photoMutation.isPending ? "Загрузка…" : "Добавить фото"}
+            </span>
+            <input
+              className="sr-only"
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              capture="environment"
+              disabled={photoMutation.isPending}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) photoMutation.mutate(file);
+                event.currentTarget.value = "";
+              }}
+            />
+          </label>
+        </div>
+      </Card>
+
+      <Card>
+        <label className="grid gap-2">
+          <span className="font-black">Итоговый комментарий мастера</span>
+          <textarea
+            className={`${inputClass} min-h-28 resize-y`}
+            value={value.notes ?? ""}
+            onChange={(event) =>
+              updateLocal((current) => ({
+                ...current,
+                notes: event.target.value,
+              }))
+            }
+            onBlur={() =>
+              cardMutation.mutate({
+                mileage: value.mileage,
+                notes: value.notes,
+                status: value.status,
+              })
+            }
+            placeholder="Общее состояние автомобиля и приоритет работ"
+          />
+        </label>
+      </Card>
+
+      <Card className="diagnostic-summary">
+        <h2 className="text-xl font-black">Рекомендованные работы</h2>
+        <div className="mt-3 grid gap-2">
+          {value.items
+            .filter(
+              (item) =>
+                item.recommendation ||
+                item.status === "critical" ||
+                item.status === "attention" ||
+                item.left_status === "critical" ||
+                item.right_status === "critical",
+            )
+            .map((item) => (
+              <div
+                key={item.id}
+                className="flex flex-wrap items-center gap-2 rounded-xl bg-panel-soft p-3"
+              >
+                <span
+                  className={`size-2 rounded-full ${hasCritical(item) ? "bg-danger" : "bg-apex"}`}
+                />
+                <strong className="min-w-0 flex-1">
+                  {item.recommendation || item.label}
+                </strong>
+                {item.estimated_cost != null && (
+                  <span className="font-bold text-apex">
+                    {money(item.estimated_cost)}
+                  </span>
+                )}
+              </div>
+            ))}
+          {!value.items.some(
+            (item) => item.recommendation || hasIssue(item),
+          ) && <p className="text-muted">Проблем и рекомендаций пока нет.</p>}
+        </div>
+      </Card>
+    </article>
+  );
+}
+
+function DiagnosticRow({
+  item,
+  patch,
+}: {
+  item: DiagnosticItem;
+  patch: (input: DiagnosticItemInput) => void;
+}) {
+  const sided = item.left_status !== null || item.right_status !== null;
+  const issue = hasIssue(item);
+  return (
+    <div className="grid gap-3 p-3 sm:p-4">
+      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center">
+        <strong className="min-w-0 flex-1 break-words">{item.label}</strong>
+        {sided ? (
+          <div className="grid grid-cols-2 gap-2 print:hidden sm:min-w-[25rem]">
+            <StatusSelect
+              label="Левая сторона"
+              value={item.left_status}
+              onChange={(status) => patch({ left_status: status })}
+            />
+            <StatusSelect
+              label="Правая сторона"
+              value={item.right_status}
+              onChange={(status) => patch({ right_status: status })}
+            />
+          </div>
+        ) : (
+          <div className="w-full print:hidden sm:w-48">
+            <StatusSelect
+              label="Состояние"
+              value={item.status}
+              onChange={(status) => patch({ status })}
+            />
+          </div>
+        )}
+        <span
+          className={`hidden rounded-lg border px-2 py-1 text-xs font-bold print:inline ${statusMeta[worstStatus(item)].className}`}
+        >
+          {statusMeta[worstStatus(item)].label}
+        </span>
+      </div>
+      {issue && (
+        <div className="grid gap-2 md:grid-cols-[1fr_1fr_150px]">
+          <input
+            className={inputClass}
+            defaultValue={item.comment ?? ""}
+            onBlur={(event) => patch({ comment: event.target.value })}
+            placeholder="Что обнаружено"
+          />
+          <input
+            className={inputClass}
+            defaultValue={item.recommendation ?? ""}
+            onBlur={(event) => patch({ recommendation: event.target.value })}
+            placeholder="Рекомендованная работа"
+          />
+          <input
+            className={inputClass}
+            type="number"
+            min="0"
+            defaultValue={item.estimated_cost ?? ""}
+            onBlur={(event) =>
+              patch({
+                estimated_cost: event.target.value
+                  ? Number(event.target.value)
+                  : null,
+              })
+            }
+            placeholder="Стоимость"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatusSelect({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: DiagnosticStatus | null;
+  onChange: (status: DiagnosticStatus) => void;
+}) {
+  const status = value ?? "unchecked";
+  return (
+    <label className="grid min-w-0 gap-1">
+      <span className="text-[11px] font-semibold text-muted">{label}</span>
+      <select
+        aria-label={label}
+        value={status}
+        onChange={(event) => onChange(event.target.value as DiagnosticStatus)}
+        className={`min-h-11 min-w-0 rounded-xl border px-3 text-sm font-bold outline-none focus:ring-2 focus:ring-apex/30 ${statusMeta[status].className}`}
+      >
+        {statusOrder.map((option) => (
+          <option key={option} value={option} className="bg-panel text-white">
+            {statusMeta[option].label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+function ProgressRing({ checked, total }: { checked: number; total: number }) {
+  const percent = total ? Math.round((checked / total) * 100) : 0;
+  return (
+    <div
+      className="relative grid size-28 place-items-center rounded-full"
+      style={{ background: `conic-gradient(#ffd600 ${percent}%, #26313c 0)` }}
+    >
+      <div className="grid size-20 place-items-center rounded-full bg-panel text-center">
+        <span>
+          <strong className="block text-2xl">{checked}</strong>
+          <small className="text-muted">из {total}</small>
+        </span>
+      </div>
+    </div>
+  );
+}
+function Stat({
+  label,
+  value,
+  color,
+  icon,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: number;
+  color: string;
+  icon: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button type="button" onClick={onClick} aria-pressed={active} className={`flex min-w-0 items-center gap-3 rounded-2xl border bg-panel p-3 text-left shadow-card transition hover:border-apex/60 ${active ? "border-apex ring-2 ring-apex/20" : "border-line"}`}>
+      <span className={`${color} [&>svg]:size-5`}>{icon}</span>
+      <span>
+        <strong className="block text-xl">{value}</strong>
+        <small className="text-muted">{label}</small>
+      </span>
+    </button>
+  );
+}
+function statusDescription(item: DiagnosticItem) {
+  if (item.left_status !== null || item.right_status !== null) {
+    return `Левая: ${statusMeta[item.left_status ?? "unchecked"].label} · Правая: ${statusMeta[item.right_status ?? "unchecked"].label}`;
+  }
+  return statusMeta[item.status].label;
+}
+function isChecked(item: DiagnosticItem) {
+  return (
+    item.status !== "unchecked" ||
+    (item.left_status != null && item.left_status !== "unchecked") ||
+    (item.right_status != null && item.right_status !== "unchecked")
+  );
+}
+function hasCritical(item: DiagnosticItem) {
+  return (
+    item.status === "critical" ||
+    item.left_status === "critical" ||
+    item.right_status === "critical"
+  );
+}
+function hasIssue(item: DiagnosticItem) {
+  return (
+    hasCritical(item) ||
+    item.status === "attention" ||
+    item.left_status === "attention" ||
+    item.right_status === "attention"
+  );
+}
+function worstStatus(item: DiagnosticItem): DiagnosticStatus {
+  const values = [item.status, item.left_status, item.right_status].filter(
+    Boolean,
+  ) as DiagnosticStatus[];
+  return values.includes("critical")
+    ? "critical"
+    : values.includes("attention")
+      ? "attention"
+      : values.includes("ok")
+        ? "ok"
+        : "unchecked";
+}
+function summarize(items: DiagnosticItem[]) {
+  return items.reduce(
+    (result, item) => {
+      result[worstStatus(item)] += 1;
+      return result;
+    },
+    { unchecked: 0, ok: 0, attention: 0, critical: 0 },
+  );
+}

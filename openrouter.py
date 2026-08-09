@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Generic, TypeVar
@@ -73,6 +74,17 @@ class ReceiptAnalysis:
     document_type: str
     items: list[ReceiptItem]
     total_cost: int | None
+
+
+@dataclass(frozen=True)
+class VehicleDocumentAnalysis:
+    document_type: str
+    vin: str | None
+    plate_number: str | None
+    brand: str | None
+    model: str | None
+    year: int | None
+    confidence: str
 
 
 COMMAND_SCHEMA = {
@@ -179,6 +191,76 @@ RECEIPT_SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+
+VEHICLE_DOCUMENT_SCHEMA = {
+    "name": "vehicle_document_recognition",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "document_type": {"type": "string", "enum": ["vin_plate", "pts", "sts", "vin_text", "unknown"]},
+            "vin": {"type": ["string", "null"]},
+            "plate_number": {"type": ["string", "null"]},
+            "brand": {"type": ["string", "null"]},
+            "model": {"type": ["string", "null"]},
+            "year": {"type": ["integer", "null"], "minimum": 1900, "maximum": 2100},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        },
+        "required": ["document_type", "vin", "plate_number", "brand", "model", "year", "confidence"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def analyze_vehicle_document(
+    api_key: str, model: str, *, image: bytes | None = None,
+    mime_type: str | None = None, vin_hint: str | None = None,
+) -> AIResponse[VehicleDocumentAnalysis]:
+    """Read a VIN plate or Russian PTS/STS and return only confident vehicle fields."""
+    prompt = """Recognize vehicle data. The input is either a photo of a VIN marking,
+Russian PTS/STS vehicle document, or a manually entered VIN. Return VIN as exactly 17
+uppercase Latin letters/digits (VIN never contains I, O or Q), Russian plate when visible,
+manufacturer brand, commercial model, and model year. For a VIN-only input, decode brand,
+model and year only when confidently supported by the VIN structure; otherwise return null.
+Never invent obscured or uncertain characters. Do not return owner personal data."""
+    content: list[dict[str, object]] = [{"type": "text", "text": f"{prompt}\nVIN input: {vin_hint or 'not provided'}"}]
+    if image is not None and mime_type:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{base64.b64encode(image).decode('ascii')}"},
+        })
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_schema", "json_schema": VEHICLE_DOCUMENT_SCHEMA},
+        "provider": {"require_parameters": True},
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{API_URL}/chat/completions", headers=_headers(api_key), json=payload,
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as response:
+            body = await response.text()
+    if response.status >= 400:
+        raise OpenRouterError(f"OpenRouter returned error {response.status}: {body[:300]}")
+    try:
+        data = json.loads(body)
+        raw = data["choices"][0]["message"]["content"]
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        vin = re.sub(r"[^A-HJ-NPR-Z0-9]", "", str(parsed.get("vin") or "").upper()) or None
+        if vin is not None and len(vin) != 17:
+            vin = None
+        analysis = VehicleDocumentAnalysis(
+            document_type=parsed["document_type"], vin=vin,
+            plate_number=parsed.get("plate_number"), brand=parsed.get("brand"),
+            model=parsed.get("model"), year=parsed.get("year"),
+            confidence=parsed["confidence"],
+        )
+        actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
+        return AIResponse(analysis, actual_model, input_tokens, output_tokens, cost_usd)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OpenRouterError("Could not recognize vehicle data.") from error
 
 
 async def analyze_receipt_image(api_key: str, image: bytes, mime_type: str, model: str) -> AIResponse[ReceiptAnalysis]:

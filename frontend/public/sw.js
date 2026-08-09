@@ -1,4 +1,4 @@
-const CACHE = "apex-react-shell-v2";
+const CACHE = "apex-react-shell-v12";
 const SHELL = ["/", "/manifest.webmanifest", "/assets/icons/icon-192.png"];
 self.addEventListener("install", (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))).then(() => self.clients.claim())));

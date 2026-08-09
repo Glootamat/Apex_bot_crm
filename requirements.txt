@@ -4,3 +4,5 @@ aiohttp>=3.9,<4.0
 tzdata>=2025.1
 fastapi>=0.116,<1.0
 uvicorn>=0.35,<1.0
+psycopg[binary]>=3.2,<4.0
+reportlab>=4.2,<5.0

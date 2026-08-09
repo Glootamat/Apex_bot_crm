@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import math
+from psycopg import IntegrityError as PostgresIntegrityError
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -234,9 +237,14 @@ class AppointmentSaveResult:
 
 class Database:
     def __init__(self, path: str | Path = "workshop.sqlite3") -> None:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        self.database_url = database_url if database_url.startswith(("postgresql://", "postgres://")) else None
         self.path = Path(path)
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self):
+        if self.database_url:
+            from postgres_backend import PostgresConnection
+            return PostgresConnection(self.database_url)
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -475,6 +483,7 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'scheduled',
                     agreed_amount INTEGER CHECK (agreed_amount IS NULL OR agreed_amount >= 0),
                     parts_source TEXT,
+                    archived_at TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE SET NULL
@@ -507,6 +516,46 @@ class Database:
                     PRIMARY KEY (chat_id, message_id),
                     FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE CASCADE,
                     FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS diagnostics (
+                    id INTEGER PRIMARY KEY,
+                    car_id INTEGER NOT NULL,
+                    service_order_id INTEGER,
+                    mileage INTEGER,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    notes TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TEXT,
+                    FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE,
+                    FOREIGN KEY (service_order_id) REFERENCES service_orders(id) ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS diagnostic_items (
+                    id INTEGER PRIMARY KEY,
+                    diagnostic_id INTEGER NOT NULL,
+                    section_key TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unchecked',
+                    left_status TEXT,
+                    right_status TEXT,
+                    comment TEXT,
+                    recommendation TEXT,
+                    estimated_cost INTEGER,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id) ON DELETE CASCADE,
+                    UNIQUE(diagnostic_id, item_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS diagnostic_photos (
+                    id INTEGER PRIMARY KEY,
+                    diagnostic_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    caption TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (diagnostic_id) REFERENCES diagnostics(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -584,6 +633,8 @@ class Database:
                 connection.execute("ALTER TABLE appointments ADD COLUMN is_flexible INTEGER NOT NULL DEFAULT 0")
             if "parts_source" not in appointment_columns:
                 connection.execute("ALTER TABLE appointments ADD COLUMN parts_source TEXT")
+            if "archived_at" not in appointment_columns:
+                connection.execute("ALTER TABLE appointments ADD COLUMN archived_at TEXT")
             connection.execute(
                 """UPDATE appointments SET status = 'completed'
                    WHERE status = 'in_progress' AND service_order_id IN (
@@ -607,9 +658,6 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_orders_car_status ON service_orders(car_id, status, archived_at);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON service_orders(created_at);
                 CREATE INDEX IF NOT EXISTS idx_appointments_start_status ON appointments(starts_at, status);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_appointments_unique_active_slot
-                    ON appointments(car_id, starts_at)
-                    WHERE status IN ('scheduled', 'in_progress');
                 CREATE INDEX IF NOT EXISTS idx_parts_order ON part_items(service_order_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_order_photos_unique_file
                     ON order_photos(service_order_id, telegram_file_id, photo_type);
@@ -622,8 +670,18 @@ class Database:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_service_card_order
                     ON service_message_cards(chat_id, service_order_id)
                     WHERE service_order_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_car ON diagnostics(car_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_order ON diagnostics(service_order_id);
+                CREATE INDEX IF NOT EXISTS idx_diagnostic_items_diagnostic ON diagnostic_items(diagnostic_id, section_key);
                 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
                 """
+            )
+            # Archived appointments must not reserve calendar slots.
+            connection.execute("DROP INDEX IF EXISTS idx_appointments_unique_active_slot")
+            connection.execute(
+                """CREATE UNIQUE INDEX idx_appointments_unique_active_slot
+                   ON appointments(car_id, starts_at)
+                   WHERE status IN ('scheduled', 'in_progress') AND archived_at IS NULL"""
             )
             for row in connection.execute("SELECT id, phone FROM customers WHERE phone IS NOT NULL"):
                 connection.execute(
@@ -841,7 +899,7 @@ class Database:
                    FROM appointments a JOIN cars c ON c.id = a.car_id
                    JOIN users u ON u.id = c.user_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id
-                   WHERE u.telegram_id = ? AND c.archived_at IS NULL
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL AND a.archived_at IS NULL
                    ORDER BY a.id DESC LIMIT 150""",
                 (telegram_id,),
             ).fetchall()]
@@ -890,7 +948,7 @@ class Database:
             if cursor.rowcount == 0:
                 existing = connection.execute(
                     """SELECT id FROM appointments
-                       WHERE car_id = ? AND starts_at = ?
+                       WHERE car_id = ? AND starts_at = ? AND archived_at IS NULL
                          AND status IN ('scheduled', 'in_progress')
                        ORDER BY id LIMIT 1""",
                     (car_id, starts_at),
@@ -918,7 +976,7 @@ class Database:
         try:
             row = connection.execute(
                 """SELECT id FROM appointments
-                   WHERE car_id = ? AND starts_at = ?
+                   WHERE car_id = ? AND starts_at = ? AND archived_at IS NULL
                      AND status IN ('scheduled', 'in_progress')
                    ORDER BY id LIMIT 1""",
                 (car_id, starts_at),
@@ -942,8 +1000,31 @@ class Database:
                    LEFT JOIN customers cu ON cu.id = c.customer_id
                    LEFT JOIN service_orders o ON o.id = a.service_order_id
                    WHERE u.telegram_id = ?
-                     AND a.status = 'scheduled'
+                     AND a.status = 'scheduled' AND a.archived_at IS NULL
                    ORDER BY a.starts_at LIMIT ?""",
+                (telegram_id, limit),
+            ).fetchall()
+            return [AppointmentOverview(**dict(row)) for row in rows]
+        finally:
+            connection.close()
+
+    def get_recent_appointments_for_telegram_user(
+        self, telegram_id: int, limit: int = 300
+    ) -> list[AppointmentOverview]:
+        """Return appointment history for CRM cards, newest visit first."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description, a.starts_at,
+                          a.status, c.brand, c.model, c.plate_number,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone,
+                          a.agreed_amount, a.is_flexible, a.parts_source
+                   FROM appointments a
+                   JOIN cars c ON c.id = a.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL AND a.archived_at IS NULL
+                   ORDER BY datetime(a.starts_at) DESC, a.id DESC LIMIT ?""",
                 (telegram_id, limit),
             ).fetchall()
             return [AppointmentOverview(**dict(row)) for row in rows]
@@ -964,7 +1045,7 @@ class Database:
                    JOIN cars c ON c.id = a.car_id
                    JOIN users u ON u.id = c.user_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id
-                   WHERE u.telegram_id = ? AND a.id = ?""",
+                   WHERE u.telegram_id = ? AND a.id = ? AND a.archived_at IS NULL""",
                 (telegram_id, appointment_id),
             ).fetchone()
             return AppointmentOverview(**dict(row)) if row is not None else None
@@ -1223,7 +1304,7 @@ class Database:
         connection = self.connect()
         try:
             customers = [dict(row) for row in connection.execute(
-                """SELECT c.id, c.full_name, c.phone,
+                """SELECT c.id, c.user_id, c.full_name, c.phone,
                           (SELECT GROUP_CONCAT(cp.phone, ' ') FROM customer_phones cp
                            WHERE cp.customer_id = c.id) AS extra_phones,
                           (SELECT GROUP_CONCAT(cn.note_text, ' ') FROM customer_notes cn
@@ -1233,7 +1314,7 @@ class Database:
                    ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             cars = [dict(row) for row in connection.execute(
-                """SELECT c.id, c.customer_id, c.brand, c.model, c.year,
+                """SELECT c.id, c.user_id, c.customer_id, c.brand, c.model, c.year,
                           c.plate_number, c.vin, c.mileage, c.next_service_date,
                           c.next_service_mileage,
                           cu.full_name AS customer_name, cu.phone AS customer_phone,
@@ -1246,10 +1327,10 @@ class Database:
                    ORDER BY c.id DESC""", (telegram_id,)
             ).fetchall()]
             orders = [dict(row) for row in connection.execute(
-                """SELECT o.id, o.description, o.status, o.concern, o.agreed_amount,
+                """SELECT o.id, o.car_id, o.description, o.status, o.concern, o.agreed_amount,
                           o.recommendations, o.labor_revenue, o.parts_cost,
                           o.parts_revenue, o.parts_profit, o.parts_source,
-                          o.created_at, o.completed_at, o.mileage_at_visit,
+                          o.created_at, o.completed_at, o.archived_at, o.mileage_at_visit,
                           c.brand, c.model, c.year, c.plate_number, c.vin, c.mileage,
                           c.next_service_date, c.next_service_mileage,
                           cu.full_name AS customer_name, cu.phone AS customer_phone,
@@ -1273,6 +1354,18 @@ class Database:
                    LEFT JOIN customers cu ON cu.id = c.customer_id
                    WHERE u.telegram_id = ? AND o.archived_at IS NULL
                    ORDER BY o.id DESC""", (telegram_id,)
+            ).fetchall()]
+            appointments = [dict(row) for row in connection.execute(
+                """SELECT a.id, a.car_id, a.service_order_id, a.description,
+                          a.starts_at, a.status, c.brand, c.model, c.plate_number,
+                          cu.full_name AS customer_name, cu.phone AS customer_phone,
+                          a.agreed_amount, a.is_flexible, a.parts_source
+                   FROM appointments a
+                   JOIN cars c ON c.id = a.car_id
+                   JOIN users u ON u.id = c.user_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE u.telegram_id = ? AND c.archived_at IS NULL AND a.archived_at IS NULL
+                   ORDER BY a.id DESC""", (telegram_id,)
             ).fetchall()]
         finally:
             connection.close()
@@ -1370,6 +1463,15 @@ class Database:
                 row["part_details"], row["receipt_totals"],
             ]
 
+        ranked_orders = ranked(orders, order_search_values)
+        for row in ranked_orders:
+            parts_margin = (
+                int(row["parts_profit"] or 0)
+                if int(row["parts_revenue"] or 0) == 0
+                else int(row["parts_revenue"] or 0) - int(row["parts_cost"] or 0)
+                     + int(row["parts_profit"] or 0)
+            )
+            row["profit"] = int(row["labor_revenue"] or 0) + parts_margin
         return {
             "customers": ranked(customers, lambda row: [
                 row["full_name"], row["phone"], row["extra_phones"], row["notes"],
@@ -1381,7 +1483,12 @@ class Database:
                 row["customer_phone"], row["customer_extra_phones"],
                 row["customer_notes"],
             ]),
-            "orders": ranked(orders, order_search_values),
+            "orders": ranked_orders,
+            "appointments": ranked(appointments, lambda row: [
+                row["description"], row["starts_at"], row["status"],
+                row["brand"], row["model"], row["plate_number"],
+                row["customer_name"], row["customer_phone"],
+            ]),
         }
 
     def log_ai_usage(self, task_type: str, model: str, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
@@ -1791,9 +1898,28 @@ class Database:
             car_ids = [row["id"] for row in connection.execute("SELECT id FROM cars WHERE user_id = ? AND customer_id = ?", (user_id, customer_id)).fetchall()]
             for car_id in car_ids:
                 connection.execute("UPDATE service_orders SET archived_at = CURRENT_TIMESTAMP WHERE car_id = ?", (car_id,))
+                connection.execute("UPDATE appointments SET archived_at = CURRENT_TIMESTAMP WHERE car_id = ? AND archived_at IS NULL", (car_id,))
             connection.executemany("UPDATE cars SET archived_at = CURRENT_TIMESTAMP WHERE id = ?", [(car_id,) for car_id in car_ids])
             cursor = connection.execute("UPDATE customers SET archived_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND archived_at IS NULL", (customer_id, user_id))
             self._write_audit(connection, user_id, "customer", customer_id, "archived")
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def delete_appointment(self, user_id: int, appointment_id: int) -> bool:
+        """Move an unstarted preliminary appointment to the trash."""
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                """UPDATE appointments SET archived_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND status = 'scheduled' AND service_order_id IS NULL
+                     AND archived_at IS NULL
+                     AND car_id IN (SELECT id FROM cars WHERE user_id = ?)""",
+                (appointment_id, user_id),
+            )
+            if cursor.rowcount:
+                self._write_audit(connection, user_id, "appointment", appointment_id, "archived")
             connection.commit()
             return cursor.rowcount > 0
         finally:
@@ -1803,6 +1929,7 @@ class Database:
         connection = self.connect()
         try:
             connection.execute("UPDATE service_orders SET archived_at = CURRENT_TIMESTAMP WHERE car_id = ?", (car_id,))
+            connection.execute("UPDATE appointments SET archived_at = CURRENT_TIMESTAMP WHERE car_id = ? AND archived_at IS NULL", (car_id,))
             cursor = connection.execute("UPDATE cars SET archived_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND archived_at IS NULL", (car_id, user_id))
             self._write_audit(connection, user_id, "car", car_id, "archived")
             connection.commit()
@@ -1883,6 +2010,31 @@ class Database:
                 (service_order_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def get_order_photos_for_telegram_user(
+        self, telegram_id: int
+    ) -> dict[int, list[dict[str, object]]]:
+        """Load all order attachments in one query for the PWA snapshot."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT op.id, op.service_order_id, op.telegram_file_id,
+                          op.caption, op.photo_type, op.created_at
+                   FROM order_photos op
+                   JOIN service_orders o ON o.id = op.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   JOIN users u ON u.id = c.user_id
+                   WHERE u.telegram_id = ? AND o.archived_at IS NULL
+                   ORDER BY op.id""",
+                (telegram_id,),
+            ).fetchall()
+            result: dict[int, list[dict[str, object]]] = {}
+            for row in rows:
+                item = dict(row)
+                result.setdefault(int(item["service_order_id"]), []).append(item)
+            return result
         finally:
             connection.close()
 
@@ -2028,6 +2180,40 @@ class Database:
         finally:
             connection.close()
 
+    def add_catalog_part(
+        self, service_order_id: int, name: str, article: str, quantity: int,
+        unit_cost: int, markup_percent: float, round_to: int = 0,
+    ) -> PartItem:
+        """Add a priced catalog item and roll its purchase/sale totals into the order."""
+        total_cost = unit_cost * quantity
+        raw_unit_sale = unit_cost * (1 + markup_percent / 100)
+        unit_sale = math.ceil(raw_unit_sale / round_to) * round_to if round_to else round(raw_unit_sale)
+        sale_total = unit_sale * quantity
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                """INSERT INTO part_items
+                   (service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (service_order_id, name, article, quantity, unit_cost, total_cost, markup_percent),
+            )
+            connection.execute(
+                """UPDATE service_orders
+                   SET parts_cost = parts_cost + ?, parts_revenue = parts_revenue + ?, parts_source = 'workshop'
+                   WHERE id = ?""",
+                (total_cost, sale_total, service_order_id),
+            )
+            connection.commit()
+            row = connection.execute(
+                """SELECT id, service_order_id, name, article, quantity, unit_cost,
+                          total_cost, markup_percent FROM part_items WHERE id = ?""",
+                (cursor.lastrowid,),
+            ).fetchone()
+            assert row is not None
+            return PartItem(**dict(row))
+        finally:
+            connection.close()
+
     def apply_markup_to_unmarked_parts(self, service_order_id: int, percent: float) -> tuple[int, int, int]:
         """Apply a margin once to receipt-derived positions not marked up before."""
         connection = self.connect()
@@ -2090,7 +2276,7 @@ class Database:
                           (SELECT COUNT(*) FROM appointments a
                            JOIN cars ac ON ac.id = a.car_id
                            JOIN users au ON au.id = ac.user_id
-                           WHERE au.telegram_id = ? AND a.status = 'no_show') AS no_shows,
+                           WHERE au.telegram_id = ? AND a.status = 'no_show' AND a.archived_at IS NULL) AS no_shows,
                           COALESCE(SUM(o.labor_revenue), 0) AS labor_revenue,
                           COALESCE(SUM(o.parts_revenue), 0) AS parts_revenue, COALESCE(SUM(o.parts_cost), 0) AS parts_cost,
                           COALESCE(SUM(o.parts_profit), 0) AS parts_profit,
@@ -2116,7 +2302,8 @@ class Database:
             row = connection.execute(
                 """SELECT a.id, a.car_id, a.service_order_id, a.description, a.agreed_amount, a.parts_source
                    FROM appointments a JOIN cars c ON c.id = a.car_id
-                   WHERE a.id = ? AND c.user_id = ? AND a.status IN ('scheduled', 'in_progress')""",
+                   WHERE a.id = ? AND c.user_id = ? AND a.status IN ('scheduled', 'in_progress')
+                     AND a.archived_at IS NULL""",
                 (appointment_id, user_id),
             ).fetchone()
             if row is None:
@@ -2155,7 +2342,8 @@ class Database:
             row = connection.execute(
                 """SELECT a.id, a.car_id, a.service_order_id, a.description, a.agreed_amount
                    FROM appointments a JOIN cars c ON c.id = a.car_id
-                   WHERE a.id = ? AND c.user_id = ? AND a.status = 'scheduled'""",
+                   WHERE a.id = ? AND c.user_id = ? AND a.status = 'scheduled'
+                     AND a.archived_at IS NULL""",
                 (appointment_id, user_id),
             ).fetchone()
             if row is None:
@@ -2262,6 +2450,282 @@ class Database:
         finally:
             connection.close()
 
+    def get_trash(self, user_id: int) -> list[dict[str, object]]:
+        """Return all recoverable records owned by the user, newest first."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """SELECT 'customer' AS kind, cu.id, cu.full_name AS title,
+                          COALESCE(cu.phone, '') AS subtitle, cu.archived_at
+                   FROM customers cu
+                   WHERE cu.user_id = ? AND cu.archived_at IS NOT NULL
+                   UNION ALL
+                   SELECT 'car', c.id, trim(c.brand || ' ' || c.model),
+                          COALESCE(c.plate_number, ''), c.archived_at
+                   FROM cars c
+                   WHERE c.user_id = ? AND c.archived_at IS NOT NULL
+                   UNION ALL
+                   SELECT 'appointment', a.id, a.description,
+                          trim(c.brand || ' ' || c.model), a.archived_at
+                   FROM appointments a JOIN cars c ON c.id = a.car_id
+                   WHERE c.user_id = ? AND a.archived_at IS NOT NULL
+                   UNION ALL
+                   SELECT 'order', o.id, o.description,
+                          trim(c.brand || ' ' || c.model), o.archived_at
+                   FROM service_orders o JOIN cars c ON c.id = o.car_id
+                   WHERE c.user_id = ? AND o.archived_at IS NOT NULL
+                   ORDER BY archived_at DESC""",
+                (user_id, user_id, user_id, user_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def restore_archived(self, user_id: int, kind: str, entity_id: int) -> bool:
+        """Restore one record and any archived parents required to make it visible."""
+        tables = {"customer": "customers", "car": "cars", "appointment": "appointments", "order": "service_orders"}
+        if kind not in tables:
+            raise ValueError("Unknown archived entity type")
+        connection = self.connect()
+        try:
+            if kind == "customer":
+                cursor = connection.execute(
+                    "UPDATE customers SET archived_at = NULL WHERE id = ? AND user_id = ? AND archived_at IS NOT NULL",
+                    (entity_id, user_id),
+                )
+            elif kind == "car":
+                row = connection.execute("SELECT customer_id FROM cars WHERE id = ? AND user_id = ? AND archived_at IS NOT NULL", (entity_id, user_id)).fetchone()
+                if row is None:
+                    return False
+                if row["customer_id"] is not None:
+                    connection.execute("UPDATE customers SET archived_at = NULL WHERE id = ? AND user_id = ?", (row["customer_id"], user_id))
+                cursor = connection.execute("UPDATE cars SET archived_at = NULL WHERE id = ? AND user_id = ?", (entity_id, user_id))
+            else:
+                table = tables[kind]
+                row = connection.execute(
+                    f"""SELECT x.car_id, c.customer_id FROM {table} x JOIN cars c ON c.id = x.car_id
+                        WHERE x.id = ? AND c.user_id = ? AND x.archived_at IS NOT NULL""",
+                    (entity_id, user_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                if row["customer_id"] is not None:
+                    connection.execute("UPDATE customers SET archived_at = NULL WHERE id = ? AND user_id = ?", (row["customer_id"], user_id))
+                connection.execute("UPDATE cars SET archived_at = NULL WHERE id = ? AND user_id = ?", (row["car_id"], user_id))
+                try:
+                    cursor = connection.execute(f"UPDATE {table} SET archived_at = NULL WHERE id = ?", (entity_id,))
+                except (sqlite3.IntegrityError, PostgresIntegrityError):
+                    connection.rollback()
+                    return False
+            if cursor.rowcount:
+                self._write_audit(connection, user_id, kind, entity_id, "restored")
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def start_diagnostic(
+        self, user_id: int, car_id: int, service_order_id: int | None,
+        checklist: list[tuple[str, str, str, bool]],
+    ) -> dict[str, object] | None:
+        """Open the existing draft or create a ready-to-use diagnostic checklist."""
+        connection = self.connect()
+        try:
+            car = connection.execute(
+                "SELECT id, mileage FROM cars WHERE id = ? AND user_id = ? AND archived_at IS NULL",
+                (car_id, user_id),
+            ).fetchone()
+            if car is None:
+                return None
+            if service_order_id is not None and connection.execute(
+                """SELECT 1 FROM service_orders o JOIN cars c ON c.id = o.car_id
+                   WHERE o.id = ? AND o.car_id = ? AND c.user_id = ? AND o.archived_at IS NULL""",
+                (service_order_id, car_id, user_id),
+            ).fetchone() is None:
+                return None
+            existing = connection.execute(
+                """SELECT id FROM diagnostics WHERE car_id = ? AND status = 'draft'
+                   AND COALESCE(service_order_id, 0) = COALESCE(?, 0)
+                   ORDER BY id DESC LIMIT 1""",
+                (car_id, service_order_id),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    "INSERT INTO diagnostics (car_id, service_order_id, mileage) VALUES (?, ?, ?)",
+                    (car_id, service_order_id, car["mileage"]),
+                )
+                diagnostic_id = int(cursor.lastrowid)
+                connection.executemany(
+                    """INSERT INTO diagnostic_items
+                       (diagnostic_id, section_key, item_key, label, left_status, right_status)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        (diagnostic_id, section, key, label, "unchecked" if sided else None, "unchecked" if sided else None)
+                        for section, key, label, sided in checklist
+                    ],
+                )
+                self._write_audit(connection, user_id, "diagnostic", diagnostic_id, "created")
+                connection.commit()
+            else:
+                diagnostic_id = int(existing["id"])
+        finally:
+            connection.close()
+        return self.get_diagnostic(user_id, diagnostic_id)
+
+    def get_diagnostic(self, user_id: int, diagnostic_id: int) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT d.*, c.brand, c.model, c.year, c.plate_number, c.vin,
+                          cu.full_name AS customer_name
+                   FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                   LEFT JOIN customers cu ON cu.id = c.customer_id
+                   WHERE d.id = ? AND c.user_id = ?""",
+                (diagnostic_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["items"] = [dict(item) for item in connection.execute(
+                """SELECT id, section_key, item_key, label, status, left_status,
+                          right_status, comment, recommendation, estimated_cost, updated_at
+                   FROM diagnostic_items WHERE diagnostic_id = ? ORDER BY id""",
+                (diagnostic_id,),
+            ).fetchall()]
+            result["photos"] = [dict(photo) for photo in connection.execute(
+                "SELECT id, filename, caption, created_at FROM diagnostic_photos WHERE diagnostic_id = ? ORDER BY id",
+                (diagnostic_id,),
+            ).fetchall()]
+            return result
+        finally:
+            connection.close()
+
+    def list_diagnostics(self, user_id: int, car_id: int | None = None) -> list[dict[str, object]]:
+        connection = self.connect()
+        try:
+            condition = " AND d.car_id = ?" if car_id is not None else ""
+            params: tuple[object, ...] = (user_id, car_id) if car_id is not None else (user_id,)
+            rows = connection.execute(
+                f"""SELECT d.id, d.car_id, d.service_order_id, d.mileage, d.status,
+                           d.created_at, d.updated_at, d.completed_at, c.brand, c.model,
+                           c.plate_number,
+                           SUM(CASE WHEN di.status != 'unchecked' OR COALESCE(di.left_status, 'unchecked') != 'unchecked' OR COALESCE(di.right_status, 'unchecked') != 'unchecked' THEN 1 ELSE 0 END) AS checked,
+                           COUNT(di.id) AS total,
+                           SUM(CASE WHEN di.status = 'critical' OR di.left_status = 'critical' OR di.right_status = 'critical' THEN 1 ELSE 0 END) AS critical,
+                           SUM(CASE WHEN di.status = 'attention' OR di.left_status = 'attention' OR di.right_status = 'attention' THEN 1 ELSE 0 END) AS attention
+                    FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                    LEFT JOIN diagnostic_items di ON di.diagnostic_id = d.id
+                    WHERE c.user_id = ?{condition}
+                    GROUP BY d.id ORDER BY d.id DESC LIMIT 100""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def update_diagnostic_item(
+        self, user_id: int, diagnostic_id: int, item_key: str, **values: object,
+    ) -> dict[str, object] | None:
+        allowed = {"status", "left_status", "right_status", "comment", "recommendation", "estimated_cost"}
+        updates = {key: value for key, value in values.items() if key in allowed}
+        for key in ("status", "left_status", "right_status"):
+            if key in updates and updates[key] is not None and updates[key] not in {"unchecked", "ok", "attention", "critical"}:
+                raise ValueError("Unknown diagnostic status")
+        connection = self.connect()
+        try:
+            if connection.execute(
+                """SELECT 1 FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                   WHERE d.id = ? AND c.user_id = ?""", (diagnostic_id, user_id)
+            ).fetchone() is None:
+                return None
+            if updates:
+                assignments = ", ".join(f"{key} = ?" for key in updates)
+                connection.execute(
+                    f"UPDATE diagnostic_items SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE diagnostic_id = ? AND item_key = ?",
+                    (*updates.values(), diagnostic_id, item_key),
+                )
+                connection.execute("UPDATE diagnostics SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (diagnostic_id,))
+                connection.commit()
+            row = connection.execute(
+                "SELECT * FROM diagnostic_items WHERE diagnostic_id = ? AND item_key = ?",
+                (diagnostic_id, item_key),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def update_diagnostic(
+        self, user_id: int, diagnostic_id: int, *, mileage: int | None,
+        notes: str | None, status: str,
+    ) -> dict[str, object] | None:
+        if status not in {"draft", "completed"}:
+            raise ValueError("Unknown diagnostic state")
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                """UPDATE diagnostics SET mileage = ?, notes = ?, status = ?,
+                          updated_at = CURRENT_TIMESTAMP,
+                          completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE NULL END
+                   WHERE id = ? AND car_id IN (SELECT id FROM cars WHERE user_id = ?)""",
+                (mileage, notes, status, status, diagnostic_id, user_id),
+            )
+            if cursor.rowcount:
+                self._write_audit(connection, user_id, "diagnostic", diagnostic_id, status)
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_diagnostic(user_id, diagnostic_id) if cursor.rowcount else None
+
+    def delete_diagnostic(self, user_id: int, diagnostic_id: int) -> list[str] | None:
+        """Delete a diagnostic owned by the user and return its stored photo names."""
+        connection = self.connect()
+        try:
+            owned = connection.execute(
+                """SELECT 1 FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                   WHERE d.id = ? AND c.user_id = ?""",
+                (diagnostic_id, user_id),
+            ).fetchone()
+            if owned is None:
+                return None
+            filenames = [
+                str(row["filename"])
+                for row in connection.execute(
+                    "SELECT filename FROM diagnostic_photos WHERE diagnostic_id = ?",
+                    (diagnostic_id,),
+                ).fetchall()
+            ]
+            connection.execute("DELETE FROM diagnostic_photos WHERE diagnostic_id = ?", (diagnostic_id,))
+            connection.execute("DELETE FROM diagnostic_items WHERE diagnostic_id = ?", (diagnostic_id,))
+            connection.execute("DELETE FROM diagnostics WHERE id = ?", (diagnostic_id,))
+            self._write_audit(connection, user_id, "diagnostic", diagnostic_id, "deleted")
+            connection.commit()
+            return filenames
+        finally:
+            connection.close()
+
+    def add_diagnostic_photo(
+        self, user_id: int, diagnostic_id: int, filename: str, caption: str | None,
+    ) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            if connection.execute(
+                """SELECT 1 FROM diagnostics d JOIN cars c ON c.id = d.car_id
+                   WHERE d.id = ? AND c.user_id = ?""", (diagnostic_id, user_id)
+            ).fetchone() is None:
+                return None
+            cursor = connection.execute(
+                "INSERT INTO diagnostic_photos (diagnostic_id, filename, caption) VALUES (?, ?, ?)",
+                (diagnostic_id, filename, caption),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT id, filename, caption, created_at FROM diagnostic_photos WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            return dict(row)
+        finally:
+            connection.close()
+
     def count_archived(self, user_id: int, older_than_days: int | None = None) -> dict[str, int]:
         connection = self.connect()
         try:
@@ -2280,7 +2744,12 @@ class Database:
                 f"SELECT COUNT(*) FROM customers WHERE user_id = ? AND archived_at IS NOT NULL{age_sql}",
                 params,
             ).fetchone()[0]
-            return {"orders": int(orders), "cars": int(cars), "customers": int(customers)}
+            appointments = connection.execute(
+                f"""SELECT COUNT(*) FROM appointments WHERE archived_at IS NOT NULL
+                    AND car_id IN (SELECT id FROM cars WHERE user_id = ?){age_sql}""",
+                params,
+            ).fetchone()[0]
+            return {"orders": int(orders), "cars": int(cars), "customers": int(customers), "appointments": int(appointments)}
         finally:
             connection.close()
 
@@ -2290,6 +2759,11 @@ class Database:
         try:
             age_sql = "" if older_than_days is None else " AND datetime(archived_at) < datetime('now', ?)"
             params: tuple[object, ...] = (user_id,) if older_than_days is None else (user_id, f"-{older_than_days} days")
+            appointment_cursor = connection.execute(
+                f"""DELETE FROM appointments WHERE archived_at IS NOT NULL
+                    AND car_id IN (SELECT id FROM cars WHERE user_id = ?){age_sql}""",
+                params,
+            )
             order_cursor = connection.execute(
                 f"""DELETE FROM service_orders WHERE archived_at IS NOT NULL
                     AND car_id IN (SELECT id FROM cars WHERE user_id = ?){age_sql}""",
@@ -2306,6 +2780,7 @@ class Database:
                 params,
             )
             result = {
+                "appointments": int(appointment_cursor.rowcount),
                 "orders": int(order_cursor.rowcount),
                 "cars": int(car_cursor.rowcount),
                 "customers": int(customer_cursor.rowcount),

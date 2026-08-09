@@ -11,6 +11,9 @@ const CustomersPage = lazy(() => import("../pages/CustomersPage").then((module) 
 const CarsPage = lazy(() => import("../pages/CarsPage").then((module) => ({ default: module.CarsPage })));
 const FinancePage = lazy(() => import("../pages/FinancePage").then((module) => ({ default: module.FinancePage })));
 const SearchPage = lazy(() => import("../pages/SearchPage").then((module) => ({ default: module.SearchPage })));
+const TrashPage = lazy(() => import("../pages/TrashPage").then((module) => ({ default: module.TrashPage })));
+const DiagnosticsIndexPage = lazy(() => import("../pages/DiagnosticsPage").then((module) => ({ default: module.DiagnosticsIndexPage })));
+const DiagnosticPage = lazy(() => import("../pages/DiagnosticsPage").then((module) => ({ default: module.DiagnosticPage })));
 const NotFoundPage = lazy(() => import("../pages/NotFoundPage").then((module) => ({ default: module.NotFoundPage })));
 
 const suspense = (node: React.ReactNode) => <Suspense fallback={<Spinner />}>{node}</Suspense>;
@@ -24,6 +27,10 @@ const router = createBrowserRouter([
     { path: "cars", element: suspense(<CarsPage />) },
     { path: "finance", element: suspense(<FinancePage />) },
     { path: "search", element: suspense(<SearchPage />) },
+    { path: "trash", element: suspense(<TrashPage />) },
+    { path: "diagnostics", element: suspense(<DiagnosticsIndexPage />) },
+    { path: "diagnostics/start", element: suspense(<DiagnosticPage />) },
+    { path: "diagnostics/:diagnosticId", element: suspense(<DiagnosticPage />) },
     { path: "*", element: suspense(<NotFoundPage />) },
   ]},
 ]);

@@ -327,6 +327,44 @@ def customer_name_label(value: object, missing: str = "Имя не указан�
     return known_customer_name(value) or missing
 
 
+VEHICLE_METADATA_MARKER_RE = re.compile(
+    r"(?i)(?:\bvin\b|вин(?:\s*[- ]?код)?|гос(?:ударственный)?\s*номер|"
+    r"номер\s+(?:авто|автомобиля|машины))"
+)
+PLATE_FROM_TEXT_RE = re.compile(
+    r"(?<![A-ZА-Я0-9])([АВЕКМНОРСТУХABEKMHOPCTYX])\s*(\d{3})\s*"
+    r"([АВЕКМНОРСТУХABEKMHOPCTYX]{2})(?:\s*(\d{2,3}))?(?![A-ZА-Я0-9])",
+    re.IGNORECASE,
+)
+
+
+def empty_workshop_command(intent: str = "upsert_customer") -> WorkshopCommand:
+    values = {
+        name: None for name in WorkshopCommand.__dataclass_fields__ if name != "intent"
+    }
+    return WorkshopCommand(intent=intent, **values)
+
+
+def customer_name_for_edit(
+    command: WorkshopCommand, text: str, phone_text: str | None = None
+) -> str | None:
+    """Return an explicitly supplied customer name without leaking car metadata."""
+    name = command.customer_name.strip() if command.customer_name else None
+    if name and phone_text and phone_text in name:
+        name = name.replace(phone_text, "").strip(" ,;|-") or None
+    has_vehicle_data = any((
+        command.car_brand, command.car_model, command.car_year,
+        command.plate_number, command.vin, command.mileage,
+    ))
+    if name or has_vehicle_data or VEHICLE_METADATA_MARKER_RE.search(text):
+        return name
+
+    remaining = text
+    if phone_text:
+        remaining = remaining.replace(phone_text, " ")
+    return re.sub(r"\s+", " ", remaining).strip(" ,;|-") or None
+
+
 def fill_contact_and_appointment_from_text(
     command: WorkshopCommand, text: str
 ) -> WorkshopCommand:
@@ -351,9 +389,14 @@ def fill_contact_and_appointment_from_text(
     if vin_match:
         values["vin"] = vin_match.group(0)
 
+    plate_match = PLATE_FROM_TEXT_RE.search(text.upper())
+    if plate_match:
+        values["plate_number"] = "".join(part or "" for part in plate_match.groups())
+
     if command.customer_name:
         clean_name = re.split(
-            r"\s*[,;.]?\s*(?:запчаст|детал|\bvin\b|вин(?:\s*код)?)",
+            r"\s*[,;.]?\s*(?:запчаст|детал|\bvin\b|вин(?:\s*[- ]?код)?|"
+            r"гос(?:ударственный)?\s*номер|номер\s+(?:авто|автомобиля|машины))",
             command.customer_name,
             maxsplit=1,
             flags=re.IGNORECASE,
@@ -2469,21 +2512,19 @@ async def edit_record_value(message: Message, bot: Bot, state: FSMContext) -> No
             except OpenRouterError:
                 parsed = None
 
-        if phone is None and parsed and parsed.customer_phone:
+        parsed = fill_contact_and_appointment_from_text(
+            parsed or empty_workshop_command(), text
+        )
+        if phone is None and parsed.customer_phone:
             phone = parsed.customer_phone
-        name = parsed.customer_name if parsed and parsed.customer_name else None
-        if name and phone and phone in name:
-            name = name.replace(phone, "").strip(" ,;|-")
-        if not name:
-            remaining = text
-            if phone_match:
-                remaining = remaining.replace(phone_match.group(), " ")
-            name = re.sub(r"\s+", " ", remaining).strip(" ,;|-") or None
+        name = customer_name_for_edit(
+            parsed, text, phone_match.group() if phone_match else None
+        )
 
         db.update_customer(record_id, name, phone)
 
         car_changed = False
-        if parsed and (parsed.car_brand or parsed.car_model or parsed.plate_number or parsed.vin or parsed.mileage):
+        if parsed.car_brand or parsed.car_model or parsed.plate_number or parsed.vin or parsed.mileage:
             car = db.find_car_by_details(
                 owner_id, parsed.car_brand, parsed.car_model, parsed.plate_number, parsed.vin
             )

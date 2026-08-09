@@ -11,5 +11,11 @@ if (!root) throw new Error("Root element is missing");
 createRoot(root).render(<StrictMode><ErrorBoundary><QueryClientProvider client={queryClient}><App /></QueryClientProvider></ErrorBoundary></StrictMode>);
 
 if ("serviceWorker" in navigator && import.meta.env.PROD) {
-  window.addEventListener("load", () => { void navigator.serviceWorker.register("/sw.js"); });
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!refreshing) { refreshing = true; window.location.reload(); }
+  });
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register("/sw.js").then((registration) => registration.update());
+  });
 }

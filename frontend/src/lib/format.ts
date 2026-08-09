@@ -7,10 +7,22 @@ export const customerName = (value: string | null | undefined) => {
 };
 
 export const formatDateTime = (value: string) => {
-  const date = new Date(value);
+  const date = parseCrmDate(value);
   return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat("ru-RU", {
     day: "2-digit", month: "long", hour: "2-digit", minute: "2-digit",
+    timeZone: "Europe/Moscow",
   }).format(date);
+};
+
+export const parseCrmDate = (value: string) => {
+  // SQLite CURRENT_TIMESTAMP is UTC. Appointment values without an offset
+  // represent workshop wall time in Moscow, regardless of the browser timezone.
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(value)
+      ? `${value}+03:00`
+      : value;
+  return new Date(normalized);
 };
 
 export const carName = (car: { brand: string; model: string; plate_number?: string | null }) =>
