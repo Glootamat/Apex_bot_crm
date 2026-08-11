@@ -50,9 +50,10 @@ jobs:
       - run: pnpm --dir frontend build
       - name: Build immutable release artifact
         run: |
+          RELEASE_ARCHIVE="$RUNNER_TEMP/apex-crm-release.tar.gz"
           tar --exclude-vcs --exclude='.env' --exclude='.venv' --exclude='frontend/node_modules' \
             --exclude='*.sqlite3' --exclude='uploads' --exclude='backups' --exclude='*.log' \
-            --exclude='*.tar.gz' -czf apex-crm-release.tar.gz .
+            --exclude='*.tar.gz' -czf "$RELEASE_ARCHIVE" .
       - name: Configure SSH
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -68,7 +69,7 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           RELEASE_ID="$(git rev-parse HEAD)"
-          scp -i ~/.ssh/deploy_key apex-crm-release.tar.gz deployment/deploy_release.sh \
+          scp -i ~/.ssh/deploy_key "$RUNNER_TEMP/apex-crm-release.tar.gz" deployment/deploy_release.sh \
             "$DEPLOY_USER@$DEPLOY_HOST:/tmp/"
           ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             "bash /tmp/deploy_release.sh '$RELEASE_ID' /tmp/apex-crm-release.tar.gz"
