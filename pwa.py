@@ -73,7 +73,7 @@ PartsSource = Literal["workshop", "customer"] | None
 
 
 def _mechanic_can_mutate(method: str, path: str) -> bool:
-    if path == "/api/logout" or path.startswith("/api/diagnostics"):
+    if path in {"/api/logout", "/api/presence"} or path.startswith("/api/diagnostics"):
         return True
     match = re.fullmatch(r"/api/orders/(\d+)(?:/(status|photos))?", path)
     if match is None:
@@ -175,7 +175,7 @@ async def bind_authentication_context(request: Request, call_next):
             )
         if context is not None and request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
             role = str(context["role"])
-            if role in {"viewer", "accountant"} and request.url.path not in {"/api/logout"}:
+            if role in {"viewer", "accountant"} and request.url.path not in {"/api/logout", "/api/presence"}:
                 return FastAPIResponse(
                     content=json.dumps({"detail": "Для вашей роли доступен только просмотр"}, ensure_ascii=False),
                     status_code=status.HTTP_403_FORBIDDEN, media_type="application/json",
@@ -641,6 +641,7 @@ def login(data: LoginRequest, request: Request, response: Response) -> dict[str,
         _record_login_failure(login_key)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверный логин или пароль")
     _clear_login_failures(login_key)
+    db.record_staff_login(int(account["id"]), int(account["organization_id"]))
     return {"status": "ok"} | _issue_token_pair(response, account)
 
 
@@ -695,6 +696,13 @@ def account(context: Annotated[dict[str, object], Depends(require_user)]) -> dic
 @app.get("/api/settings/staff")
 def staff_list(context: Annotated[dict[str, object], Depends(require_manager)]) -> list[dict[str, object]]:
     return db.list_staff(int(context["organization_id"]))
+
+
+@app.post("/api/presence")
+def presence_heartbeat(context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, str]:
+    """Record an active PWA session without creating an additional login event."""
+    db.touch_staff_presence(int(context["id"]), int(context["organization_id"]))
+    return {"status": "ok"}
 
 
 @app.get("/api/settings/workspace")

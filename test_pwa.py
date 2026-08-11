@@ -205,6 +205,32 @@ class PwaTest(unittest.TestCase):
                 finally:
                     pwa._clear_login_failures("testclient")
 
+    def test_staff_activity_tracks_login_and_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.add_or_update_user(9601, "Owner", None)
+            environment = {
+                "ADMIN_ID": "9601", "PWA_ADMIN_USER": "admin",
+                "PWA_PASSWORD_HASH": password_hash("secret-password"),
+                "PWA_SESSION_SECRET": "s" * 48,
+            }
+            with patch.object(pwa, "db", db), patch.dict(os.environ, environment):
+                owner = TestClient(pwa.app, base_url="https://testserver")
+                self.assertEqual(owner.post("/api/login", json={"username": "admin", "password": "secret-password"}).status_code, 200)
+                created = owner.post("/api/settings/staff", json={
+                    "username": "mechanic", "password": "mechanic-password",
+                    "full_name": "Mechanic", "role": "mechanic",
+                })
+                self.assertEqual(created.status_code, 201)
+                mechanic = TestClient(pwa.app, base_url="https://testserver")
+                self.assertEqual(mechanic.post("/api/login", json={"username": "mechanic", "password": "mechanic-password"}).status_code, 200)
+                self.assertEqual(mechanic.post("/api/presence").status_code, 200)
+                member = next(item for item in owner.get("/api/settings/staff").json() if item["username"] == "mechanic")
+                self.assertTrue(member["online"])
+                self.assertEqual(member["logins_today"], 1)
+                self.assertIsNotNone(member["last_seen_at"])
+
     def test_platform_owner_creates_demo_service_and_controls_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

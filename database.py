@@ -410,6 +410,27 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_refresh_sessions_family
                     ON refresh_sessions(family_id);
 
+                CREATE TABLE IF NOT EXISTS account_presence (
+                    account_id INTEGER NOT NULL,
+                    organization_id INTEGER NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (account_id, organization_id),
+                    FOREIGN KEY (account_id) REFERENCES auth_accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS account_login_events (
+                    id INTEGER PRIMARY KEY,
+                    account_id INTEGER NOT NULL,
+                    organization_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES auth_accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_account_login_events_today
+                    ON account_login_events(organization_id, account_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS cars (
                     id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL,
@@ -988,15 +1009,57 @@ class Database:
             connection.close()
 
     def list_staff(self, organization_id: int) -> list[dict[str, object]]:
+        now = datetime.now(timezone.utc)
+        start_of_day = now.astimezone(timezone(timedelta(hours=3))).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).astimezone(timezone.utc).isoformat()
+        end_of_day = (datetime.fromisoformat(start_of_day) + timedelta(days=1)).isoformat()
+        online_after = (now - timedelta(minutes=2)).isoformat()
         connection = self.connect()
         try:
             rows = connection.execute(
-                """SELECT a.id, a.username, a.full_name, a.active, m.role, m.created_at
+                """SELECT a.id, a.username, a.full_name, a.active, m.role, m.created_at,
+                          p.last_seen_at,
+                          CASE WHEN p.last_seen_at >= ? THEN 1 ELSE 0 END AS online,
+                          (SELECT COUNT(*) FROM account_login_events le
+                           WHERE le.account_id = a.id AND le.organization_id = m.organization_id
+                             AND le.created_at >= ? AND le.created_at < ?) AS logins_today
                    FROM organization_memberships m JOIN auth_accounts a ON a.id = m.account_id
+                   LEFT JOIN account_presence p ON p.account_id = a.id AND p.organization_id = m.organization_id
                    WHERE m.organization_id = ? AND m.active = 1 ORDER BY a.full_name""",
-                (organization_id,),
+                (online_after, start_of_day, end_of_day, organization_id),
             ).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def record_staff_login(self, account_id: int, organization_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        connection = self.connect()
+        try:
+            connection.execute(
+                "INSERT INTO account_login_events (account_id, organization_id, created_at) VALUES (?, ?, ?)",
+                (account_id, organization_id, now),
+            )
+            connection.execute(
+                """INSERT INTO account_presence (account_id, organization_id, last_seen_at) VALUES (?, ?, ?)
+                   ON CONFLICT(account_id, organization_id) DO UPDATE SET last_seen_at = excluded.last_seen_at""",
+                (account_id, organization_id, now),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def touch_staff_presence(self, account_id: int, organization_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        connection = self.connect()
+        try:
+            connection.execute(
+                """INSERT INTO account_presence (account_id, organization_id, last_seen_at) VALUES (?, ?, ?)
+                   ON CONFLICT(account_id, organization_id) DO UPDATE SET last_seen_at = excluded.last_seen_at""",
+                (account_id, organization_id, now),
+            )
+            connection.commit()
         finally:
             connection.close()
 

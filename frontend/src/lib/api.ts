@@ -66,6 +66,7 @@ export const api = {
   login: (username: string, password: string) => request<{ status: string } & TokenResponse>("/api/login", { method: "POST", ...json({ username, password }) }),
   logout: async () => { const result = await request<{ status: string }>("/api/logout", { method: "POST" }); accessToken = null; return result; },
   account: () => request<Account>("/api/account"),
+  presence: () => request<{ status: string }>("/api/presence", { method: "POST" }),
   staff: () => request<StaffMember[]>("/api/settings/staff"),
   createStaff: (value: { username: string; password: string; full_name: string; role: StaffRole }) => request<StaffMember>("/api/settings/staff", { method: "POST", ...json(value) }),
   updateStaff: (id: number, value: { role?: StaffRole; active?: boolean; password?: string }) => request<StaffMember>(`/api/settings/staff/${id}`, { method: "PATCH", ...json(value) }),

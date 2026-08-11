@@ -108,6 +108,19 @@ export function AppShell() {
   });
 
   useEffect(() => {
+    if (!account.data) return;
+    const sendPresence = () => { void api.presence().catch(() => undefined); };
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") sendPresence(); };
+    sendPresence();
+    const timer = window.setInterval(sendPresence, 60_000);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [account.data]);
+
+  useEffect(() => {
     if (!settings.autoLockMinutes) return;
     let timer = window.setTimeout(() => logout(), settings.autoLockMinutes * 60_000);
     const resetTimer = () => {
