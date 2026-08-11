@@ -110,9 +110,9 @@ export function OwnerPanelPage() {
     <header className="flex flex-wrap items-start gap-4">
       <div className="flex min-w-0 flex-1 items-center gap-4">
         <img className="size-16 rounded-2xl object-cover shadow-[0_10px_30px_rgba(255,214,0,.16)]" src="/assets/brand/apex-logo.png" alt="Apex Auto" />
-        <div><p className="text-sm font-black tracking-wide text-apex">APEX CONTROL · КЛИЕНТЫ ПЛАТФОРМЫ</p><h1 className="text-3xl font-black sm:text-4xl">Панель владельца</h1><p className="mt-1 text-sm text-muted">{counts.total} автосервисов · {counts.active} активных · {counts.attention} требуют внимания</p></div>
+        <div><p className="text-xs font-black tracking-wide text-apex sm:text-sm">APEX CONTROL · КЛИЕНТЫ ПЛАТФОРМЫ</p><h1 className="text-2xl font-black sm:text-4xl">Панель владельца</h1><p className="mt-1 text-sm text-muted">{counts.total} автосервисов · {counts.active} активных · {counts.attention} требуют внимания</p></div>
       </div>
-      <Button onClick={() => setOpen(true)}><Plus size={18} />Новый автосервис</Button>
+      <Button className="w-full sm:w-auto" onClick={() => setOpen(true)}><Plus size={18} />Новый автосервис</Button>
     </header>
 
     {createdCredentials && <Card className="border-apex/40 bg-apex/5">

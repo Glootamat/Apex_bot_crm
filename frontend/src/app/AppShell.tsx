@@ -23,7 +23,7 @@ import {
   useNavigate,
 } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { queryClient } from "../lib/query";
 import { useCrm } from "../features/crm/useCrm";
 import {
@@ -209,7 +209,10 @@ export function AppShell() {
   }, [menuOpen]);
 
   if (auth.isPending || crm.isPending) return <BrandedLoader />;
-  if (auth.error && "status" in auth.error && auth.error.status === 401)
+  const unauthorized = [auth.error, crm.error].some(
+    (error) => error instanceof ApiError && error.status === 401,
+  );
+  if (unauthorized)
     return <Navigate to="/login" replace />;
   if (auth.isError || crm.isError || !crm.data)
     return (

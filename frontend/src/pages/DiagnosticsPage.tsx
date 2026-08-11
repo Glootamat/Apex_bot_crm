@@ -20,7 +20,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Button,
@@ -30,7 +30,6 @@ import {
   Modal,
   Spinner,
 } from "../components/ui";
-import { useCrm } from "../features/crm/useCrm";
 import { api } from "../lib/api";
 import { exportDiagnosticImage } from "../lib/diagnosticImage";
 import { customerName, formatDateTime, money } from "../lib/format";
@@ -93,18 +92,9 @@ function normalizeSearchValue(value: unknown) {
     .replace(/[^a-zа-я0-9]+/gi, "");
 }
 
-function normalizeVehicleCode(value: unknown) {
-  return normalizeSearchValue(value)
-    .replace(/а/g, "a").replace(/в/g, "b").replace(/е/g, "e")
-    .replace(/к/g, "k").replace(/м/g, "m").replace(/н/g, "h")
-    .replace(/о/g, "o").replace(/р/g, "p").replace(/с/g, "c")
-    .replace(/т/g, "t").replace(/у/g, "y").replace(/х/g, "x");
-}
-
 export function DiagnosticsIndexPage() {
   const navigate = useNavigate();
-  const [vehicleSearch, setVehicleSearch] = useState("");
-  const crm = useCrm();
+  const [diagnosticSearch, setDiagnosticSearch] = useState("");
   const diagnostics = useQuery({
     queryKey: ["diagnostics"],
     queryFn: () => api.diagnostics(),
@@ -119,55 +109,43 @@ export function DiagnosticsIndexPage() {
       deleteDiagnostic.mutate(id);
     }
   };
-  const cars = useMemo(() => crm.data?.cars ?? [], [crm.data?.cars]);
-  const customersById = useMemo(
-    () => new Map((crm.data?.customers ?? []).map((customer) => [customer.id, customer])),
-    [crm.data?.customers],
-  );
-  const filteredCars = useMemo(() => {
-    const terms = vehicleSearch.trim().split(/\s+/).filter(Boolean);
-    if (!terms.length) return cars;
-    return cars.filter((car) => {
-      const customer = car.customer_id ? customersById.get(car.customer_id) : undefined;
-      const text = [
-        car.brand, car.model, car.year, car.plate_number, car.vin, car.mileage,
-        customer?.full_name, customer?.phone,
+  const filteredDiagnostics = useMemo(() => {
+    const terms = diagnosticSearch.trim().split(/\s+/).filter(Boolean);
+    const cards = diagnostics.data ?? [];
+    if (!terms.length) return cards;
+    return cards.filter((card) => {
+      const haystack = [
+        card.id, card.brand, card.model, card.plate_number, card.vin,
+        card.customer_name, card.status === "completed" ? "завершена" : "черновик",
       ].map(normalizeSearchValue).join(" ");
-      const vehicleCodes = [car.plate_number, car.vin].map(normalizeVehicleCode).join(" ");
-      return terms.every((term) =>
-        text.includes(normalizeSearchValue(term)) ||
-        vehicleCodes.includes(normalizeVehicleCode(term)),
-      );
+      return terms.every((term) => haystack.includes(normalizeSearchValue(term)));
     });
-  }, [cars, customersById, vehicleSearch]);
-  if (crm.isPending || diagnostics.isPending)
+  }, [diagnosticSearch, diagnostics.data]);
+  if (diagnostics.isPending)
     return <Spinner label="Открываю диагностику…" />;
   return (
     <div className="grid gap-5">
       <header>
         <p className="text-sm font-bold text-apex">ТЕХНИЧЕСКОЕ СОСТОЯНИЕ</p>
         <h1 className="text-3xl font-black">Диагностика автомобилей</h1>
-        <p className="mt-1 text-muted">
-          Выберите автомобиль — черновик откроется сразу, без лишних форм.
-        </p>
+        <p className="mt-1 text-muted">Новые карты создаются из карточки автомобиля или заказ-наряда.</p>
       </header>
       <section>
-        <h2 className="mb-3 text-lg font-black">Начать диагностику</h2>
         <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center">
           <label className="relative block flex-1">
             <Search className="pointer-events-none absolute left-4 top-1/2 size-5 -translate-y-1/2 text-muted" />
             <input
-              value={vehicleSearch}
-              onChange={(event) => setVehicleSearch(event.target.value)}
+              value={diagnosticSearch}
+              onChange={(event) => setDiagnosticSearch(event.target.value)}
               className={`${inputClass} w-full pl-12 pr-12`}
-              placeholder="Клиент, телефон, марка, модель, госномер или VIN"
+              placeholder="Поиск по карте: авто, клиент, госномер, VIN или №"
               autoComplete="off"
-              aria-label="Поиск автомобиля для диагностики"
+              aria-label="Поиск диагностических карт"
             />
-            {vehicleSearch && (
+            {diagnosticSearch && (
               <button
                 type="button"
-                onClick={() => setVehicleSearch("")}
+                onClick={() => setDiagnosticSearch("")}
                 className="absolute right-3 top-1/2 grid size-8 -translate-y-1/2 place-items-center rounded-lg text-muted transition hover:bg-panel-soft hover:text-white"
                 aria-label="Очистить поиск"
               >
@@ -175,48 +153,12 @@ export function DiagnosticsIndexPage() {
               </button>
             )}
           </label>
-          {vehicleSearch && <span className="shrink-0 text-sm text-muted">Найдено: {filteredCars.length}</span>}
+          {diagnosticSearch && <span className="shrink-0 text-sm text-muted">Найдено: {filteredDiagnostics.length}</span>}
         </div>
-        {filteredCars.length ? (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {filteredCars.map((car) => (
-            <button
-              key={car.id}
-              onClick={() =>
-                void navigate(`/diagnostics/start?car_id=${car.id}`)
-              }
-              className="flex min-w-0 items-center gap-3 rounded-2xl border border-line bg-panel p-4 text-left transition hover:border-apex/50"
-            >
-              <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-apex/10 text-apex">
-                <ClipboardCheck />
-              </span>
-              <span className="min-w-0">
-                <strong className="block break-words">
-                  {car.brand} {car.model}
-                </strong>
-                <span className="text-sm text-muted">
-                  {car.plate_number || car.vin || "Без номера"}
-                </span>
-                {car.customer_id && customersById.get(car.customer_id) && (
-                  <span className="block truncate text-xs text-muted">
-                    {customersById.get(car.customer_id)?.full_name}
-                    {customersById.get(car.customer_id)?.phone ? ` · ${customersById.get(car.customer_id)?.phone}` : ""}
-                  </span>
-                )}
-              </span>
-              <ChevronRight className="ml-auto shrink-0 text-muted" />
-            </button>
-          ))}
-        </div>
-        ) : (
-          <EmptyState>По запросу «{vehicleSearch}» автомобиль не найден. Проверьте данные или очистите поиск.</EmptyState>
-        )}
-      </section>
-      <section>
-        <h2 className="mb-3 text-lg font-black">Последние карты</h2>
-        {diagnostics.data?.length ? (
+        <h2 className="mb-3 text-lg font-black">Недавние карты</h2>
+        {filteredDiagnostics.length ? (
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {diagnostics.data.map((item) => (
+            {filteredDiagnostics.map((item) => (
               <Card
                 key={item.id}
                 className="cursor-pointer transition hover:border-apex/50"
@@ -231,8 +173,9 @@ export function DiagnosticsIndexPage() {
                       {item.brand} {item.model}
                     </h3>
                     <p className="text-sm text-muted">
-                      {formatDateTime(item.created_at)}
+                      {formatDateTime(item.updated_at)}
                     </p>
+                    <p className="mt-1 truncate text-xs text-muted">{item.customer_name || item.plate_number || item.vin || "Автомобиль без номера"}</p>
                   </div>
                   <span className="rounded-full bg-panel-soft px-3 py-1 text-sm font-bold">
                     {item.checked}/{item.total}
@@ -263,7 +206,7 @@ export function DiagnosticsIndexPage() {
             ))}
           </div>
         ) : (
-          <EmptyState>Диагностик пока нет</EmptyState>
+          <EmptyState>{diagnosticSearch ? `По запросу «${diagnosticSearch}» карт не найдено.` : "Диагностических карт пока нет."}</EmptyState>
         )}
       </section>
     </div>
@@ -289,6 +232,20 @@ export function DiagnosticPage() {
   if (diagnostic.isError || !diagnostic.data)
     return <EmptyState>Не удалось открыть диагностическую карту</EmptyState>;
   return <DiagnosticCard value={diagnostic.data} queryKey={queryKey} />;
+}
+
+function ProtectedDiagnosticPhoto({ id, path, alt }: { id: number; path: string; alt: string }) {
+  const photo = useQuery({
+    queryKey: ["diagnostic-photo", id, path],
+    queryFn: async () => URL.createObjectURL(await api.diagnosticPhoto(path)),
+    staleTime: Infinity,
+  });
+  useEffect(() => () => {
+    if (photo.data) URL.revokeObjectURL(photo.data);
+  }, [photo.data]);
+  if (photo.isPending) return <div className="aspect-square animate-pulse rounded-xl bg-panel-soft" aria-label="Загрузка фото" />;
+  if (photo.isError || !photo.data) return <div className="grid aspect-square place-items-center rounded-xl bg-danger/10 p-2 text-center text-xs text-danger">Фото недоступно</div>;
+  return <a href={photo.data} target="_blank" rel="noreferrer"><img className="aspect-square w-full rounded-xl object-cover" src={photo.data} alt={alt} /></a>;
 }
 
 function DiagnosticCard({
@@ -600,13 +557,7 @@ function DiagnosticCard({
         <h2 className="font-black">Фото диагностики</h2>
         <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
           {value.photos.map((photo) => (
-            <a key={photo.id} href={photo.url} target="_blank" rel="noreferrer">
-              <img
-                className="aspect-square w-full rounded-xl object-cover"
-                src={photo.url}
-                alt={photo.caption || "Фото диагностики"}
-              />
-            </a>
+            <ProtectedDiagnosticPhoto key={photo.id} id={photo.id} path={photo.url} alt={photo.caption || "Фото диагностики"} />
           ))}
           <button type="button" onClick={() => setPhotoSourceOpen(true)} disabled={photoMutation.isPending} className="grid aspect-square cursor-pointer place-items-center rounded-xl border border-dashed border-line text-center text-sm text-muted transition hover:border-apex hover:text-apex disabled:opacity-50 print:hidden">
             <span>

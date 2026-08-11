@@ -20,6 +20,16 @@ const text = (data: FormData, key: string) => { const value = data.get(key); ret
 const optional = (data: FormData, key: string) => text(data, key) || null;
 const number = (data: FormData, key: string) => { const value = text(data, key); return value ? Number(value) : null; };
 const requiredNumber = (data: FormData, key: string) => Number(text(data, key));
+const moneyInput = (value: number | undefined) => ({
+  type: "number" as const, min: "0", inputMode: "numeric" as const,
+  defaultValue: value ?? 0,
+  onFocus: (event: React.FocusEvent<HTMLInputElement>) => {
+    if (event.currentTarget.value === "0") event.currentTarget.select();
+  },
+  onInput: (event: React.FormEvent<HTMLInputElement>) => {
+    event.currentTarget.value = event.currentTarget.value.replace(/^0+(?=\d)/, "");
+  },
+});
 
 export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props) {
   const formRef = useRef<HTMLFormElement>(null);
@@ -102,10 +112,10 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
       {entity.kind === "order" && <>
         <Field label="Автомобиль" full><select className={inputClass} name="car_id" required defaultValue={entity.value?.car_id ?? entity.carId ?? ""}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
         <Field label="Работы" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} /></Field>
-        <Field label="Оплата за работу"><input className={inputClass} name="labor_revenue" type="number" min="0" defaultValue={entity.value?.labor_revenue ?? 0} /></Field>
-        <Field label="Закупка запчастей"><input className={inputClass} name="parts_cost" type="number" min="0" defaultValue={entity.value?.parts_cost ?? 0} /></Field>
-        <Field label="Продажа запчастей"><input className={inputClass} name="parts_revenue" type="number" min="0" defaultValue={entity.value?.parts_revenue ?? 0} /></Field>
-        <Field label="Доп. прибыль по запчастям"><input className={inputClass} name="parts_profit" type="number" defaultValue={entity.value?.parts_profit ?? 0} /></Field>
+        <Field label="Оплата за работу"><input className={inputClass} name="labor_revenue" {...moneyInput(entity.value?.labor_revenue)} /></Field>
+        <Field label="Закупка запчастей"><input className={inputClass} name="parts_cost" {...moneyInput(entity.value?.parts_cost)} /></Field>
+        <Field label="Продажа запчастей"><input className={inputClass} name="parts_revenue" {...moneyInput(entity.value?.parts_revenue)} /></Field>
+        <Field label="Доп. прибыль по запчастям"><input className={inputClass} name="parts_profit" {...moneyInput(entity.value?.parts_profit)} /></Field>
         <Field label="Жалоба клиента" full><textarea className={inputClass} name="concern" defaultValue={entity.value?.concern ?? ""} /></Field>
         <Field label="Согласованная сумма"><input className={inputClass} name="agreed_amount" type="number" min="0" defaultValue={entity.value?.agreed_amount ?? ""} /></Field>
         <Field label="Запчасти"><select className={inputClass} name="parts_source" defaultValue={entity.value?.parts_source ?? ""}><option value="">Не указано</option><option value="workshop">Наши</option><option value="customer">Клиента</option></select></Field>

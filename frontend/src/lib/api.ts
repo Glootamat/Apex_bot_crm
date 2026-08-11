@@ -88,6 +88,11 @@ export const api = {
     if (!response.ok) throw new ApiError(response.status, "Не удалось сформировать PDF");
     return response.blob();
   },
+  diagnosticPhoto: async (path: string) => {
+    const response = await authenticatedFetch(path);
+    if (!response.ok) throw new ApiError(response.status, "Не удалось загрузить фото");
+    return response.blob();
+  },
   startDiagnostic: (carId: number, serviceOrderId?: number) => request<Diagnostic>("/api/diagnostics/start", { method: "POST", ...json({ car_id: carId, service_order_id: serviceOrderId ?? null }) }),
   updateDiagnostic: (id: number, value: { mileage: number | null; notes: string | null; status: "draft" | "completed" }) => request<Diagnostic>(`/api/diagnostics/${id}`, { method: "PUT", ...json(value) }),
   createOrderFromDiagnostic: (id: number) => request<Order & { created_from_diagnostic: boolean }>(`/api/diagnostics/${id}/create-order`, { method: "POST" }),
