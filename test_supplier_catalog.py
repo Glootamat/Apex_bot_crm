@@ -1,6 +1,8 @@
 import unittest
 
-from supplier_catalog import SupplierOffer, _parse_profit_liga, serialize_offer
+from defusedxml.common import EntitiesForbidden
+
+from supplier_catalog import SafeET, SupplierOffer, _parse_profit_liga, _require_https_url, serialize_offer
 
 
 class SupplierCatalogTest(unittest.TestCase):
@@ -23,6 +25,17 @@ class SupplierCatalogTest(unittest.TestCase):
         self.assertEqual(offers[0].purchase_price, 2450)
         self.assertEqual(offers[0].delivery_days, 2)
         self.assertEqual(offers[0].offer_id, "17:4")
+
+    def test_supplier_url_must_be_https(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _require_https_url("http://127.0.0.1/internal")
+        with self.assertRaises(RuntimeError):
+            _require_https_url("https://user:password@example.com/api")
+
+    def test_external_xml_entities_are_rejected(self) -> None:
+        payload = b'<!DOCTYPE x [<!ENTITY secret SYSTEM "file:///etc/passwd">]><x>&secret;</x>'
+        with self.assertRaises(EntitiesForbidden):
+            SafeET.fromstring(payload)
 
 
 if __name__ == "__main__":

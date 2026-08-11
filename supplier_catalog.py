@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
-import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import Element
+from urllib.parse import urlparse
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import aiohttp
+from defusedxml import ElementTree as SafeET
+
+
+MAX_SUPPLIER_RESPONSE_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -106,8 +112,8 @@ async def search_rossko(query: str) -> list[SupplierOffer]:
             headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "https://api.rossko.ru/service/v2.1/GetSearch"},
         ) as response:
             response.raise_for_status()
-            payload = await response.text()
-    root = ET.fromstring(payload)
+            payload = await _read_limited(response)
+    root = SafeET.fromstring(payload)
     offers: list[SupplierOffer] = []
     for part in _elements(root, "Part"):
         brand, article, name = (_child_text(part, key) for key in ("brand", "partnumber", "name"))
@@ -136,8 +142,8 @@ async def get_rossko_orders(*, order_ids: list[int] | None = None, limit: int = 
             headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "https://api.rossko.ru/service/v2.1/GetOrders"},
         ) as response:
             response.raise_for_status()
-            payload = await response.text()
-    root = ET.fromstring(payload)
+            payload = await _read_limited(response)
+    root = SafeET.fromstring(payload)
     orders: list[RosskoOrder] = []
     for order in _elements(root, "Order"):
         parts: list[RosskoOrderPart] = []
@@ -157,16 +163,18 @@ async def get_rossko_orders(*, order_ids: list[int] | None = None, limit: int = 
 async def search_profit_liga(query: str) -> list[SupplierOffer]:
     """Search Profit Liga stock offers using the documented /search/items API."""
     url = os.getenv("PROFIT_LIGA_SEARCH_URL", "https://api.pr-lg.ru/search/items")
+    _require_https_url(url)
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, params={"secret": os.environ["PROFIT_LIGA_API_KEY"], "article": query}) as response:
             response.raise_for_status()
-            data = await response.json(content_type=None)
+            data = json.loads(await _read_limited(response))
     return _parse_profit_liga(data)
 
 
 async def get_profit_liga_orders(*, page: int = 1, order_id: str | None = None) -> list[ProfitLigaOrder]:
     url = os.getenv("PROFIT_LIGA_ORDERS_URL", "https://api.pr-lg.ru/orders/list")
+    _require_https_url(url)
     params: dict[str, object] = {"secret": os.environ["PROFIT_LIGA_API_KEY"], "page": max(1, page)}
     if order_id:
         params["order_id"] = order_id
@@ -174,7 +182,7 @@ async def get_profit_liga_orders(*, page: int = 1, order_id: str | None = None) 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, params=params) as response:
             response.raise_for_status()
-            data = await response.json(content_type=None)
+            data = json.loads(await _read_limited(response))
     if not isinstance(data, dict) or str(data.get("status", "")).lower() == "error":
         raise RuntimeError(str(data.get("err") if isinstance(data, dict) else "Profit Liga отклонила запрос"))
     rows = data.get("data", [])
@@ -266,15 +274,15 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _elements(root: ET.Element, name: str) -> list[ET.Element]:
+def _elements(root: Element, name: str) -> list[Element]:
     return [element for element in root.iter() if _local(element.tag) == name]
 
 
-def _descendants(root: ET.Element, name: str) -> list[ET.Element]:
+def _descendants(root: Element, name: str) -> list[Element]:
     return [element for element in root.iter() if element is not root and _local(element.tag) == name]
 
 
-def _child_text(root: ET.Element, name: str) -> str:
+def _child_text(root: Element, name: str) -> str:
     child = next((element for element in root if _local(element.tag) == name), None)
     return (child.text or "").strip() if child is not None else ""
 
@@ -285,3 +293,23 @@ def _xml(value: str) -> str:
 
 def _optional_xml(name: str, value: str | None) -> str:
     return f"<api:{name}>{_xml(value)}</api:{name}>" if value else ""
+
+
+async def _read_limited(response: aiohttp.ClientResponse) -> bytes:
+    declared_size = response.content_length
+    if declared_size is not None and declared_size > MAX_SUPPLIER_RESPONSE_BYTES:
+        raise RuntimeError("Ответ поставщика слишком большой")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > MAX_SUPPLIER_RESPONSE_BYTES:
+            raise RuntimeError("Ответ поставщика слишком большой")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _require_https_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("URL поставщика должен использовать HTTPS без учётных данных")

@@ -66,6 +66,16 @@ const moduleByPath: Partial<Record<string, ModuleKey>> = {
   "/customers": "customers", "/cars": "cars", "/finance": "finance", "/trash": "trash",
 };
 
+function hasModalHistoryState() {
+  const state: unknown = window.history.state;
+  return typeof state === "object" && state !== null && "apexModal" in state && state.apexModal === true;
+}
+
+function historyStateObject() {
+  const state: unknown = window.history.state;
+  return typeof state === "object" && state !== null ? state : {};
+}
+
 export function AppShell() {
   const [menuOpen, setMenuOpen] = useState(false);
   const swipeStart = useRef<{ x: number; y: number; tracking: boolean } | null>(
@@ -89,7 +99,7 @@ export function AppShell() {
     queryFn: api.dashboard,
     retry: false,
   });
-  const logout = useMutation({
+  const { mutate: logout } = useMutation({
     mutationFn: api.logout,
     onSettled: () => {
       queryClient.clear();
@@ -99,10 +109,10 @@ export function AppShell() {
 
   useEffect(() => {
     if (!settings.autoLockMinutes) return;
-    let timer = window.setTimeout(() => logout.mutate(), settings.autoLockMinutes * 60_000);
+    let timer = window.setTimeout(() => logout(), settings.autoLockMinutes * 60_000);
     const resetTimer = () => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => logout.mutate(), settings.autoLockMinutes * 60_000);
+      timer = window.setTimeout(() => logout(), settings.autoLockMinutes * 60_000);
     };
     const events = ["pointerdown", "keydown", "touchstart"] as const;
     events.forEach((event) => window.addEventListener(event, resetTimer, { passive: true }));
@@ -110,12 +120,12 @@ export function AppShell() {
       window.clearTimeout(timer);
       events.forEach((event) => window.removeEventListener(event, resetTimer));
     };
-  }, [logout.mutate, settings.autoLockMinutes]);
+  }, [logout, settings.autoLockMinutes]);
 
   const markModalInHistory = useCallback(() => {
-    if (!window.history.state?.apexModal) {
+    if (!hasModalHistoryState()) {
       window.history.pushState(
-        { ...window.history.state, apexModal: true },
+        { ...historyStateObject(), apexModal: true },
         "",
         window.location.href,
       );
@@ -140,7 +150,7 @@ export function AppShell() {
   const closeModal = useCallback(() => {
     setEntity(null);
     setDetail(null);
-    if (window.history.state?.apexModal) window.history.back();
+    if (hasModalHistoryState()) window.history.back();
   }, []);
 
   useEffect(() => {
@@ -293,7 +303,7 @@ export function AppShell() {
           </NavLink>
           <button
             className="flex min-h-12 w-full items-center gap-3 rounded-xl px-3 text-sm font-semibold text-muted hover:bg-panel-soft hover:text-white"
-            onClick={() => logout.mutate()}
+            onClick={() => logout()}
           >
             <LogOut size={20} />
             Выйти

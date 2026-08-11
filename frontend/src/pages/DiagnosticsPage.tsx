@@ -86,7 +86,8 @@ const statusOrder: DiagnosticStatus[] = [
 ];
 
 function normalizeSearchValue(value: unknown) {
-  return String(value ?? "")
+  const primitive = typeof value === "string" || typeof value === "number" ? value : "";
+  return String(primitive)
     .toLocaleLowerCase("ru-RU")
     .replace(/ё/g, "е")
     .replace(/[^a-zа-я0-9]+/gi, "");
@@ -118,7 +119,7 @@ export function DiagnosticsIndexPage() {
       deleteDiagnostic.mutate(id);
     }
   };
-  const cars = crm.data?.cars ?? [];
+  const cars = useMemo(() => crm.data?.cars ?? [], [crm.data?.cars]);
   const customersById = useMemo(
     () => new Map((crm.data?.customers ?? []).map((customer) => [customer.id, customer])),
     [crm.data?.customers],

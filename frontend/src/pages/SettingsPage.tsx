@@ -1,7 +1,7 @@
 import { Bell, Blocks, Building2, Check, ChevronRight, Cloud, KeyRound, MonitorCog, RotateCcw, ShieldCheck, Smartphone, UsersRound } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Button, Card, Field, inputClass } from "../components/ui";
+import { Button, Card, Field, inputClass, Spinner } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { queryClient } from "../lib/query";
 import type { StaffRole } from "../lib/types";
@@ -39,16 +39,26 @@ function StaffSettings() {
 }
 
 export function SettingsPage() {
-  const stored = useAppSettings(); const [settings, setSettings] = useState<AppSettings>(stored); const [saved, setSaved] = useState(false);
   const workspace = useQuery({ queryKey: ["workspace"], queryFn: api.workspace, retry: false });
-  const saveWorkspace = useMutation({ mutationFn: api.updateWorkspace, onSuccess: async (value) => { setSettings((current) => ({ ...current, workspaceName: value.name, city: value.city ?? "" })); await queryClient.invalidateQueries({ queryKey: ["account"] }); } });
+  if (workspace.isPending) return <Spinner label="Загружаю настройки…" />;
+  return <SettingsContent workspace={workspace.data} />;
+}
+
+function SettingsContent({ workspace }: { workspace?: { name: string; city: string | null } }) {
+  const stored = useAppSettings();
+  const [settings, setSettings] = useState<AppSettings>(() => ({
+    ...stored,
+    workspaceName: workspace?.name ?? stored.workspaceName,
+    city: workspace?.city ?? stored.city,
+  }));
+  const [saved, setSaved] = useState(false);
+  const saveWorkspace = useMutation({ mutationFn: api.updateWorkspace, onMutate: () => setSaved(false), onSuccess: async (value) => { setSettings((current) => ({ ...current, workspaceName: value.name, city: value.city ?? "" })); setSaved(true); window.setTimeout(() => setSaved(false), 1800); await queryClient.invalidateQueries({ queryKey: ["account"] }); } });
   const [passwords, setPasswords] = useState({ current: "", next: "" });
   const changePassword = useMutation({ mutationFn: () => api.changePassword(passwords.current, passwords.next), onSuccess: () => setPasswords({ current: "", next: "" }) });
-  useEffect(() => { if (workspace.data) setSettings((current) => ({ ...current, workspaceName: workspace.data.name, city: workspace.data.city ?? "" })); }, [workspace.data]);
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => { setSaved(false); setSettings((current) => ({ ...current, [key]: value })); };
-  const save = () => { saveSettings(settings); saveWorkspace.mutate({ name: settings.workspaceName, city: settings.city }); setSaved(true); window.setTimeout(() => setSaved(false), 1800); };
+  const save = () => { saveSettings(settings); saveWorkspace.mutate({ name: settings.workspaceName.trim(), city: settings.city.trim() }); };
   return <div className={`mx-auto grid max-w-5xl gap-6 ${settings.compactMode ? "settings-compact" : ""}`}>
-    <header className="flex flex-wrap items-end justify-between gap-4"><div><p className="text-sm font-bold tracking-wide text-apex">УПРАВЛЕНИЕ</p><h1 className="mt-1 text-3xl font-black sm:text-4xl">Настройки</h1><p className="mt-2 max-w-2xl text-muted">Настройте рабочее пространство, доступные модули и поведение Apex CRM.</p></div><Button onClick={save}>{saved && <Check size={18} />}{saved ? "Сохранено" : "Сохранить изменения"}</Button></header>
+    <header className="flex flex-wrap items-end justify-between gap-4"><div><p className="text-sm font-bold tracking-wide text-apex">УПРАВЛЕНИЕ</p><h1 className="mt-1 text-3xl font-black sm:text-4xl">Настройки</h1><p className="mt-2 max-w-2xl text-muted">Настройте рабочее пространство, доступные модули и поведение Apex CRM.</p>{saveWorkspace.error instanceof ApiError && <p className="mt-2 text-sm text-danger" role="alert">{saveWorkspace.error.message}</p>}</div><Button onClick={save} disabled={!settings.workspaceName.trim() || saveWorkspace.isPending}>{saved && <Check size={18} />}{saveWorkspace.isPending ? "Сохраняю…" : saved ? "Сохранено" : "Сохранить изменения"}</Button></header>
     <Card><Heading icon={Building2} title="Рабочее пространство" text="Общие данные вашей организации" /><div className="grid gap-4 sm:grid-cols-2"><Field label="Название автосервиса"><input className={inputClass} value={settings.workspaceName} onChange={(e) => update("workspaceName", e.target.value)} /></Field><Field label="Город и часовой пояс"><input className={inputClass} value={settings.city} onChange={(e) => update("city", e.target.value)} /></Field></div><p className="mt-4 rounded-xl bg-panel-soft p-3 text-sm text-muted">В общей версии здесь появятся филиалы, рабочие посты, нормы времени, валюта, налоги, реквизиты и шаблоны документов.</p></Card>
     <Card><Heading icon={Blocks} title="Модули приложения" text="Отключённые разделы исчезнут из бокового меню" /><div className="grid gap-x-6 md:grid-cols-2">{moduleItems.map((item) => <Row key={item.key} title={item.title} description={item.description} checked={settings.modules[item.key]} onChange={(value) => update("modules", { ...settings.modules, [item.key]: value })} />)}</div></Card>
     <div className="grid gap-6 lg:grid-cols-2"><Card><Heading icon={Bell} title="Уведомления" text="Что требует вашего внимания" /><Row title="На этом устройстве" description="Показывать системные уведомления" checked={settings.desktopNotifications} onChange={(v) => update("desktopNotifications", v)} /><Row title="Напоминания о записи" description="Перед визитом клиента" checked={settings.appointmentReminders} onChange={(v) => update("appointmentReminders", v)} /><Row title="Статусы заказов" description="Готовность, задержки и согласования" checked={settings.orderStatusNotifications} onChange={(v) => update("orderStatusNotifications", v)} /><Row title="Итоги дня" description="Краткая вечерняя сводка" checked={settings.dailySummary} onChange={(v) => update("dailySummary", v)} /></Card>

@@ -3,6 +3,8 @@ import type { AiUsageSummary } from "./types";
 import type { Account, AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, Order, OrderInput, Organization, PartsCatalogResult, PartsCatalogStatus, ProfitLigaOrdersResult, ReceiptUploadResult, RosskoOrdersResult, SearchResults, StaffMember, StaffRole, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
+let accessToken: string | null = null;
+let refreshPromise: Promise<string | null> | null = null;
 
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -10,21 +12,48 @@ export class ApiError extends Error {
 
 const errorSchema = z.object({ detail: z.string().optional() });
 
+type TokenResponse = { access_token: string; token_type: "bearer"; expires_in: number };
+
+async function refreshAccessToken(): Promise<string | null> {
+  if (!refreshPromise) {
+    refreshPromise = fetch(`${API_BASE}/api/refresh`, {
+      method: "POST", credentials: "same-origin",
+    }).then(async (response) => {
+      if (!response.ok) return null;
+      const value = await response.json() as TokenResponse;
+      accessToken = value.access_token;
+      return accessToken;
+    }).finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
+
+async function authenticatedFetch(path: string, init?: RequestInit, retry = true): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  let response = await fetch(`${API_BASE}${path}`, { credentials: "same-origin", ...init, headers });
+  if (response.status === 401 && retry && path !== "/api/login" && path !== "/api/refresh") {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) response = await authenticatedFetch(path, init, false);
+  }
+  return response;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 15_000);
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
-      credentials: "same-origin",
-      ...init,
-      headers: init?.body ? { "Content-Type": "application/json", ...init.headers } : init?.headers,
-      signal: controller.signal,
-    });
+    const response = await authenticatedFetch(path, { ...init, signal: controller.signal });
     if (!response.ok) {
       const parsed = errorSchema.safeParse(await response.json().catch(() => ({})));
       throw new ApiError(response.status, parsed.success && parsed.data.detail ? parsed.data.detail : "Не удалось выполнить запрос");
     }
-    return await response.json() as T;
+    const value = await response.json() as T;
+    if (value && typeof value === "object" && "access_token" in value) {
+      accessToken = String((value as Record<string, unknown>).access_token);
+    }
+    return value;
   } catch (error) {
     if (error instanceof ApiError) throw error;
     if (error instanceof DOMException && error.name === "AbortError") throw new ApiError(408, "Сервер отвечает слишком долго");
@@ -34,8 +63,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 const json = (value: unknown): RequestInit => ({ body: JSON.stringify(value) });
 export const api = {
-  login: (username: string, password: string) => request<{ status: string }>("/api/login", { method: "POST", ...json({ username, password }) }),
-  logout: () => request<{ status: string }>("/api/logout", { method: "POST" }),
+  login: (username: string, password: string) => request<{ status: string } & TokenResponse>("/api/login", { method: "POST", ...json({ username, password }) }),
+  logout: async () => { const result = await request<{ status: string }>("/api/logout", { method: "POST" }); accessToken = null; return result; },
   account: () => request<Account>("/api/account"),
   staff: () => request<StaffMember[]>("/api/settings/staff"),
   createStaff: (value: { username: string; password: string; full_name: string; role: StaffRole }) => request<StaffMember>("/api/settings/staff", { method: "POST", ...json(value) }),
@@ -55,7 +84,7 @@ export const api = {
   diagnostics: (carId?: number) => request<DiagnosticSummary[]>(`/api/diagnostics${carId ? `?car_id=${carId}` : ""}`),
   diagnostic: (id: number) => request<Diagnostic>(`/api/diagnostics/${id}`),
   diagnosticPdf: async (id: number) => {
-    const response = await fetch(`${API_BASE}/api/diagnostics/${id}/pdf`, { credentials: "same-origin" });
+    const response = await authenticatedFetch(`/api/diagnostics/${id}/pdf`);
     if (!response.ok) throw new ApiError(response.status, "Не удалось сформировать PDF");
     return response.blob();
   },

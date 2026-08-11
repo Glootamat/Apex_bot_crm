@@ -7,9 +7,9 @@ After=network-online.target
 Type=simple
 User=apexcrm
 Group=apexcrm
-WorkingDirectory=/opt/apex-crm
-EnvironmentFile=/opt/apex-crm/.env
-ExecStart=/opt/apex-crm/.venv/bin/python /opt/apex-crm/bot.py
+WorkingDirectory=/opt/apex-crm/current
+EnvironmentFile=/opt/apex-crm/shared/.env
+ExecStart=/opt/apex-crm/current/.venv/bin/python /opt/apex-crm/current/bot.py
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -18,7 +18,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/apex-crm
+ReadWritePaths=/opt/apex-crm/shared
 
 [Install]
 WantedBy=multi-user.target

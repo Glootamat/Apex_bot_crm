@@ -1,5 +1,9 @@
 # CRM автосервиса в Telegram
 
+Актуальное описание компонентов, границ ИИ, принципов разработки и целевого CI/CD:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Настройка production CI/CD: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 Локальный Telegram-бот для учёта автомобилей и заказ-нарядов. Данные хранятся в файле `workshop.sqlite3` рядом с программой.
 
 Сейчас бот умеет:

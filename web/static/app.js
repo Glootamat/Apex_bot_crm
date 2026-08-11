@@ -16,15 +16,33 @@ const numberOrNull = (value) => value === "" || value == null ? null : Number(va
 let crm = {customers:[], cars:[], appointments:[], orders:[], finance:{}};
 let currentView = "dashboard";
 let orderFilter = "active";
+let accessToken = null;
+let refreshing = null;
 
-async function api(url, options = {}) {
-  const response = await fetch(url, {credentials:"same-origin", ...options});
+async function refreshAccess() {
+  if (!refreshing) refreshing = fetch("/api/refresh", {method:"POST", credentials:"same-origin"})
+    .then(async (response) => response.ok ? (await response.json()).access_token : null)
+    .finally(() => { refreshing = null; });
+  accessToken = await refreshing;
+  return accessToken;
+}
+
+async function api(url, options = {}, retry = true) {
+  const headers = new Headers(options.headers || {});
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  let response = await fetch(url, {credentials:"same-origin", ...options, headers});
+  if (response.status === 401 && retry && !["/api/login", "/api/refresh"].includes(url) && await refreshAccess()) {
+    response = await api(url, options, false);
+    return response;
+  }
   if (response.status === 401) throw new Error("AUTH");
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || "Ошибка сервера");
   }
-  return response.json();
+  const value = await response.json();
+  if (value?.access_token) accessToken = value.access_token;
+  return value;
 }
 
 function showLogin() { $("#dashboard").hidden = true; $("#sectionView").hidden = true; $("#loginScreen").hidden = false; }
@@ -175,7 +193,7 @@ $("#entityForm").addEventListener("submit",(e)=>{e.preventDefault();saveForm(e.c
 $("#searchButton").addEventListener("click",runSearch); $("#searchInput").addEventListener("keydown",e=>{if(e.key==="Enter")runSearch();});
 $("#refreshButton").addEventListener("click",async()=>{await loadAll();toast("Данные обновлены");});
 $("#focusSearch").addEventListener("click",()=>{$("#searchInput").focus();$("#searchInput").scrollIntoView({behavior:"smooth",block:"center"});});
-$("#logoutButton").addEventListener("click",async()=>{await fetch("/api/logout",{method:"POST",credentials:"same-origin"}).catch(()=>{});showLogin();});
+$("#logoutButton").addEventListener("click",async()=>{await api("/api/logout",{method:"POST"}).catch(()=>{});accessToken=null;showLogin();});
 document.addEventListener("click",async(e)=>{
   const view=e.target.closest("[data-view]"); if(view){showView(view.dataset.view);return;}
   const create=e.target.closest("[data-create]"); if(create){openForm(create.dataset.create,null,{carId:create.dataset.carId,customerId:create.dataset.customerId});return;}

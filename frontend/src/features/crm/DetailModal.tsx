@@ -417,7 +417,9 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
       </Modal>
     );
   const o = detail.value;
-  const markup = o.parts_revenue - o.parts_cost + o.parts_profit;
+  const markup = o.parts_revenue === 0
+    ? o.parts_profit
+    : o.parts_revenue - o.parts_cost + o.parts_profit;
   const works = attachments.filter((x) => x.photo_type === "work" && x.url);
   const diagnosticAction = (
     <Button

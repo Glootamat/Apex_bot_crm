@@ -15,6 +15,8 @@ import aiohttp
 
 API_URL = "https://openrouter.ai/api/v1"
 T = TypeVar("T")
+MAX_MONEY_RUB = 1_000_000_000
+MAX_RECEIPT_ITEMS = 100
 
 
 @dataclass(frozen=True)
@@ -178,14 +180,14 @@ RECEIPT_SCHEMA = {
         "type": "object",
         "properties": {
             "document_type": {"type": "string", "enum": ["receipt", "supplier_cart", "unknown"]},
-            "items": {"type": "array", "items": {"type": "object", "properties": {
-                "name": {"type": "string"},
-                "article": {"type": ["string", "null"]},
-                "quantity": {"type": ["number", "null"], "minimum": 0},
-                "unit_cost": {"type": ["integer", "null"], "minimum": 0},
-                "total_cost": {"type": ["integer", "null"], "minimum": 0},
+            "items": {"type": "array", "maxItems": MAX_RECEIPT_ITEMS, "items": {"type": "object", "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 200},
+                "article": {"type": ["string", "null"], "maxLength": 100},
+                "quantity": {"type": ["number", "null"], "minimum": 0, "maximum": 100000},
+                "unit_cost": {"type": ["integer", "null"], "minimum": 0, "maximum": MAX_MONEY_RUB},
+                "total_cost": {"type": ["integer", "null"], "minimum": 0, "maximum": MAX_MONEY_RUB},
             }, "required": ["name", "article", "quantity", "unit_cost", "total_cost"], "additionalProperties": False}},
-            "total_cost": {"type": ["integer", "null"], "minimum": 0},
+            "total_cost": {"type": ["integer", "null"], "minimum": 0, "maximum": MAX_MONEY_RUB},
         },
         "required": ["document_type", "items", "total_cost"],
         "additionalProperties": False,
@@ -251,11 +253,19 @@ Never invent obscured or uncertain characters. Do not return owner personal data
         vin = re.sub(r"[^A-HJ-NPR-Z0-9]", "", str(parsed.get("vin") or "").upper()) or None
         if vin is not None and len(vin) != 17:
             vin = None
+        document_type = parsed["document_type"]
+        confidence = parsed["confidence"]
+        year = parsed.get("year")
+        if document_type not in {"vin_plate", "pts", "sts", "vin_text", "unknown"} or confidence not in {"high", "medium", "low"}:
+            raise ValueError("Invalid vehicle recognition result")
+        if year is not None and (isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2100):
+            raise ValueError("Invalid vehicle year")
         analysis = VehicleDocumentAnalysis(
-            document_type=parsed["document_type"], vin=vin,
-            plate_number=parsed.get("plate_number"), brand=parsed.get("brand"),
-            model=parsed.get("model"), year=parsed.get("year"),
-            confidence=parsed["confidence"],
+            document_type=document_type, vin=vin,
+            plate_number=_optional_short_text(parsed.get("plate_number"), 20),
+            brand=_optional_short_text(parsed.get("brand"), 200),
+            model=_optional_short_text(parsed.get("model"), 200), year=year,
+            confidence=confidence,
         )
         actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
         return AIResponse(analysis, actual_model, input_tokens, output_tokens, cost_usd)
@@ -290,14 +300,10 @@ total when unit price and quantity are visible; use the visible document total w
         data = json.loads(body)
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content) if isinstance(content, str) else content
-        analysis = ReceiptAnalysis(
-            document_type=parsed["document_type"],
-            items=[ReceiptItem(**item) for item in parsed["items"]],
-            total_cost=parsed["total_cost"],
-        )
+        analysis = _validate_receipt(parsed)
         actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
         return AIResponse(analysis, actual_model, input_tokens, output_tokens, cost_usd)
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise OpenRouterError("Could not recognize receipt data.") from error
 
 
@@ -380,8 +386,79 @@ intent:
     try:
         data = json.loads(body)
         content = data["choices"][0]["message"]["content"]
-        command = WorkshopCommand(**(json.loads(content) if isinstance(content, str) else content))
+        command = _validate_workshop_command(
+            json.loads(content) if isinstance(content, str) else content
+        )
         actual_model, input_tokens, output_tokens, cost_usd = _response_meta(data, model)
         return AIResponse(command, actual_model, input_tokens, output_tokens, cost_usd)
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise OpenRouterError("Не удалось разобрать ответ OpenRouter.") from error
+
+
+def _validate_receipt(value: object) -> ReceiptAnalysis:
+    if not isinstance(value, dict) or value.get("document_type") not in {"receipt", "supplier_cart", "unknown"}:
+        raise ValueError("Invalid receipt")
+    rows = value.get("items")
+    if not isinstance(rows, list) or len(rows) > MAX_RECEIPT_ITEMS:
+        raise ValueError("Invalid receipt items")
+    items: list[ReceiptItem] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Invalid receipt item")
+        name = str(row.get("name") or "").strip()
+        article = str(row["article"]).strip() if row.get("article") is not None else None
+        quantity = _bounded_number(row.get("quantity"), 100_000, integer=False)
+        unit_cost = _bounded_number(row.get("unit_cost"), MAX_MONEY_RUB)
+        line_total = _bounded_number(row.get("total_cost"), MAX_MONEY_RUB)
+        if not name or len(name) > 200 or (article is not None and len(article) > 100):
+            raise ValueError("Invalid receipt text")
+        if line_total is None and quantity is not None and unit_cost is not None:
+            line_total = round(quantity * unit_cost)
+        if line_total is None or line_total <= 0:
+            continue
+        items.append(ReceiptItem(name, article or None, quantity, unit_cost, int(line_total)))
+    total = sum(item.total_cost or 0 for item in items)
+    if total <= 0 or total > MAX_MONEY_RUB:
+        raise ValueError("Invalid receipt total")
+    return ReceiptAnalysis(str(value["document_type"]), items, total)
+
+
+def _optional_short_text(value: object, maximum: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid text value")
+    result = value.strip()
+    if len(result) > maximum:
+        raise ValueError("Text value is too long")
+    return result or None
+
+
+def _bounded_number(value: object, maximum: float, *, integer: bool = True) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Invalid numeric value")
+    number = float(value)
+    if not 0 <= number <= maximum or (integer and not number.is_integer()):
+        raise ValueError("Numeric value outside allowed range")
+    return int(number) if integer else number
+
+
+def _validate_workshop_command(value: object) -> WorkshopCommand:
+    if not isinstance(value, dict):
+        raise ValueError("Invalid command")
+    command = WorkshopCommand(**value)
+    for field in ("labor_revenue", "parts_cost", "parts_revenue", "parts_profit", "agreed_amount"):
+        _bounded_number(getattr(command, field), MAX_MONEY_RUB)
+    for field in ("mileage", "next_service_mileage", "order_id"):
+        _bounded_number(getattr(command, field), 2_147_483_647)
+    if command.parts_markup_percent is not None:
+        _bounded_number(command.parts_markup_percent, 1000, integer=False)
+    if command.car_year is not None and not 1900 <= command.car_year <= 2100:
+        raise ValueError("Invalid vehicle year")
+    for field, field_value in vars(command).items():
+        limit = 4000 if field in {"description", "concern", "recommendations"} else 200
+        if isinstance(field_value, str) and len(field_value) > limit:
+            raise ValueError("Command text is too long")
+    return command

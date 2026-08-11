@@ -390,6 +390,26 @@ class Database:
                     UNIQUE(organization_id, account_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS refresh_sessions (
+                    id TEXT PRIMARY KEY,
+                    family_id TEXT NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    organization_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    replaced_by TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT,
+                    FOREIGN KEY (account_id) REFERENCES auth_accounts(id) ON DELETE CASCADE,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_refresh_sessions_account
+                    ON refresh_sessions(account_id, organization_id);
+                CREATE INDEX IF NOT EXISTS idx_refresh_sessions_family
+                    ON refresh_sessions(family_id);
+
                 CREATE TABLE IF NOT EXISTS cars (
                     id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL,
@@ -820,7 +840,7 @@ class Database:
         try:
             row = connection.execute(
                 """SELECT a.id, a.username, a.password_hash, a.full_name, a.active,
-                          a.platform_admin, m.organization_id, m.role,
+                          a.platform_admin, a.password_changed_at, m.organization_id, m.role,
                           o.name AS organization_name, o.data_owner_user_id, o.demo_expires_at,
                           u.telegram_id AS data_owner_telegram_id
                    FROM auth_accounts a
@@ -841,6 +861,7 @@ class Database:
         try:
             row = connection.execute(
                 """SELECT a.id, a.username, a.full_name, a.active, a.platform_admin,
+                          a.password_hash, a.password_changed_at,
                           m.organization_id, m.role, o.name AS organization_name, o.demo_expires_at,
                           o.data_owner_user_id, u.telegram_id AS data_owner_telegram_id
                    FROM auth_accounts a
@@ -852,6 +873,117 @@ class Database:
             ).fetchone()
             result = dict(row) if row else None
             return None if result and _timestamp_expired(result.get("demo_expires_at")) else result
+        finally:
+            connection.close()
+
+    def create_refresh_session(
+        self, session_id: str, family_id: str, account_id: int,
+        organization_id: int, token_hash: str, expires_at: str,
+    ) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                """INSERT INTO refresh_sessions
+                   (id, family_id, account_id, organization_id, token_hash, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, family_id, account_id, organization_id, token_hash, expires_at),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_refresh_session(self, token_hash: str) -> dict[str, object] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM refresh_sessions WHERE token_hash = ?", (token_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            connection.close()
+
+    def refresh_family_active(
+        self, family_id: str, account_id: int, organization_id: int,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """SELECT expires_at FROM refresh_sessions
+                   WHERE family_id = ? AND account_id = ? AND organization_id = ?
+                     AND revoked_at IS NULL
+                   ORDER BY created_at DESC LIMIT 1""",
+                (family_id, account_id, organization_id),
+            ).fetchone()
+            if row is None:
+                return False
+            expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return expires_at > datetime.now(timezone.utc)
+        except ValueError:
+            return False
+        finally:
+            connection.close()
+
+    def rotate_refresh_session(
+        self, current_id: str, new_id: str, family_id: str, account_id: int,
+        organization_id: int, token_hash: str, expires_at: str,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            cursor = connection.execute(
+                """UPDATE refresh_sessions
+                   SET revoked_at = CURRENT_TIMESTAMP, replaced_by = ?, last_used_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND revoked_at IS NULL""",
+                (new_id, current_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute(
+                """INSERT INTO refresh_sessions
+                   (id, family_id, account_id, organization_id, token_hash, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (new_id, family_id, account_id, organization_id, token_hash, expires_at),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def revoke_refresh_session(self, token_hash: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE token_hash = ?",
+                (token_hash,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def revoke_refresh_family(self, family_id: str) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE family_id = ?",
+                (family_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def revoke_account_sessions(self, account_id: int) -> None:
+        connection = self.connect()
+        try:
+            connection.execute(
+                "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE account_id = ?",
+                (account_id,),
+            )
+            connection.commit()
         finally:
             connection.close()
 
@@ -1375,7 +1507,7 @@ class Database:
         self, user_id: int, appointment_id: int, *, car_id: int | None = None,
         description: str | None = None, starts_at: str | None = None,
         agreed_amount: int | None = None, is_flexible: bool | None = None,
-        parts_source: str | None = None,
+        parts_source: str | None = None, replace_nullable: bool = False,
     ) -> bool:
         connection = self.connect()
         try:
@@ -1402,13 +1534,15 @@ class Database:
             appointment_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(appointments)")
             }
+            nullable_amount = "?" if replace_nullable else "COALESCE(?, agreed_amount)"
+            nullable_source = "?" if replace_nullable else "COALESCE(?, parts_source)"
             if "ends_at" in appointment_columns:
                 ends_at = (datetime.fromisoformat(target_start) + timedelta(hours=1)).isoformat()
                 connection.execute(
-                    """UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
-                              ends_at = ?, agreed_amount = COALESCE(?, agreed_amount),
+                    f"""UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
+                              ends_at = ?, agreed_amount = {nullable_amount},
                               is_flexible = COALESCE(?, is_flexible),
-                              parts_source = COALESCE(?, parts_source)
+                              parts_source = {nullable_source}
                        WHERE id = ?""",
                     (
                         target_car_id, target_description, target_start, ends_at,
@@ -1418,10 +1552,10 @@ class Database:
                 )
             else:
                 connection.execute(
-                    """UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
-                              agreed_amount = COALESCE(?, agreed_amount),
+                    f"""UPDATE appointments SET car_id = ?, description = ?, starts_at = ?,
+                              agreed_amount = {nullable_amount},
                               is_flexible = COALESCE(?, is_flexible),
-                              parts_source = COALESCE(?, parts_source)
+                              parts_source = {nullable_source}
                        WHERE id = ?""",
                     (
                         target_car_id, target_description, target_start, agreed_amount,
@@ -1536,14 +1670,24 @@ class Database:
         finally:
             connection.close()
 
-    def update_customer(self, customer_id: int, full_name: str | None, phone: str | None) -> None:
+    def update_customer(
+        self, customer_id: int, full_name: str | None, phone: str | None,
+        *, replace_nullable: bool = False,
+    ) -> None:
         connection = self.connect()
         try:
-            connection.execute(
-                """UPDATE customers SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone),
-                   phone_normalized = COALESCE(?, phone_normalized) WHERE id = ?""",
-                (full_name, phone, self.normalize_phone(phone), customer_id),
-            )
+            if replace_nullable:
+                connection.execute(
+                    """UPDATE customers SET full_name = COALESCE(?, full_name), phone = ?,
+                       phone_normalized = ? WHERE id = ?""",
+                    (full_name, phone, self.normalize_phone(phone), customer_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE customers SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone),
+                       phone_normalized = COALESCE(?, phone_normalized) WHERE id = ?""",
+                    (full_name, phone, self.normalize_phone(phone), customer_id),
+                )
             connection.commit()
         finally:
             connection.close()
@@ -2034,17 +2178,27 @@ class Database:
         finally:
             connection.close()
 
-    def update_car(self, car_id: int, customer_id: int | None, brand: str | None, model: str | None, year: int | None, plate_number: str | None, vin: str | None, mileage: int | None, next_service_date: str | None = None, next_service_mileage: int | None = None) -> None:
+    def update_car(self, car_id: int, customer_id: int | None, brand: str | None, model: str | None, year: int | None, plate_number: str | None, vin: str | None, mileage: int | None, next_service_date: str | None = None, next_service_mileage: int | None = None, *, replace_nullable: bool = False) -> None:
         connection = self.connect()
         try:
-            connection.execute(
-                """UPDATE cars SET customer_id = COALESCE(?, customer_id), brand = COALESCE(?, brand),
-                   model = COALESCE(?, model), year = COALESCE(?, year), plate_number = COALESCE(?, plate_number),
-                   plate_normalized = COALESCE(?, plate_normalized), vin = COALESCE(?, vin),
-                   mileage = COALESCE(?, mileage), next_service_date = COALESCE(?, next_service_date),
-                   next_service_mileage = COALESCE(?, next_service_mileage) WHERE id = ?""",
-                (customer_id, brand, model, year, plate_number, self.normalize_plate(plate_number), vin, mileage, next_service_date, next_service_mileage, car_id),
-            )
+            if replace_nullable:
+                connection.execute(
+                    """UPDATE cars SET customer_id = ?, brand = COALESCE(?, brand),
+                       model = COALESCE(?, model), year = ?, plate_number = ?,
+                       plate_normalized = ?, vin = ?, mileage = ?,
+                       next_service_date = COALESCE(?, next_service_date),
+                       next_service_mileage = COALESCE(?, next_service_mileage) WHERE id = ?""",
+                    (customer_id, brand, model, year, plate_number, self.normalize_plate(plate_number), vin, mileage, next_service_date, next_service_mileage, car_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE cars SET customer_id = COALESCE(?, customer_id), brand = COALESCE(?, brand),
+                       model = COALESCE(?, model), year = COALESCE(?, year), plate_number = COALESCE(?, plate_number),
+                       plate_normalized = COALESCE(?, plate_normalized), vin = COALESCE(?, vin),
+                       mileage = COALESCE(?, mileage), next_service_date = COALESCE(?, next_service_date),
+                       next_service_mileage = COALESCE(?, next_service_mileage) WHERE id = ?""",
+                    (customer_id, brand, model, year, plate_number, self.normalize_plate(plate_number), vin, mileage, next_service_date, next_service_mileage, car_id),
+                )
             connection.commit()
         finally:
             connection.close()
@@ -2197,9 +2351,9 @@ class Database:
         return self.get_service_order(order_id)
 
     def update_order_parts_source(
-        self, order_id: int, parts_source: str, user_id: int | None = None
+        self, order_id: int, parts_source: str | None, user_id: int | None = None
     ) -> ServiceOrder:
-        if parts_source not in {"customer", "workshop"}:
+        if parts_source is not None and parts_source not in {"customer", "workshop"}:
             raise ValueError("Unknown parts source")
         connection = self.connect()
         try:
@@ -2357,6 +2511,32 @@ class Database:
                 (service_order_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def user_owns_order_photo(self, user_id: int, filename: str) -> bool:
+        connection = self.connect()
+        try:
+            return connection.execute(
+                """SELECT 1 FROM order_photos op
+                   JOIN service_orders o ON o.id = op.service_order_id
+                   JOIN cars c ON c.id = o.car_id
+                   WHERE op.telegram_file_id = ? AND c.user_id = ?""",
+                (f"pwa:{filename}", user_id),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
+    def user_owns_diagnostic_photo(self, user_id: int, filename: str) -> bool:
+        connection = self.connect()
+        try:
+            return connection.execute(
+                """SELECT 1 FROM diagnostic_photos dp
+                   JOIN diagnostics d ON d.id = dp.diagnostic_id
+                   JOIN cars c ON c.id = d.car_id
+                   WHERE dp.filename = ? AND c.user_id = ?""",
+                (filename, user_id),
+            ).fetchone() is not None
         finally:
             connection.close()
 
@@ -2788,6 +2968,7 @@ class Database:
     def update_order_crm_fields(
         self, order_id: int, user_id: int | None = None, *, concern: str | None = None,
         agreed_amount: int | None = None, recommendations: str | None = None,
+        replace_nullable: bool = False,
     ) -> ServiceOrder:
         connection = self.connect()
         try:
@@ -2796,12 +2977,19 @@ class Database:
             ).fetchone()
             if current is None:
                 raise ValueError(f"Service order {order_id} does not exist")
-            connection.execute(
-                """UPDATE service_orders SET concern = COALESCE(?, concern),
-                   agreed_amount = COALESCE(?, agreed_amount), recommendations = COALESCE(?, recommendations)
-                   WHERE id = ?""",
-                (concern, agreed_amount, recommendations, order_id),
-            )
+            if replace_nullable:
+                connection.execute(
+                    """UPDATE service_orders SET concern = ?, agreed_amount = ?, recommendations = ?
+                       WHERE id = ?""",
+                    (concern, agreed_amount, recommendations, order_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE service_orders SET concern = COALESCE(?, concern),
+                       agreed_amount = COALESCE(?, agreed_amount), recommendations = COALESCE(?, recommendations)
+                       WHERE id = ?""",
+                    (concern, agreed_amount, recommendations, order_id),
+                )
             details = f"concern={concern!r}; agreed_amount={agreed_amount!r}; recommendations={recommendations!r}"
             self._write_audit(connection, user_id, "order", order_id, "crm_fields_updated", details)
             connection.commit()

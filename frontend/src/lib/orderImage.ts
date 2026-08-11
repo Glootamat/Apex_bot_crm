@@ -217,7 +217,10 @@ async function canvasPdf(canvas: HTMLCanvasElement) {
   const jpeg = new Uint8Array(await (await canvasBlob(canvas, "image/jpeg", 0.92)).arrayBuffer());
   const pageWidth = 595; const pageHeight = 842; const imageHeight = canvas.height * pageWidth / canvas.width;
   const pageCount = Math.max(1, Math.ceil(imageHeight / pageHeight)); const imageId = 3 + pageCount; const firstContentId = imageId + 1;
-  const objects: Uint8Array[] = new Array(3 + pageCount * 2 + 1);
+  const objects: (Uint8Array | undefined)[] = Array.from(
+    { length: 3 + pageCount * 2 + 1 },
+    () => undefined,
+  );
   objects[1] = bytes("<< /Type /Catalog /Pages 2 0 R >>");
   objects[2] = bytes(`<< /Type /Pages /Kids [${Array.from({ length: pageCount }, (_, index) => `${3 + index} 0 R`).join(" ")}] /Count ${pageCount} >>`);
   for (let index = 0; index < pageCount; index++) objects[3 + index] = bytes(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${firstContentId + index} 0 R >>`);

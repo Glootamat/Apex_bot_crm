@@ -7,22 +7,25 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from aiohttp import ClientError
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, Response as FastAPIResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 from psycopg import IntegrityError as PostgresIntegrityError
 
 from database import Database
@@ -53,8 +56,75 @@ app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 UPLOAD_DIR = BASE_DIR / "uploads" / "order_photos"
 DIAGNOSTIC_UPLOAD_DIR = BASE_DIR / "uploads" / "diagnostics"
 
-COOKIE_NAME = "apex_crm_session"
-SESSION_SECONDS = 12 * 60 * 60
+COOKIE_NAME = "apex_crm_refresh"
+ACCESS_TOKEN_SECONDS = 10 * 60
+REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60
+JWT_ISSUER = "apex-crm"
+JWT_AUDIENCE = "apex-crm-pwa"
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_FAILURES = 5
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
+
+RequiredName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+RequiredText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+OptionalText = Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=4000)]
+PartsSource = Literal["workshop", "customer"] | None
+
+
+def _mechanic_can_mutate(method: str, path: str) -> bool:
+    if path == "/api/logout" or path.startswith("/api/diagnostics"):
+        return True
+    match = re.fullmatch(r"/api/orders/(\d+)(?:/(status|photos))?", path)
+    if match is None:
+        return False
+    action = match.group(2)
+    return (method == "PUT" and action is None) or (
+        method == "POST" and action in {"status", "photos"}
+    )
+
+
+def _login_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _login_is_limited(key: str) -> bool:
+    now = time.monotonic()
+    with _login_failures_lock:
+        if len(_login_failures) > 4096:
+            expired = [candidate for candidate, stamps in _login_failures.items() if not stamps or now - stamps[-1] >= LOGIN_WINDOW_SECONDS]
+            for candidate in expired:
+                _login_failures.pop(candidate, None)
+        failures = [stamp for stamp in _login_failures.get(key, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+        _login_failures[key] = failures
+        return len(failures) >= LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(key: str) -> None:
+    with _login_failures_lock:
+        _login_failures.setdefault(key, []).append(time.monotonic())
+
+
+def _clear_login_failures(key: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(key, None)
+
+
+def _valid_image_content(content_type: str, content: bytes) -> bool:
+    if content_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if content_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if content_type == "image/webp":
+        return len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+    return False
+
+
+def _password_version(account: dict[str, object]) -> str:
+    digest = hmac.new(
+        _session_secret(), str(account.get("password_hash") or "").encode("utf-8"), hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest[:16]).rstrip(b"=").decode("ascii")
 
 
 @app.middleware("http")
@@ -64,18 +134,45 @@ async def prevent_api_caching(request: Request, call_next):
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+        "manifest-src 'self'; worker-src 'self' blob:"
+    )
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
 @app.middleware("http")
 async def bind_authentication_context(request: Request, call_next):
-    """Bind tenant identity before FastAPI moves sync handlers to worker threads."""
+    """Centrally authenticate every private API route with a Bearer access JWT."""
     context = None
-    identity = session_identity(request.cookies.get(COOKIE_NAME))
+    authorization = request.headers.get("authorization", "")
+    identity = session_identity(authorization[7:].strip()) if authorization.lower().startswith("bearer ") else None
     if identity is not None:
-        context = db.get_auth_context(*identity)
+        if db.refresh_family_active(identity[3], identity[0], identity[1]):
+            context = db.get_auth_context(identity[0], identity[1])
+        current_password_version = _password_version(context) if context else ""
+        if context is not None and not secrets.compare_digest(identity[2], current_password_version):
+            context = None
     token = _auth_context.set(context)
     try:
+        public_api = {"/api/login", "/api/refresh", "/api/logout"}
+        if (
+            request.url.path.startswith("/api/") and request.url.path not in public_api
+            and request.method != "OPTIONS" and context is None
+        ):
+            return FastAPIResponse(
+                content=json.dumps({"detail": "Authentication required"}),
+                status_code=status.HTTP_401_UNAUTHORIZED, media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         if context is not None and request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
             role = str(context["role"])
             if role in {"viewer", "accountant"} and request.url.path not in {"/api/logout"}:
@@ -83,11 +180,7 @@ async def bind_authentication_context(request: Request, call_next):
                     content=json.dumps({"detail": "Для вашей роли доступен только просмотр"}, ensure_ascii=False),
                     status_code=status.HTTP_403_FORBIDDEN, media_type="application/json",
                 )
-            if role == "mechanic" and not (
-                request.url.path.startswith("/api/diagnostics")
-                or request.url.path.startswith("/api/orders/")
-                or request.url.path == "/api/logout"
-            ):
+            if role == "mechanic" and not _mechanic_can_mutate(request.method, request.url.path):
                 return FastAPIResponse(
                     content=json.dumps({"detail": "Механик может изменять только работы и диагностику"}, ensure_ascii=False),
                     status_code=status.HTTP_403_FORBIDDEN, media_type="application/json",
@@ -98,132 +191,152 @@ async def bind_authentication_context(request: Request, call_next):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+    password: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
 
 
 class StaffCreatePayload(BaseModel):
-    username: str
-    password: str
-    full_name: str
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+    password: Annotated[str, StringConstraints(min_length=10, max_length=1024)]
+    full_name: RequiredName
     role: str
 
 
 class StaffUpdatePayload(BaseModel):
     role: str | None = None
     active: bool | None = None
-    password: str | None = None
+    password: Annotated[str | None, StringConstraints(min_length=10, max_length=1024)] = None
 
 
 class OrganizationCreatePayload(BaseModel):
-    name: str
-    city: str | None = None
-    owner_name: str
-    username: str
-    password: str
+    name: RequiredName
+    city: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=200)] = None
+    owner_name: RequiredName
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+    password: Annotated[str, StringConstraints(min_length=10, max_length=1024)]
     demo: bool = True
 
 
 class WorkspacePayload(BaseModel):
-    name: str
-    city: str | None = None
+    name: RequiredName
+    city: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=200)] = None
 
 
 class PasswordChangePayload(BaseModel):
-    current_password: str
-    new_password: str
+    current_password: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+    new_password: Annotated[str, StringConstraints(min_length=10, max_length=1024)]
 
 
 class OrganizationAccessPayload(BaseModel):
-    action: str
+    action: Literal["block", "activate", "demo"]
 
 
 class CustomerPayload(BaseModel):
-    full_name: str
-    phone: str | None = None
+    full_name: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
+    phone: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=50)] = None
 
 
 class CarPayload(BaseModel):
-    customer_id: int | None = None
-    brand: str
-    model: str
-    year: int | None = None
-    plate_number: str | None = None
-    vin: str | None = None
-    mileage: int | None = None
+    customer_id: Annotated[int | None, Field(gt=0)] = None
+    brand: RequiredName
+    model: RequiredName
+    year: Annotated[int | None, Field(ge=1886, le=2100)] = None
+    plate_number: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=20)] = None
+    vin: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=17)] = None
+    mileage: Annotated[int | None, Field(ge=0, le=10_000_000)] = None
+
+    @field_validator("vin")
+    @classmethod
+    def validate_vin(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = value.upper()
+        if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", normalized):
+            raise ValueError("VIN должен содержать 17 допустимых символов")
+        return normalized
 
 
 class AppointmentPayload(BaseModel):
-    car_id: int
-    description: str
-    starts_at: str
-    agreed_amount: int | None = None
+    car_id: Annotated[int, Field(gt=0)]
+    description: RequiredText
+    starts_at: Annotated[str, StringConstraints(strip_whitespace=True, min_length=16, max_length=40)]
+    agreed_amount: Annotated[int | None, Field(ge=0, le=1_000_000_000)] = None
     is_flexible: bool = False
-    parts_source: str | None = None
+    parts_source: PartsSource = None
+
+    @field_validator("starts_at")
+    @classmethod
+    def validate_starts_at(cls, value: str) -> str:
+        try:
+            from datetime import datetime
+            datetime.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("Укажите корректные дату и время") from error
+        return value
 
 
 class OrderPayload(BaseModel):
-    car_id: int
-    description: str
-    labor_revenue: int = 0
-    parts_cost: int = 0
-    parts_revenue: int = 0
-    parts_profit: int = 0
-    concern: str | None = None
-    agreed_amount: int | None = None
-    recommendations: str | None = None
-    parts_source: str | None = None
+    car_id: Annotated[int, Field(gt=0)]
+    description: RequiredText
+    labor_revenue: Annotated[int, Field(ge=0, le=1_000_000_000)] = 0
+    parts_cost: Annotated[int, Field(ge=0, le=1_000_000_000)] = 0
+    parts_revenue: Annotated[int, Field(ge=0, le=1_000_000_000)] = 0
+    parts_profit: Annotated[int, Field(ge=0, le=1_000_000_000)] = 0
+    concern: OptionalText = None
+    agreed_amount: Annotated[int | None, Field(ge=0, le=1_000_000_000)] = None
+    recommendations: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=10_000)] = None
+    parts_source: PartsSource = None
 
 
 class ActionPayload(BaseModel):
-    action: str
+    action: Literal["arrived", "no_show", "ready", "in_progress", "completed"]
 
 
 class DiagnosticStartPayload(BaseModel):
-    car_id: int
-    service_order_id: int | None = None
+    car_id: Annotated[int, Field(gt=0)]
+    service_order_id: Annotated[int | None, Field(gt=0)] = None
 
 
 class DiagnosticItemPayload(BaseModel):
-    status: str | None = None
-    left_status: str | None = None
-    right_status: str | None = None
-    comment: str | None = None
-    recommendation: str | None = None
-    estimated_cost: int | None = None
+    status: Literal["unchecked", "ok", "attention", "critical"] | None = None
+    left_status: Literal["unchecked", "ok", "attention", "critical"] | None = None
+    right_status: Literal["unchecked", "ok", "attention", "critical"] | None = None
+    comment: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=4000)] = None
+    recommendation: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=4000)] = None
+    estimated_cost: Annotated[int | None, Field(ge=0, le=1_000_000_000)] = None
 
 
 class DiagnosticPayload(BaseModel):
-    mileage: int | None = None
-    notes: str | None = None
-    status: str = "draft"
+    mileage: Annotated[int | None, Field(ge=0, le=10_000_000)] = None
+    notes: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=10_000)] = None
+    status: Literal["draft", "completed"] = "draft"
 
 
 class VinRecognitionPayload(BaseModel):
-    vin: str
+    vin: Annotated[str, StringConstraints(strip_whitespace=True, min_length=17, max_length=17)]
 
 
 class CatalogAddPayload(BaseModel):
-    order_id: int
-    name: str
-    article: str
-    quantity: int = 1
-    purchase_price: int
-    markup_percent: float = 40
+    order_id: Annotated[int, Field(gt=0)]
+    name: RequiredName
+    article: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    quantity: Annotated[int, Field(ge=1, le=999)] = 1
+    purchase_price: Annotated[int, Field(gt=0, le=1_000_000_000)]
+    markup_percent: Annotated[float, Field(ge=0, le=300)] = 40
 
 
 class RosskoImportPayload(BaseModel):
-    order_id: int
-    rossko_order_id: int
-    markup_percent: float = 40
-    part_articles: list[str] | None = None
+    order_id: Annotated[int, Field(gt=0)]
+    rossko_order_id: Annotated[int, Field(gt=0)]
+    markup_percent: Annotated[float, Field(ge=0, le=300)] = 40
+    part_articles: Annotated[list[str] | None, Field(max_length=999)] = None
 
 
 class ProfitLigaImportPayload(BaseModel):
-    order_id: int
-    profit_order_id: str
-    markup_percent: float = 40
-    part_articles: list[str] | None = None
+    order_id: Annotated[int, Field(gt=0)]
+    profit_order_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    markup_percent: Annotated[float, Field(ge=0, le=300)] = 40
+    part_articles: Annotated[list[str] | None, Field(max_length=999)] = None
 
 
 DIAGNOSTIC_CHECKLIST = [
@@ -323,37 +436,64 @@ def _session_secret() -> bytes:
     return value.encode("utf-8")
 
 
-def make_session(account_id: int, organization_id: int) -> str:
-    payload = json.dumps(
-        {"sub": account_id, "org": organization_id, "exp": int(time.time()) + SESSION_SECONDS},
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
-    signature = hmac.new(_session_secret(), encoded.encode("ascii"), hashlib.sha256)
-    return encoded + "." + base64.urlsafe_b64encode(signature.digest()).rstrip(b"=").decode("ascii")
+def make_session(
+    account_id: int, organization_id: int, password_version: str = "", family_id: str = "",
+) -> str:
+    """Create a standards-compatible short-lived HS256 access JWT."""
+    now = int(time.time())
+    header = _jwt_part({"alg": "HS256", "typ": "JWT"})
+    payload = _jwt_part({
+        "iss": JWT_ISSUER, "aud": JWT_AUDIENCE, "typ": "access",
+        "sub": str(account_id), "org": organization_id, "pwd": password_version,
+        "iat": now, "nbf": now, "exp": now + ACCESS_TOKEN_SECONDS,
+        "jti": secrets.token_urlsafe(16), "sid": family_id,
+    })
+    signing_input = f"{header}.{payload}"
+    signature = hmac.new(_session_secret(), signing_input.encode("ascii"), hashlib.sha256).digest()
+    return f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode('ascii')}"
 
 
-def session_identity(session: str | None) -> tuple[int, int] | None:
-    if not session or "." not in session:
+def _jwt_part(value: dict[str, object]) -> str:
+    raw = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def session_identity(session: str | None) -> tuple[int, int, str, str] | None:
+    if not session or session.count(".") != 2:
         return None
-    encoded, raw_signature = session.split(".", 1)
-    expected = hmac.new(_session_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
-    if not hmac.compare_digest(expected, _b64decode(raw_signature)):
-        return None
+    raw_header, encoded, raw_signature = session.split(".", 2)
     try:
-        payload = json.loads(_b64decode(encoded))
-        if int(payload["exp"]) <= int(time.time()):
+        header = json.loads(_b64decode(raw_header))
+        if header != {"alg": "HS256", "typ": "JWT"}:
             return None
-        return int(payload["sub"]), int(payload["org"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        expected = hmac.new(
+            _session_secret(), f"{raw_header}.{encoded}".encode("ascii"), hashlib.sha256,
+        ).digest()
+        decoded_signature = _b64decode(raw_signature)
+        canonical_signature = base64.urlsafe_b64encode(decoded_signature).rstrip(b"=").decode("ascii")
+        if not hmac.compare_digest(raw_signature, canonical_signature) or not hmac.compare_digest(expected, decoded_signature):
+            return None
+        payload = json.loads(_b64decode(encoded))
+        now = int(time.time())
+        if (
+            payload.get("iss") != JWT_ISSUER or payload.get("aud") != JWT_AUDIENCE
+            or payload.get("typ") != "access" or int(payload["exp"]) <= now
+            or int(payload["nbf"]) > now + 30 or int(payload["iat"]) > now + 30
+            or not isinstance(payload.get("jti"), str) or not payload.get("sid")
+        ):
+            return None
+        return (
+            int(payload["sub"]), int(payload["org"]), str(payload.get("pwd", "")),
+            str(payload["sid"]),
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
         return None
 
 
 _auth_context: ContextVar[dict[str, object] | None] = ContextVar("auth_context", default=None)
 
 
-def require_user(session: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> dict[str, object]:
+def require_user() -> dict[str, object]:
     context = _auth_context.get()
     if context is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
@@ -447,25 +587,104 @@ def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-@app.post("/api/login")
-def login(data: LoginRequest, response: Response) -> dict[str, str]:
-    expected_user = os.getenv("PWA_ADMIN_USER", "admin").strip().casefold()
-    expected_password = os.getenv("PWA_PASSWORD_HASH", "")
-    account = db.get_auth_account(data.username)
-    if account is None and secrets.compare_digest(data.username.strip().casefold(), expected_user) and verify_password(data.password, expected_password):
-        account = db.bootstrap_web_owner(
-            expected_user, expected_password, os.getenv("PWA_OWNER_NAME", "Владелец"), owner_telegram_id(),
-        )
-    if account is None or not verify_password(data.password, str(account["password_hash"])):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверный логин или пароль")
+def _refresh_hash(token: str) -> str:
+    return hmac.new(_session_secret(), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _set_refresh_cookie(response: Response, token: str) -> None:
     cookie_secure = os.getenv("PWA_COOKIE_SECURE", "true").casefold() not in {
         "0", "false", "no", "нет",
     }
     response.set_cookie(
-        COOKIE_NAME, make_session(int(account["id"]), int(account["organization_id"])), max_age=SESSION_SECONDS,
-        httponly=True, secure=cookie_secure, samesite="strict", path="/",
+        COOKIE_NAME, token, max_age=REFRESH_TOKEN_SECONDS,
+        httponly=True, secure=cookie_secure, samesite="strict", path="/api",
     )
-    return {"status": "ok"}
+
+
+def _issue_token_pair(response: Response, account: dict[str, object]) -> dict[str, object]:
+    refresh_token = secrets.token_urlsafe(48)
+    session_id = secrets.token_urlsafe(24)
+    expires = datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TOKEN_SECONDS)
+    db.create_refresh_session(
+        session_id, session_id, int(account["id"]), int(account["organization_id"]),
+        _refresh_hash(refresh_token), expires.isoformat(),
+    )
+    _set_refresh_cookie(response, refresh_token)
+    return {
+        "access_token": make_session(
+            int(account["id"]), int(account["organization_id"]), _password_version(account),
+            session_id,
+        ),
+        "token_type": "bearer", "expires_in": ACCESS_TOKEN_SECONDS,
+    }
+
+
+@app.post("/api/login")
+def login(data: LoginRequest, request: Request, response: Response) -> dict[str, object]:
+    login_key = _login_key(request)
+    if _login_is_limited(login_key):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Слишком много попыток входа. Повторите через 15 минут",
+        )
+    expected_user = os.getenv("PWA_ADMIN_USER", "admin").strip().casefold()
+    expected_password = os.getenv("PWA_PASSWORD_HASH", "")
+    account = db.get_auth_account(data.username)
+    password_valid = verify_password(
+        data.password, str(account["password_hash"]) if account is not None else expected_password,
+    )
+    if account is None and secrets.compare_digest(data.username.strip().casefold(), expected_user) and password_valid:
+        account = db.bootstrap_web_owner(
+            expected_user, expected_password, os.getenv("PWA_OWNER_NAME", "Владелец"), owner_telegram_id(),
+        )
+    if account is None or not password_valid:
+        _record_login_failure(login_key)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверный логин или пароль")
+    _clear_login_failures(login_key)
+    return {"status": "ok"} | _issue_token_pair(response, account)
+
+
+@app.post("/api/refresh")
+def refresh_access_token(response: Response, request: Request) -> dict[str, object]:
+    refresh_token = request.cookies.get(COOKIE_NAME)
+    session = db.get_refresh_session(_refresh_hash(refresh_token)) if refresh_token else None
+    if session is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token is invalid")
+    if session.get("revoked_at"):
+        db.revoke_refresh_family(str(session["family_id"]))
+        response.delete_cookie(COOKIE_NAME, path="/api")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token reuse detected")
+    try:
+        expires_at = datetime.fromisoformat(str(session["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token is invalid") from error
+    if expires_at <= datetime.now(timezone.utc):
+        db.revoke_refresh_session(_refresh_hash(refresh_token))
+        response.delete_cookie(COOKIE_NAME, path="/api")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token expired")
+    account = db.get_auth_context(int(session["account_id"]), int(session["organization_id"]))
+    if account is None:
+        db.revoke_refresh_family(str(session["family_id"]))
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is unavailable")
+    new_token = secrets.token_urlsafe(48)
+    new_id = secrets.token_urlsafe(24)
+    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TOKEN_SECONDS)
+    if not db.rotate_refresh_session(
+        str(session["id"]), new_id, str(session["family_id"]), int(session["account_id"]),
+        int(session["organization_id"]), _refresh_hash(new_token), new_expiry.isoformat(),
+    ):
+        db.revoke_refresh_family(str(session["family_id"]))
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token reuse detected")
+    _set_refresh_cookie(response, new_token)
+    return {
+        "access_token": make_session(
+            int(account["id"]), int(account["organization_id"]), _password_version(account),
+            str(session["family_id"]),
+        ),
+        "token_type": "bearer", "expires_in": ACCESS_TOKEN_SECONDS,
+    }
 
 
 @app.get("/api/account")
@@ -497,7 +716,10 @@ def workspace_update(data: WorkspacePayload, context: Annotated[dict[str, object
 
 
 @app.put("/api/settings/password")
-def password_update(data: PasswordChangePayload, context: Annotated[dict[str, object], Depends(require_user)]) -> dict[str, str]:
+def password_update(
+    data: PasswordChangePayload, response: Response,
+    context: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
     account = db.get_auth_account(str(context["username"]))
     if account is None or not verify_password(data.current_password, str(account["password_hash"])):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Текущий пароль введён неверно")
@@ -505,7 +727,11 @@ def password_update(data: PasswordChangePayload, context: Annotated[dict[str, ob
         db.update_account_password(int(context["id"]), hash_password(data.new_password))
     except ValueError as error:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
-    return {"status": "ok"}
+    refreshed = db.get_auth_account(str(context["username"]))
+    if refreshed is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Учётная запись больше недоступна")
+    db.revoke_account_sessions(int(context["id"]))
+    return {"status": "ok"} | _issue_token_pair(response, refreshed)
 
 
 @app.post("/api/settings/staff", status_code=status.HTTP_201_CREATED)
@@ -534,6 +760,8 @@ def staff_update(account_id: int, data: StaffUpdatePayload, context: Annotated[d
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
     if not db.update_staff(int(context["organization_id"]), account_id, data.role, data.active, password_hash):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Сотрудник не найден или является владельцем")
+    if data.active is False or password_hash is not None:
+        db.revoke_account_sessions(account_id)
     return next(item for item in db.list_staff(int(context["organization_id"])) if int(item["id"]) == account_id)
 
 
@@ -572,8 +800,11 @@ def organization_access(
 
 
 @app.post("/api/logout")
-def logout(response: Response) -> dict[str, str]:
-    response.delete_cookie(COOKIE_NAME, path="/")
+def logout(response: Response, request: Request) -> dict[str, str]:
+    refresh_token = request.cookies.get(COOKIE_NAME)
+    if refresh_token:
+        db.revoke_refresh_session(_refresh_hash(refresh_token))
+    response.delete_cookie(COOKIE_NAME, path="/api")
     return {"status": "ok"}
 
 
@@ -606,7 +837,10 @@ def ai_usage_finance(
 
 
 @app.get("/api/search")
-def search(q: str, _: Annotated[str, Depends(require_user)]) -> dict[str, object]:
+def search(
+    q: Annotated[str, Query(max_length=200)],
+    _: Annotated[dict[str, object], Depends(require_user)],
+) -> dict[str, object]:
     query = q.strip()
     if len(query) < 2:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Введите минимум два символа")
@@ -670,7 +904,10 @@ def edit_customer(
 ) -> dict[str, object]:
     if db.get_customer_for_telegram_user(owner_telegram_id(), customer_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Клиент не найден")
-    db.update_customer(customer_id, data.full_name.strip() or "Имя не указано", data.phone or None)
+    db.update_customer(
+        customer_id, data.full_name.strip() or "Имя не указано", data.phone or None,
+        replace_nullable=True,
+    )
     return asdict(db.get_customer_for_telegram_user(owner_telegram_id(), customer_id))
 
 
@@ -703,7 +940,7 @@ def edit_car(car_id: int, data: CarPayload, _: Annotated[str, Depends(require_us
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Клиент не найден")
     db.update_car(
         car_id, data.customer_id, data.brand.strip(), data.model.strip(), data.year,
-        data.plate_number or None, data.vin or None, data.mileage,
+        data.plate_number or None, data.vin or None, data.mileage, replace_nullable=True,
     )
     return asdict(require_car(car_id))
 
@@ -745,7 +982,7 @@ def edit_appointment(
             owner_user_id(), appointment_id, car_id=data.car_id,
             description=data.description.strip(), starts_at=data.starts_at,
             agreed_amount=data.agreed_amount, is_flexible=data.is_flexible,
-            parts_source=data.parts_source,
+            parts_source=data.parts_source, replace_nullable=True,
         )
     except ValueError as error:
         raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
@@ -823,9 +1060,32 @@ def create_order(data: OrderPayload, _: Annotated[str, Depends(require_user)]) -
 
 @app.put("/api/orders/{order_id}")
 def edit_order(
-    order_id: int, data: OrderPayload, _: Annotated[str, Depends(require_user)]
+    order_id: int, data: OrderPayload,
+    context: Annotated[dict[str, object], Depends(require_user)],
 ) -> dict[str, object]:
     order = require_order(order_id)
+    if context["role"] == "mechanic":
+        restricted_changed = (
+            data.car_id != order.car_id
+            or data.labor_revenue != order.labor_revenue
+            or data.parts_cost != order.parts_cost
+            or data.parts_revenue != order.parts_revenue
+            or data.parts_profit != order.parts_profit
+            or data.concern != order.concern
+            or data.agreed_amount != order.agreed_amount
+            or data.recommendations != order.recommendations
+            or data.parts_source != order.parts_source
+        )
+        if restricted_changed:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Механик может изменять только описание выполненных работ",
+            )
+        order = db.update_service_order(
+            order_id, data.description, order.labor_revenue, order.parts_cost,
+            order.parts_revenue, order.parts_profit, False,
+        )
+        return asdict(order) | {"profit": order.profit}
     if data.car_id != order.car_id:
         require_car(data.car_id)
         db.reassign_order_car(owner_user_id(), order_id, data.car_id)
@@ -836,9 +1096,9 @@ def edit_order(
     order = db.update_order_crm_fields(
         order_id, owner_user_id(), concern=data.concern,
         agreed_amount=data.agreed_amount, recommendations=data.recommendations,
+        replace_nullable=True,
     )
-    if data.parts_source:
-        order = db.update_order_parts_source(order_id, data.parts_source, owner_user_id())
+    order = db.update_order_parts_source(order_id, data.parts_source, owner_user_id())
     return asdict(order) | {"profit": order.profit}
 
 
@@ -869,6 +1129,8 @@ async def upload_order_photo(
 ) -> dict[str, object]:
     """Accept a camera image as a raw request body without multipart overhead."""
     require_order(order_id)
+    if caption is not None and len(caption) > 500:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Подпись должна быть не длиннее 500 символов")
     if photo_type not in {"work", "receipt"}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестный тип фотографии")
     content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
@@ -878,6 +1140,8 @@ async def upload_order_photo(
     content = await request.body()
     if not content or len(content) > 10 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Фото должно быть не больше 10 МБ")
+    if not _valid_image_content(content_type, content):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Содержимое файла не соответствует формату изображения")
     filename = f"{uuid.uuid4().hex}{extensions[content_type]}"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     (UPLOAD_DIR / filename).write_bytes(content)
@@ -893,7 +1157,7 @@ async def upload_order_photo(
     if not api_key or api_key == "your_openrouter_api_key":
         return result | {"recognition_error": "Распознавание не настроено"}
     vision_model = os.getenv("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
-    markup_percent = max(0.0, float(os.getenv("RECEIPT_MARKUP_PERCENT", "40")))
+    markup_percent = min(1000.0, max(0.0, float(os.getenv("RECEIPT_MARKUP_PERCENT", "40"))))
     try:
         response = await analyze_receipt_image(api_key, content, content_type, vision_model)
         db.log_ai_usage(
@@ -929,8 +1193,12 @@ async def upload_order_photo(
 
 
 @app.get("/api/order-photos/{filename}")
-def order_photo(filename: str, _: Annotated[str, Depends(require_user)]) -> FileResponse:
+def order_photo(
+    filename: str, context: Annotated[dict[str, object], Depends(require_user)],
+) -> FileResponse:
     if Path(filename).name != filename or not filename:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Фото не найдено")
+    if not db.user_owns_order_photo(int(context["data_owner_user_id"]), filename):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Фото не найдено")
     path = UPLOAD_DIR / filename
     if not path.is_file():
@@ -955,6 +1223,8 @@ async def recognize_vehicle_image(
     content = await request.body()
     if not content or len(content) > 10 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Фото должно быть не больше 10 МБ")
+    if not _valid_image_content(content_type, content):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Содержимое файла не соответствует формату изображения")
     api_key, model = _vision_settings()
     try:
         response = await analyze_vehicle_document(
@@ -1244,6 +1514,8 @@ async def upload_diagnostic_photo(
     diagnostic_id: int, request: Request,
     _: Annotated[str, Depends(require_user)], caption: str | None = None,
 ) -> dict[str, object]:
+    if caption is not None and len(caption) > 500:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Подпись должна быть не длиннее 500 символов")
     content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
     extensions = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
     if content_type not in extensions:
@@ -1251,6 +1523,8 @@ async def upload_diagnostic_photo(
     content = await request.body()
     if not content or len(content) > 10 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Фото должно быть не больше 10 МБ")
+    if not _valid_image_content(content_type, content):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Содержимое файла не соответствует формату изображения")
     filename = f"{uuid.uuid4().hex}{extensions[content_type]}"
     photo = db.add_diagnostic_photo(owner_user_id(), diagnostic_id, filename, caption)
     if photo is None:
@@ -1261,8 +1535,12 @@ async def upload_diagnostic_photo(
 
 
 @app.get("/api/diagnostic-photos/{filename}")
-def diagnostic_photo(filename: str, _: Annotated[str, Depends(require_user)]) -> FileResponse:
+def diagnostic_photo(
+    filename: str, context: Annotated[dict[str, object], Depends(require_user)],
+) -> FileResponse:
     if Path(filename).name != filename or not filename:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Фото не найдено")
+    if not db.user_owns_diagnostic_photo(int(context["data_owner_user_id"]), filename):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Фото не найдено")
     path = DIAGNOSTIC_UPLOAD_DIR / filename
     if not path.is_file():
