@@ -116,7 +116,8 @@ export function DiagnosticsIndexPage() {
     return cards.filter((card) => {
       const haystack = [
         card.id, card.brand, card.model, card.plate_number, card.vin,
-        card.customer_name, card.status === "completed" ? "завершена" : "черновик",
+        card.customer_name, card.customer_phone,
+        card.status === "completed" ? "завершена" : "черновик",
       ].map(normalizeSearchValue).join(" ");
       return terms.every((term) => haystack.includes(normalizeSearchValue(term)));
     });
@@ -138,7 +139,7 @@ export function DiagnosticsIndexPage() {
               value={diagnosticSearch}
               onChange={(event) => setDiagnosticSearch(event.target.value)}
               className={`${inputClass} w-full pl-12 pr-12`}
-              placeholder="Поиск по карте: авто, клиент, госномер, VIN или №"
+              placeholder="Поиск: авто, клиент, телефон, госномер, VIN или №"
               autoComplete="off"
               aria-label="Поиск диагностических карт"
             />
@@ -175,7 +176,7 @@ export function DiagnosticsIndexPage() {
                     <p className="text-sm text-muted">
                       {formatDateTime(item.updated_at)}
                     </p>
-                    <p className="mt-1 truncate text-xs text-muted">{item.customer_name || item.plate_number || item.vin || "Автомобиль без номера"}</p>
+                    <p className="mt-1 truncate text-xs text-muted">{item.customer_name || item.plate_number || item.vin || "Автомобиль без номера"}{item.customer_phone ? ` · ${item.customer_phone}` : ""}</p>
                   </div>
                   <span className="rounded-full bg-panel-soft px-3 py-1 text-sm font-bold">
                     {item.checked}/{item.total}

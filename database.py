@@ -3330,13 +3330,13 @@ class Database:
             rows = connection.execute(
                 f"""SELECT d.id, d.car_id, d.service_order_id, d.mileage, d.status,
                            d.created_at, d.updated_at, d.completed_at, c.brand, c.model,
-                           c.plate_number, c.vin, u.full_name AS customer_name,
+                           c.plate_number, c.vin, cu.full_name AS customer_name, cu.phone AS customer_phone,
                            SUM(CASE WHEN di.status != 'unchecked' OR COALESCE(di.left_status, 'unchecked') != 'unchecked' OR COALESCE(di.right_status, 'unchecked') != 'unchecked' THEN 1 ELSE 0 END) AS checked,
                            COUNT(di.id) AS total,
                            SUM(CASE WHEN di.status = 'critical' OR di.left_status = 'critical' OR di.right_status = 'critical' THEN 1 ELSE 0 END) AS critical,
                            SUM(CASE WHEN di.status = 'attention' OR di.left_status = 'attention' OR di.right_status = 'attention' THEN 1 ELSE 0 END) AS attention
                     FROM diagnostics d JOIN cars c ON c.id = d.car_id
-                    LEFT JOIN users u ON u.id = c.customer_id
+                    LEFT JOIN customers cu ON cu.id = c.customer_id
                     LEFT JOIN diagnostic_items di ON di.diagnostic_id = d.id
                     WHERE c.user_id = ?{condition}
                     GROUP BY d.id ORDER BY d.id DESC LIMIT 100""",
