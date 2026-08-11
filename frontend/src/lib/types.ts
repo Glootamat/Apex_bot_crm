@@ -36,6 +36,7 @@ export type Account = { id: number; username: string; full_name: string; organiz
 export type StaffMember = { id: number; username: string; full_name: string; active: boolean; role: StaffRole | "owner"; created_at: string; online: boolean; last_seen_at: string | null; logins_today: number };
 export type OrganizationStatus = "active" | "demo" | "expired" | "blocked";
 export type Organization = { id: number; name: string; city: string | null; active: boolean; demo_expires_at: string | null; demo_days_left: number | null; created_at: string; owner_name: string | null; owner_username: string | null; employees: number; orders: number; status: OrganizationStatus };
+export type OrganizationDetail = Organization & { customers: number; cars: number; active_orders: number; scheduled_appointments: number; last_order_at: string | null; online_staff: number; staff: StaffMember[] };
 export type SearchResults = { customers: Customer[]; cars: Car[]; orders: Order[]; appointments: Appointment[] };
 export type TrashItem = { kind: "customer" | "car" | "appointment" | "order"; id: number; title: string; subtitle: string; archived_at: string };
 export type TrashData = { retention_days: number; items: TrashItem[] };

@@ -231,6 +231,40 @@ class PwaTest(unittest.TestCase):
                 self.assertEqual(member["logins_today"], 1)
                 self.assertIsNotNone(member["last_seen_at"])
 
+    def test_platform_owner_views_service_detail_and_manages_staff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.add_or_update_user(9701, "Platform Owner", None)
+            environment = {
+                "ADMIN_ID": "9701", "PWA_ADMIN_USER": "admin",
+                "PWA_PASSWORD_HASH": password_hash("secret-password"),
+                "PWA_SESSION_SECRET": "s" * 48,
+            }
+            with patch.object(pwa, "db", db), patch.dict(os.environ, environment):
+                admin = TestClient(pwa.app, base_url="https://testserver")
+                admin.post("/api/login", json={"username": "admin", "password": "secret-password"})
+                organization = admin.post("/api/platform/organizations", json={
+                    "name": "Managed Service", "city": "Москва", "owner_name": "Owner",
+                    "username": "managed-owner", "password": "managed-password", "demo": False,
+                }).json()
+                created = admin.post(f"/api/platform/organizations/{organization['id']}/staff", json={
+                    "username": "managed-mechanic", "password": "mechanic-password",
+                    "full_name": "Mechanic", "role": "mechanic",
+                })
+                self.assertEqual(created.status_code, 201)
+                mechanic = TestClient(pwa.app, base_url="https://testserver")
+                self.assertEqual(mechanic.post("/api/login", json={"username": "managed-mechanic", "password": "mechanic-password"}).status_code, 200)
+                detail = admin.get(f"/api/platform/organizations/{organization['id']}")
+                self.assertEqual(detail.status_code, 200)
+                member = next(item for item in detail.json()["staff"] if item["username"] == "managed-mechanic")
+                self.assertTrue(member["online"])
+                self.assertEqual(member["logins_today"], 1)
+                disabled = admin.patch(f"/api/platform/organizations/{organization['id']}/staff/{member['id']}", json={"active": False})
+                self.assertEqual(disabled.status_code, 200)
+                self.assertFalse(disabled.json()["active"])
+                self.assertEqual(mechanic.get("/api/dashboard").status_code, 401)
+
     def test_platform_owner_creates_demo_service_and_controls_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

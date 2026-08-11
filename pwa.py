@@ -778,6 +778,56 @@ def organizations_list(_: Annotated[dict[str, object], Depends(require_platform_
     return db.list_organizations()
 
 
+@app.get("/api/platform/organizations/{organization_id}")
+def organization_detail(
+    organization_id: int,
+    _: Annotated[dict[str, object], Depends(require_platform_admin)],
+) -> dict[str, object]:
+    detail = db.get_organization_detail(organization_id)
+    if detail is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Автосервис не найден")
+    return detail
+
+
+@app.post("/api/platform/organizations/{organization_id}/staff", status_code=status.HTTP_201_CREATED)
+def organization_staff_create(
+    organization_id: int, data: StaffCreatePayload,
+    _: Annotated[dict[str, object], Depends(require_platform_admin)],
+) -> dict[str, object]:
+    roles = {"admin", "service_advisor", "mechanic", "accountant", "viewer"}
+    if db.get_organization_detail(organization_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Автосервис не найден")
+    if data.role not in roles:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестная роль")
+    try:
+        account_id = db.create_staff(
+            organization_id, data.username, hash_password(data.password), data.full_name, data.role,
+        )
+    except (ValueError, PostgresIntegrityError, sqlite3.IntegrityError) as error:
+        detail = str(error) if isinstance(error, ValueError) else "Этот логин уже занят"
+        raise HTTPException(status.HTTP_409_CONFLICT, detail) from error
+    return next(item for item in db.list_staff(organization_id) if int(item["id"]) == account_id)
+
+
+@app.patch("/api/platform/organizations/{organization_id}/staff/{account_id}")
+def organization_staff_update(
+    organization_id: int, account_id: int, data: StaffUpdatePayload,
+    _: Annotated[dict[str, object], Depends(require_platform_admin)],
+) -> dict[str, object]:
+    roles = {"admin", "service_advisor", "mechanic", "accountant", "viewer"}
+    if data.role is not None and data.role not in roles:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Неизвестная роль")
+    try:
+        password_hash = hash_password(data.password) if data.password else None
+    except ValueError as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+    if not db.update_staff(organization_id, account_id, data.role, data.active, password_hash):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Сотрудник не найден или является владельцем")
+    if data.active is False or password_hash is not None:
+        db.revoke_account_sessions(account_id)
+    return next(item for item in db.list_staff(organization_id) if int(item["id"]) == account_id)
+
+
 @app.post("/api/platform/organizations", status_code=status.HTTP_201_CREATED)
 def organization_create(data: OrganizationCreatePayload, _: Annotated[dict[str, object], Depends(require_platform_admin)]) -> dict[str, object]:
     if not data.name.strip() or not data.owner_name.strip() or not data.username.strip():

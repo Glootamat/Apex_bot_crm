@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AiUsageSummary } from "./types";
-import type { Account, AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, Order, OrderInput, Organization, PartsCatalogResult, PartsCatalogStatus, ProfitLigaOrdersResult, ReceiptUploadResult, RosskoOrdersResult, SearchResults, StaffMember, StaffRole, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
+import type { Account, AppointmentInput, CarInput, CrmData, CustomerInput, Dashboard, Diagnostic, DiagnosticItem, DiagnosticItemInput, DiagnosticPhoto, DiagnosticSummary, Order, OrderInput, Organization, OrganizationDetail, PartsCatalogResult, PartsCatalogStatus, ProfitLigaOrdersResult, ReceiptUploadResult, RosskoOrdersResult, SearchResults, StaffMember, StaffRole, SupplierOffer, TrashData, TrashItem, VehicleRecognition } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
 let accessToken: string | null = null;
@@ -74,7 +74,10 @@ export const api = {
   updateWorkspace: (value: { name: string; city: string }) => request<{ id: number; name: string; city: string | null }>("/api/settings/workspace", { method: "PUT", ...json(value) }),
   changePassword: (current_password: string, new_password: string) => request<{ status: string }>("/api/settings/password", { method: "PUT", ...json({ current_password, new_password }) }),
   organizations: () => request<Organization[]>("/api/platform/organizations"),
+  organization: (id: number) => request<OrganizationDetail>(`/api/platform/organizations/${id}`),
   createOrganization: (value: { name: string; city: string; owner_name: string; username: string; password: string; demo: boolean }) => request<Organization>("/api/platform/organizations", { method: "POST", ...json(value) }),
+  createOrganizationStaff: (organizationId: number, value: { username: string; password: string; full_name: string; role: StaffRole }) => request<StaffMember>(`/api/platform/organizations/${organizationId}/staff`, { method: "POST", ...json(value) }),
+  updateOrganizationStaff: (organizationId: number, id: number, value: { role?: StaffRole; active?: boolean; password?: string }) => request<StaffMember>(`/api/platform/organizations/${organizationId}/staff/${id}`, { method: "PATCH", ...json(value) }),
   updateOrganizationAccess: (id: number, action: "block" | "activate" | "demo") => request<Organization>(`/api/platform/organizations/${id}/access`, { method: "POST", ...json({ action }) }),
   dashboard: () => request<Dashboard>("/api/dashboard"),
   aiUsage: (period: number) => request<AiUsageSummary>(`/api/finance/ai-usage?period=${period}`),

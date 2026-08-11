@@ -46,11 +46,12 @@ function StaffSettings() {
 
 export function SettingsPage() {
   const workspace = useQuery({ queryKey: ["workspace"], queryFn: api.workspace, retry: false });
-  if (workspace.isPending) return <Spinner label="Загружаю настройки…" />;
-  return <SettingsContent workspace={workspace.data} />;
+  const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
+  if (workspace.isPending || account.isPending) return <Spinner label="Загружаю настройки…" />;
+  return <SettingsContent workspace={workspace.data} platformAdmin={Boolean(account.data?.platform_admin)} />;
 }
 
-function SettingsContent({ workspace }: { workspace?: { name: string; city: string | null } }) {
+function SettingsContent({ workspace, platformAdmin }: { workspace?: { name: string; city: string | null }; platformAdmin: boolean }) {
   const stored = useAppSettings();
   const [settings, setSettings] = useState<AppSettings>(() => ({
     ...stored,
@@ -69,7 +70,7 @@ function SettingsContent({ workspace }: { workspace?: { name: string; city: stri
     <Card><Heading icon={Blocks} title="Модули приложения" text="Отключённые разделы исчезнут из бокового меню" /><div className="grid gap-x-6 md:grid-cols-2">{moduleItems.map((item) => <Row key={item.key} title={item.title} description={item.description} checked={settings.modules[item.key]} onChange={(value) => update("modules", { ...settings.modules, [item.key]: value })} />)}</div></Card>
     <div className="grid gap-6 lg:grid-cols-2"><Card><Heading icon={Bell} title="Уведомления" text="Что требует вашего внимания" /><Row title="На этом устройстве" description="Показывать системные уведомления" checked={settings.desktopNotifications} onChange={(v) => update("desktopNotifications", v)} /><Row title="Напоминания о записи" description="Перед визитом клиента" checked={settings.appointmentReminders} onChange={(v) => update("appointmentReminders", v)} /><Row title="Статусы заказов" description="Готовность, задержки и согласования" checked={settings.orderStatusNotifications} onChange={(v) => update("orderStatusNotifications", v)} /><Row title="Итоги дня" description="Краткая вечерняя сводка" checked={settings.dailySummary} onChange={(v) => update("dailySummary", v)} /></Card>
     <Card><Heading icon={MonitorCog} title="Интерфейс" text="Вид приложения на этом устройстве" /><Row title="Компактный режим" description="Меньше отступов, больше данных" checked={settings.compactMode} onChange={(v) => update("compactMode", v)} /><Row title="Минимум анимации" description="Сократить движения интерфейса" checked={settings.reduceMotion} onChange={(v) => update("reduceMotion", v)} /><div className="mt-4 flex gap-3 rounded-xl bg-panel-soft p-3 text-sm text-muted"><Smartphone size={20} className="shrink-0 text-info" />Эти параметры сохраняются на текущем устройстве.</div></Card></div>
-    <StaffSettings />
+    {!platformAdmin && <StaffSettings />}
     <div className="grid gap-6 lg:grid-cols-2"><Card><Heading icon={Cloud} title="Интеграции" text="Связь с внешними сервисами" /><Integration name="Поставщики запчастей" status="Настраивается на сервере" /><Integration name="Телефония и мессенджеры" status="Не подключено" /><Integration name="Онлайн-касса и бухгалтерия" status="Не подключено" /><Integration name="Календари и вебхуки" status="Не подключено" /></Card>
     <Card><Heading icon={ShieldCheck} title="Безопасность" text="Сессии и защита учётной записи" /><Field label="Автоблокировка при бездействии"><select className={inputClass} value={settings.autoLockMinutes} onChange={(e) => update("autoLockMinutes", Number(e.target.value))}><option value={0}>Не блокировать</option><option value={15}>Через 15 минут</option><option value={30}>Через 30 минут</option><option value={60}>Через 1 час</option></select></Field><div className="mt-4 grid gap-3"><Field label="Текущий пароль"><input className={inputClass} type="password" value={passwords.current} onChange={(e) => setPasswords({ ...passwords, current: e.target.value })} /></Field><Field label="Новый пароль (от 10 символов)"><input className={inputClass} type="password" minLength={10} value={passwords.next} onChange={(e) => setPasswords({ ...passwords, next: e.target.value })} /></Field>{changePassword.error instanceof ApiError && <p className="text-sm text-danger">{changePassword.error.message}</p>}<Button variant="secondary" disabled={!passwords.current || passwords.next.length < 10 || changePassword.isPending} onClick={() => changePassword.mutate()}><KeyRound size={18} />Изменить пароль</Button></div></Card></div>
     <Card className="flex flex-wrap items-center gap-4"><RotateCcw className="text-muted" /><div className="min-w-0 flex-1"><h2 className="font-black">Сбросить настройки</h2><p className="text-sm text-muted">Вернуть параметры этого устройства по умолчанию</p></div><Button variant="danger" onClick={() => { setSettings(defaultSettings); saveSettings(defaultSettings); }}>Сбросить</Button></Card>

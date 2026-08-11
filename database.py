@@ -1020,7 +1020,7 @@ class Database:
             rows = connection.execute(
                 """SELECT a.id, a.username, a.full_name, a.active, m.role, m.created_at,
                           p.last_seen_at,
-                          CASE WHEN p.last_seen_at >= ? THEN 1 ELSE 0 END AS online,
+                          CASE WHEN a.active = 1 AND p.last_seen_at >= ? THEN 1 ELSE 0 END AS online,
                           (SELECT COUNT(*) FROM account_login_events le
                            WHERE le.account_id = a.id AND le.organization_id = m.organization_id
                              AND le.created_at >= ? AND le.created_at < ?) AS logins_today
@@ -1147,6 +1147,39 @@ class Database:
             return result
         finally:
             connection.close()
+
+    def get_organization_detail(self, organization_id: int) -> dict[str, object] | None:
+        organization = next(
+            (item for item in self.list_organizations() if int(item["id"]) == organization_id),
+            None,
+        )
+        if organization is None:
+            return None
+        connection = self.connect()
+        try:
+            metrics = connection.execute(
+                """SELECT
+                    (SELECT COUNT(*) FROM customers cu WHERE cu.user_id = o.data_owner_user_id AND cu.archived_at IS NULL) AS customers,
+                    (SELECT COUNT(*) FROM cars c WHERE c.user_id = o.data_owner_user_id AND c.archived_at IS NULL) AS cars,
+                    (SELECT COUNT(*) FROM service_orders so JOIN cars c ON c.id = so.car_id
+                     WHERE c.user_id = o.data_owner_user_id AND so.archived_at IS NULL
+                       AND so.status NOT IN ('ready', 'completed')) AS active_orders,
+                    (SELECT COUNT(*) FROM appointments a JOIN cars c ON c.id = a.car_id
+                     WHERE c.user_id = o.data_owner_user_id AND a.archived_at IS NULL
+                       AND a.status = 'scheduled') AS scheduled_appointments,
+                    (SELECT MAX(COALESCE(so.completed_at, so.created_at)) FROM service_orders so
+                     JOIN cars c ON c.id = so.car_id
+                     WHERE c.user_id = o.data_owner_user_id AND so.archived_at IS NULL) AS last_order_at
+                   FROM organizations o WHERE o.id = ?""",
+                (organization_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        staff = self.list_staff(organization_id)
+        return organization | (dict(metrics) if metrics else {}) | {
+            "staff": staff,
+            "online_staff": sum(1 for member in staff if bool(member.get("online"))),
+        }
 
     def create_organization(self, name: str, city: str | None, owner_name: str, username: str, password_hash: str, demo_days: int = 7) -> int:
         connection = self.connect()
