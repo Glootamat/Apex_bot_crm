@@ -23,6 +23,9 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     environment: production
+    env:
+      ADMIN_ID: "1"
+      BOT_TOKEN: "test:token"
     steps:
       - uses: actions/checkout@v4
         with:
