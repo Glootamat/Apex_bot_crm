@@ -1,4 +1,4 @@
-import { Camera, ScanLine } from "lucide-react";
+import { Camera, FileImage, ScanLine, Search } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api, ApiError } from "../../lib/api";
@@ -10,7 +10,7 @@ import { Button, Field, inputClass, Modal } from "../../components/ui";
 type Entity =
   | { kind: "customer"; value?: Customer }
   | { kind: "car"; value?: Car; customerId?: number }
-  | { kind: "appointment"; value?: Appointment; carId?: number }
+  | { kind: "appointment"; value?: Appointment; carId?: number; startsAt?: string }
   | { kind: "order"; value?: Order; carId?: number };
 
 export type EntityModalState = Entity | null;
@@ -47,6 +47,8 @@ function AppointmentDateTime({ value }: { value?: string }) {
 
 export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props) {
   const formRef = useRef<HTMLFormElement>(null);
+  const [carQuery, setCarQuery] = useState("");
+  const [selectedCarId, setSelectedCarId] = useState(() => entity.kind === "appointment" || entity.kind === "order" ? String(entity.value?.car_id ?? entity.carId ?? "") : "");
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", close);
@@ -104,7 +106,7 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
         <Field label="Телефон" full><input className={inputClass} name="phone" type="tel" inputMode="tel" defaultValue={entity.value?.phone ?? ""} placeholder="+7 900 000-00-00" /></Field>
       </>}
       {entity.kind === "car" && <>
-        <label className="inline-flex min-h-12 cursor-pointer items-center justify-center gap-2 rounded-xl border border-apex/40 bg-apex/10 px-4 py-2 text-sm font-bold text-apex transition hover:bg-apex/15 sm:col-span-2"><Camera size={18} />{recognition.isPending ? "Распознаю…" : "Сканировать VIN / ПТС / СТС"}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={recognition.isPending} onChange={(event) => { const file = event.target.files?.[0]; if (file) recognition.mutate({ file }); event.currentTarget.value = ""; }} /></label>
+        <div className="grid grid-cols-2 gap-2 sm:col-span-2"><label className="inline-flex min-h-12 cursor-pointer items-center justify-center gap-2 rounded-xl border border-apex/40 bg-apex/10 px-3 py-2 text-center text-sm font-bold text-apex transition hover:bg-apex/15"><Camera size={18} />{recognition.isPending ? "Распознаю…" : "Сфотографировать"}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={recognition.isPending} onChange={(event) => { const file = event.target.files?.[0]; if (file) recognition.mutate({ file }); event.currentTarget.value = ""; }} /></label><label className="inline-flex min-h-12 cursor-pointer items-center justify-center gap-2 rounded-xl border border-line bg-panel-soft px-3 py-2 text-center text-sm font-bold transition hover:border-apex/50"><FileImage size={18} />Из галереи<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" disabled={recognition.isPending} onChange={(event) => { const file = event.target.files?.[0]; if (file) recognition.mutate({ file }); event.currentTarget.value = ""; }} /></label></div><p className="-mt-2 text-xs text-muted sm:col-span-2">Добавьте фото VIN, ПТС или СТС с камеры либо из галереи.</p>
         {recognition.data && <p className="rounded-xl bg-success/10 p-3 text-sm text-success sm:col-span-2">Распознано: {[recognition.data.brand, recognition.data.model, recognition.data.year, recognition.data.vin].filter(Boolean).join(" · ") || "проверьте изображение"}. Поля заполнены автоматически — проверьте перед сохранением.</p>}
         {recognition.error && <p className="rounded-xl bg-danger/10 p-3 text-sm text-danger sm:col-span-2">Не удалось распознать VIN или документ. Сделайте фото без бликов либо введите VIN вручную.</p>}
         <Field label="Клиент" full><select className={inputClass} name="customer_id" defaultValue={entity.value?.customer_id ?? entity.customerId ?? ""}><option value="">Без клиента</option>{customers.map((item) => <option key={item.id} value={item.id}>{item.full_name}{item.phone ? ` · ${item.phone}` : ""}</option>)}</select></Field>
@@ -116,8 +118,8 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
         <Field label="Пробег"><input className={inputClass} name="mileage" type="number" min="0" defaultValue={entity.value?.mileage ?? ""} /></Field>
       </>}
       {entity.kind === "appointment" && <>
-        <Field label="Автомобиль" full><select className={inputClass} name="car_id" required defaultValue={entity.value?.car_id ?? entity.carId ?? ""}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
-        <AppointmentDateTime value={entity.value?.starts_at} />
+        <Field label="Автомобиль" full><div className="grid gap-2"><div className="relative"><Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={18}/><input className={`${inputClass} pl-10`} value={carQuery} onChange={(event) => setCarQuery(event.target.value)} placeholder="Имя клиента, телефон, марка, номер или VIN" /></div><input name="car_id" type="hidden" value={selectedCarId} />{selectedCarId && !carQuery && (() => { const selected = cars.find((car) => String(car.id) === selectedCarId); return selected ? <button type="button" className="rounded-xl border border-apex/40 bg-apex/10 p-3 text-left text-sm font-bold text-apex" onClick={() => setSelectedCarId("")}>{carName(selected)} · изменить</button> : null; })()}<div className={`${carQuery || !selectedCarId ? "grid" : "hidden"} max-h-52 gap-1 overflow-y-auto rounded-xl border border-line bg-canvas p-1`}>{cars.filter((car) => { const owner = customers.find((customer) => customer.id === car.customer_id); const haystack = `${carName(car)} ${owner?.full_name ?? ""} ${owner?.phone ?? ""}`.toLocaleLowerCase("ru"); return carQuery.trim() ? haystack.includes(carQuery.trim().toLocaleLowerCase("ru")) : false; }).slice(0, 20).map((car) => { const owner = customers.find((customer) => customer.id === car.customer_id); return <button key={car.id} type="button" className="rounded-lg p-3 text-left hover:bg-panel-soft" onClick={() => { setSelectedCarId(String(car.id)); setCarQuery(""); }}><strong className="block">{carName(car)}</strong><span className="text-xs text-muted">{owner?.full_name || "Клиент не указан"}{owner?.phone ? ` · ${owner.phone}` : ""}</span></button>; })}{!carQuery.trim() && !selectedCarId && <p className="p-3 text-sm text-muted">Начните вводить имя клиента, телефон, марку, госномер или VIN.</p>}</div></div></Field>
+        <AppointmentDateTime value={entity.value?.starts_at ?? entity.startsAt} />
         <Field label="Причина обращения" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} /></Field>
         <Field label="Согласованная сумма"><input className={inputClass} name="agreed_amount" type="number" min="0" defaultValue={entity.value?.agreed_amount ?? ""} /></Field>
         <Field label="Запчасти"><select className={inputClass} name="parts_source" defaultValue={entity.value?.parts_source ?? ""}><option value="">Не указано</option><option value="workshop">Наши</option><option value="customer">Клиента</option></select></Field>

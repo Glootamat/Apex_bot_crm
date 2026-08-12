@@ -1,5 +1,6 @@
 import {
   Camera,
+  CalendarPlus,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -21,7 +22,8 @@ import {
 } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useOutletContext, useParams, useSearchParams } from "react-router-dom";
+import type { AppOutlet } from "../app/AppShell";
 import {
   Button,
   Card,
@@ -268,6 +270,7 @@ function DiagnosticCard({
   const [photoSourceOpen, setPhotoSourceOpen] = useState(false);
   const [photoIndex, setPhotoIndex] = useState<number | null>(null);
   const navigate = useNavigate();
+  const { openEntity } = useOutletContext<AppOutlet>();
   const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
   const organizationName = account.data?.organization_name?.trim() || "APEX AUTO";
   const cameraInput = useRef<HTMLInputElement>(null);
@@ -661,6 +664,7 @@ function DiagnosticCard({
           )}
           {orderMutation.error && <p className="text-sm text-danger sm:col-span-2">{orderMutation.error instanceof Error ? orderMutation.error.message : "Не удалось создать заказ-наряд"}</p>}
         </div>
+        <div className="mt-3 border-t border-line pt-3"><Button className="w-full" variant="secondary" onClick={() => openEntity({ kind: "appointment", carId: value.car_id })}><CalendarPlus size={17} />Записать клиента на повторный визит</Button></div>
       </Card>
 
       <Button className="min-h-14 text-base print:hidden" onClick={complete} disabled={cardMutation.isPending}>
