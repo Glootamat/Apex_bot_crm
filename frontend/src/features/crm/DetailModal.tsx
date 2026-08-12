@@ -423,6 +423,8 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
   return (
     <Modal title={`Заказ-наряд #${o.id}`} onClose={onClose}>
       <div className="grid gap-4">
+        <DetailHero icon={<CarFront size={24} />} eyebrow={`Заказ-наряд #${o.id}`} title={`${o.brand} ${o.model}`} subtitle={o.plate_number || customerName(o.customer_name)} tone="apex" badge={statusLabel(o.status)} />
+        <section className="grid grid-cols-2 gap-2 sm:grid-cols-4"><QuickMetric label="Создан" value={formatDateTime(o.created_at)} /><QuickMetric label="Работы" value={money(o.labor_revenue)} tone="apex" /><QuickMetric label="Запчасти" value={money(o.parts_revenue)} /><QuickMetric label="Прибыль" value={money(o.profit)} tone="success" /></section>
         <dl className="grid gap-2 sm:grid-cols-2">
           <Row
             label="Автомобиль"
