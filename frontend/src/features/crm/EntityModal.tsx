@@ -1,5 +1,5 @@
 import { Camera, ScanLine } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api, ApiError } from "../../lib/api";
 import { refreshCrm } from "../../lib/query";
@@ -30,6 +30,20 @@ const moneyInput = (value: number | undefined) => ({
     event.currentTarget.value = event.currentTarget.value.replace(/^0+(?=\d)/, "");
   },
 });
+
+function appointmentDefaults(value?: string) {
+  const date = value?.slice(0, 10) || new Date().toLocaleDateString("sv-SE");
+  const time = value?.slice(11, 16) || "10:00";
+  return { date, hour: time.slice(0, 2), minute: time.slice(3, 5) };
+}
+
+function AppointmentDateTime({ value }: { value?: string }) {
+  const initial = appointmentDefaults(value);
+  const [date, setDate] = useState(initial.date); const [hour, setHour] = useState(initial.hour); const [minute, setMinute] = useState(initial.minute);
+  const hours = Array.from({ length: 24 }, (_, index) => String(index).padStart(2, "0"));
+  const minutes = ["00", "15", "30", "45"];
+  return <Field label="Дата и время записи" full><div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_130px_130px]"><input className={inputClass} type="date" value={date} min={new Date().toLocaleDateString("sv-SE")} onChange={(event) => setDate(event.target.value)} required /><select className={inputClass} aria-label="Час" value={hour} onChange={(event) => setHour(event.target.value)}>{hours.map((item) => <option key={item} value={item}>{item}:00</option>)}</select><select className={inputClass} aria-label="Минуты" value={minute} onChange={(event) => setMinute(event.target.value)}>{minutes.map((item) => <option key={item} value={item}>:{item}</option>)}</select></div><input name="starts_at" type="hidden" value={`${date}T${hour}:${minute}`} /><p className="mt-1 text-xs text-muted">Выберите день в календаре и удобное время. Шаг времени — 15 минут.</p></Field>;
+}
 
 export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props) {
   const formRef = useRef<HTMLFormElement>(null);
@@ -103,7 +117,7 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
       </>}
       {entity.kind === "appointment" && <>
         <Field label="Автомобиль" full><select className={inputClass} name="car_id" required defaultValue={entity.value?.car_id ?? entity.carId ?? ""}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
-        <Field label="Дата и время" full><input className={inputClass} name="starts_at" type="datetime-local" required defaultValue={entity.value?.starts_at.slice(0, 16) ?? ""} /></Field>
+        <AppointmentDateTime value={entity.value?.starts_at} />
         <Field label="Причина обращения" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} /></Field>
         <Field label="Согласованная сумма"><input className={inputClass} name="agreed_amount" type="number" min="0" defaultValue={entity.value?.agreed_amount ?? ""} /></Field>
         <Field label="Запчасти"><select className={inputClass} name="parts_source" defaultValue={entity.value?.parts_source ?? ""}><option value="">Не указано</option><option value="workshop">Наши</option><option value="customer">Клиента</option></select></Field>
