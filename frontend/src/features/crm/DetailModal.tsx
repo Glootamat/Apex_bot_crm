@@ -115,6 +115,8 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     return (
       <Modal title={customerName(detail.value.full_name)} onClose={onClose}>
         <div className="grid gap-4">
+          <DetailHero icon={<UserRound size={24} />} eyebrow="Клиент" title={customerName(detail.value.full_name)} subtitle={detail.value.phone || "Телефон не указан"} tone="info" />
+          <section className="grid grid-cols-3 gap-2"><QuickMetric label="Автомобили" value={cars.length} /><QuickMetric label="Заказы" value={orders.length} /><QuickMetric label="Прибыль" value={money(orders.reduce((sum, x) => sum + x.profit, 0))} tone="success" /></section>
           <dl className="grid gap-2 sm:grid-cols-2">
             <Row label="Телефон" value={detail.value.phone} />
             <button
@@ -220,6 +222,8 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
         onClose={onClose}
       >
         <div className="grid gap-4">
+          <DetailHero icon={<CarFront size={24} />} eyebrow="Автомобиль" title={`${detail.value.brand} ${detail.value.model}`} subtitle={detail.value.plate_number || "Госномер не указан"} tone="apex" />
+          <section className="grid grid-cols-3 gap-2"><QuickMetric label="Год" value={detail.value.year || "—"} /><QuickMetric label="Пробег" value={detail.value.mileage ? `${detail.value.mileage.toLocaleString("ru-RU")} км` : "—"} /><QuickMetric label="Заказы" value={orders.length} tone="success" /></section>
           <dl className="grid gap-2 sm:grid-cols-2">
             <Row label="Госномер" value={detail.value.plate_number} />
             <Row label="Год" value={detail.value.year} />
@@ -339,6 +343,8 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     return (
       <Modal title={`Запись #${detail.value.id}`} onClose={onClose}>
         <div className="grid gap-4">
+          <DetailHero icon={<CalendarDays size={24} />} eyebrow="Предварительная запись" title={`${detail.value.brand} ${detail.value.model}`} subtitle={formatDateTime(detail.value.starts_at)} tone="info" badge={statusLabel(detail.value.status)} />
+          <section className="grid grid-cols-2 gap-2"><QuickMetric label="Клиент" value={customerName(detail.value.customer_name)} /><QuickMetric label="Согласовано" value={detail.value.agreed_amount == null ? "Не указано" : money(detail.value.agreed_amount)} tone="apex" /></section>
           <dl className="grid gap-2 sm:grid-cols-2">
             <Row
               label="Дата и время"
@@ -524,6 +530,13 @@ function Gallery({
       </div>
     </section>
   );
+}
+function DetailHero({ icon, eyebrow, title, subtitle, tone, badge }: { icon: React.ReactNode; eyebrow: string; title: string; subtitle: string; tone: "apex" | "info" | "success"; badge?: string }) {
+  const tones = { apex: "bg-apex/12 text-apex", info: "bg-info/12 text-info", success: "bg-success/12 text-success" };
+  return <section className="overflow-hidden rounded-2xl border border-line bg-gradient-to-br from-panel to-panel-soft p-4 shadow-card"><div className="flex items-start gap-3"><span className={`grid size-12 shrink-0 place-items-center rounded-2xl ${tones[tone]}`}>{icon}</span><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-bold uppercase tracking-wide text-muted">{eyebrow}</p>{badge && <span className="rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-bold text-success">{badge}</span>}</div><h2 className="mt-1 break-words text-xl font-black">{title}</h2><p className="mt-1 break-all text-sm text-muted">{subtitle}</p></div></div></section>;
+}
+function QuickMetric({ label, value, tone }: { label: string; value: React.ReactNode; tone?: "apex" | "success" }) {
+  return <div className="min-w-0 rounded-xl border border-line/70 bg-canvas/60 p-3"><p className="truncate text-[10px] font-bold uppercase tracking-wide text-muted">{label}</p><strong className={`mt-1 block break-words text-sm sm:text-base ${tone === "success" ? "text-success" : tone === "apex" ? "text-apex" : "text-white"}`}>{value}</strong></div>;
 }
 function recentContacts(visits: Appointment[], orders: Order[]) {
   const linked = new Set(
