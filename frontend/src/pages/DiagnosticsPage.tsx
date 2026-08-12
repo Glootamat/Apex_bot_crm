@@ -780,13 +780,14 @@ function ProgressRing({ checked, total }: { checked: number; total: number }) {
   const percent = total ? Math.round((checked / total) * 100) : 0;
   return (
     <div
-      className="relative grid size-20 place-items-center rounded-full"
+      className="relative grid size-16 shrink-0 place-items-center rounded-full"
+      aria-label={`Проверено ${checked} из ${total}: ${percent}%`}
       style={{ background: `conic-gradient(#ffd600 ${percent}%, #26313c 0)` }}
     >
-      <div className="grid size-14 place-items-center rounded-full bg-panel text-center">
+      <div className="grid size-11 place-items-center rounded-full bg-panel text-center">
         <span>
-          <strong className="block text-lg leading-none">{checked}</strong>
-          <small className="text-[10px] text-muted">из {total}</small>
+          <strong className="block text-sm leading-none">{percent}%</strong>
+          <small className="block text-[8px] leading-none text-muted">проверено</small>
         </span>
       </div>
     </div>
