@@ -124,7 +124,8 @@ export function AppShell() {
     if (!settings.desktopNotifications || !settings.appointmentReminders || !crm.data || !("Notification" in window) || Notification.permission !== "granted") return;
     const notifySoon = () => {
       const now = Date.now();
-      const sent = new Set<string>(JSON.parse(localStorage.getItem("apex-reminded-appointments") ?? "[]"));
+      const stored = JSON.parse(localStorage.getItem("apex-reminded-appointments") ?? "[]") as unknown;
+      const sent = new Set<string>(Array.isArray(stored) ? stored.filter((item): item is string => typeof item === "string") : []);
       for (const appointment of crm.data.appointments) {
         const starts = new Date(appointment.starts_at).getTime();
         const key = `${appointment.id}:${starts}`;

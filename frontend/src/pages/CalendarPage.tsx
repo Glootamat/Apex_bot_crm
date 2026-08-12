@@ -15,10 +15,10 @@ export function CalendarPage() {
   const crm = useCrm();
   const action = useMutation({ mutationFn: ({ id, value }: { id: number; value: "arrived" | "no_show" }) => api.appointmentAction(id, value), onSuccess: refreshCrm });
   const remove = useMutation({ mutationFn: api.deleteAppointment, onSuccess: refreshCrm });
-  if (crm.isPending) return <Spinner />;
   const items = crm.data?.appointments ?? [];
   const [month, setMonth] = useState(() => new Date());
-  const calendarDays = useMemo(() => monthDays(month, items), [month, items]);
+  const calendarDays = useMemo(() => monthDays(month, crm.data?.appointments ?? []), [month, crm.data?.appointments]);
+  if (crm.isPending) return <Spinner />;
   const deleteAppointment = (id: number) => {
     if (window.confirm("Удалить предварительную запись? Она будет храниться в корзине 30 дней.")) remove.mutate(id);
   };
