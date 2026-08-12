@@ -18,7 +18,7 @@ jobs:
     env:
       ADMIN_ID: "1"
       BOT_TOKEN: "test:token"
-      DEPLOY_HOST: apexauto26.ru
+      DEPLOY_HOST: 144.31.144.162
       DEPLOY_USER: apexdeploy
     steps:
       - uses: actions/checkout@v4
