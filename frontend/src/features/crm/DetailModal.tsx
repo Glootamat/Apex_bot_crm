@@ -13,8 +13,8 @@ import {
   Trash2,
   UserRound,
 } from "lucide-react";
-import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import type {
   Appointment,
@@ -65,6 +65,9 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     detail.kind === "order" ? (detail.value.attachments ?? []) : [],
   );
   const [orderExportOpen, setOrderExportOpen] = useState(false);
+  const [photoSourceOpen, setPhotoSourceOpen] = useState(false);
+  const cameraInput = useRef<HTMLInputElement>(null);
+  const galleryInput = useRef<HTMLInputElement>(null);
   const remove = useMutation({
     mutationFn: () =>
       detail.kind === "customer"
@@ -101,28 +104,7 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     )
       remove.mutate();
   };
-  const uploadInput = (
-    type: "work",
-    icon: React.ReactNode,
-    label: string,
-  ) => (
-    <label className="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-xl bg-panel-soft px-4 py-2 text-sm font-bold hover:bg-line">
-      {icon}
-      {upload.isPending ? "Загрузка…" : label}
-      <input
-        className="sr-only"
-        type="file"
-        accept="image/jpeg,image/png,image/webp"
-        capture="environment"
-        disabled={upload.isPending}
-        onChange={(event) => {
-          const file = event.target.files?.[0];
-          if (file) upload.mutate({ file, type });
-          event.currentTarget.value = "";
-        }}
-      />
-    </label>
-  );
+  const selectPhoto = (file?: File) => { if (file) upload.mutate({ file, type: "work" }); setPhotoSourceOpen(false); };
 
   if (detail.kind === "customer") {
     const cars = data.cars.filter((x) => x.customer_id === detail.value.id);
@@ -477,7 +459,7 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
             <PackageSearch size={17} />
             Подобрать запчасти и загрузить заказ поставщика
           </Button>
-          {uploadInput("work", <Camera size={17} />, "Добавить фото работ")}
+          <Button variant="secondary" onClick={() => setPhotoSourceOpen(true)} disabled={upload.isPending}><Camera size={17} />{upload.isPending ? "Загрузка…" : "Добавить фото работ"}</Button>
           <Button variant="secondary" onClick={() => setOrderExportOpen((current) => !current)}>
             <Save size={17} />
             Сохранить
@@ -512,9 +494,19 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
             Удалить заказ-наряд
           </Button>
         </div>
+        {photoSourceOpen && <Modal title="Добавить фото работ" onClose={() => setPhotoSourceOpen(false)}><div className="grid grid-cols-2 gap-2"><Button className="min-h-24 flex-col" variant="secondary" onClick={() => cameraInput.current?.click()}><Camera size={25} />Камера</Button><Button className="min-h-24 flex-col" variant="secondary" onClick={() => galleryInput.current?.click()}><FileImage size={25} />Галерея</Button></div></Modal>}
+        <input ref={cameraInput} className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => { selectPhoto(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+        <input ref={galleryInput} className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => { selectPhoto(event.target.files?.[0]); event.currentTarget.value = ""; }} />
       </div>
     </Modal>
   );
+}
+function ProtectedOrderPhoto({ item, title }: { item: OrderAttachment; title: string }) {
+  const photo = useQuery({ queryKey: ["order-photo", item.id, item.url], queryFn: async () => URL.createObjectURL(await api.orderPhoto(item.url!)), staleTime: Infinity });
+  useEffect(() => () => { if (photo.data) URL.revokeObjectURL(photo.data); }, [photo.data]);
+  if (photo.isPending) return <div className="aspect-square animate-pulse rounded-xl bg-panel-soft" />;
+  if (photo.isError || !photo.data) return <div className="grid aspect-square place-items-center rounded-xl bg-danger/10 p-2 text-center text-xs text-danger">Фото недоступно</div>;
+  return <a href={photo.data} target="_blank" rel="noreferrer"><img className="aspect-square w-full rounded-xl object-cover" src={photo.data} alt={item.caption || title} loading="lazy" /></a>;
 }
 function Gallery({
   title,
@@ -528,16 +520,7 @@ function Gallery({
     <section>
       <h3 className="mb-2 font-black">{title}</h3>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-        {items.map((item) => (
-          <a key={item.id} href={item.url!} target="_blank" rel="noreferrer">
-            <img
-              className="aspect-square w-full rounded-xl object-cover"
-              src={item.url!}
-              alt={item.caption || title}
-              loading="lazy"
-            />
-          </a>
-        ))}
+        {items.map((item) => <ProtectedOrderPhoto key={item.id} item={item} title={title} />)}
       </div>
     </section>
   );

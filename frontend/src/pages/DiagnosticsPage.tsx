@@ -178,8 +178,8 @@ export function DiagnosticsIndexPage() {
                     </p>
                     <p className="mt-1 truncate text-xs text-muted">{item.customer_name || item.plate_number || item.vin || "Автомобиль без номера"}{item.customer_phone ? ` · ${item.customer_phone}` : ""}</p>
                   </div>
-                  <span className="rounded-full bg-panel-soft px-3 py-1 text-sm font-bold">
-                    {item.checked}/{item.total}
+                  <span className="rounded-full bg-panel-soft px-3 py-1 text-xs font-bold" aria-label={`Проверено ${item.checked} из ${item.total}`}>
+                    Проверено: {item.checked}/{item.total}
                   </span>
                 </div>
                 <div className="mt-4 flex items-end justify-between gap-3">
@@ -235,7 +235,7 @@ export function DiagnosticPage() {
   return <DiagnosticCard value={diagnostic.data} queryKey={queryKey} />;
 }
 
-function ProtectedDiagnosticPhoto({ id, path, alt }: { id: number; path: string; alt: string }) {
+function ProtectedDiagnosticPhoto({ id, path, alt, onOpen }: { id: number; path: string; alt: string; onOpen: () => void }) {
   const photo = useQuery({
     queryKey: ["diagnostic-photo", id, path],
     queryFn: async () => URL.createObjectURL(await api.diagnosticPhoto(path)),
@@ -246,7 +246,14 @@ function ProtectedDiagnosticPhoto({ id, path, alt }: { id: number; path: string;
   }, [photo.data]);
   if (photo.isPending) return <div className="aspect-square animate-pulse rounded-xl bg-panel-soft" aria-label="Загрузка фото" />;
   if (photo.isError || !photo.data) return <div className="grid aspect-square place-items-center rounded-xl bg-danger/10 p-2 text-center text-xs text-danger">Фото недоступно</div>;
-  return <a href={photo.data} target="_blank" rel="noreferrer"><img className="aspect-square w-full rounded-xl object-cover" src={photo.data} alt={alt} /></a>;
+  return <button type="button" className="relative aspect-square overflow-hidden rounded-xl" onClick={onOpen} aria-label={`Открыть: ${alt}`}><img className="size-full object-cover transition hover:scale-105" src={photo.data} alt={alt} /></button>;
+}
+
+function DiagnosticPhotoViewer({ photos, index, onChange, onClose }: { photos: Diagnostic["photos"]; index: number; onChange: (index: number) => void; onClose: () => void }) {
+  const current = photos[index]!;
+  const photo = useQuery({ queryKey: ["diagnostic-photo-viewer", current.id, current.url], queryFn: async () => URL.createObjectURL(await api.diagnosticPhoto(current.url)), staleTime: Infinity });
+  useEffect(() => () => { if (photo.data) URL.revokeObjectURL(photo.data); }, [photo.data]);
+  return <Modal title={`Фото ${index + 1} из ${photos.length}`} onClose={onClose}><div className="grid gap-3"><div className="grid min-h-64 place-items-center rounded-xl bg-canvas">{photo.data ? <img className="max-h-[65dvh] w-full rounded-xl object-contain" src={photo.data} alt={current.caption || "Фото диагностики"} /> : <Spinner label="Загружаю фото…" />}</div><div className="grid grid-cols-2 gap-2"><Button variant="secondary" disabled={index === 0} onClick={() => onChange(index - 1)}>← Предыдущее</Button><Button variant="secondary" disabled={index === photos.length - 1} onClick={() => onChange(index + 1)}>Следующее →</Button></div></div></Modal>;
 }
 
 function DiagnosticCard({
@@ -259,6 +266,7 @@ function DiagnosticCard({
   const [statusFilter, setStatusFilter] = useState<DiagnosticStatus | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [photoSourceOpen, setPhotoSourceOpen] = useState(false);
+  const [photoIndex, setPhotoIndex] = useState<number | null>(null);
   const navigate = useNavigate();
   const account = useQuery({ queryKey: ["account"], queryFn: api.account, retry: false });
   const organizationName = account.data?.organization_name?.trim() || "APEX AUTO";
@@ -557,8 +565,8 @@ function DiagnosticCard({
       <Card className="p-3">
         <h2 className="font-black">Фото диагностики</h2>
         <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
-          {value.photos.map((photo) => (
-            <ProtectedDiagnosticPhoto key={photo.id} id={photo.id} path={photo.url} alt={photo.caption || "Фото диагностики"} />
+          {value.photos.map((photo, index) => (
+            <ProtectedDiagnosticPhoto key={photo.id} id={photo.id} path={photo.url} alt={photo.caption || "Фото диагностики"} onOpen={() => setPhotoIndex(index)} />
           ))}
           <button type="button" onClick={() => setPhotoSourceOpen(true)} disabled={photoMutation.isPending} className="grid aspect-square cursor-pointer place-items-center rounded-xl border border-dashed border-line text-center text-sm text-muted transition hover:border-apex hover:text-apex disabled:opacity-50 print:hidden">
             <span>
@@ -581,6 +589,7 @@ function DiagnosticCard({
           </div>
         </Modal>
       )}
+      {photoIndex !== null && value.photos[photoIndex] && <DiagnosticPhotoViewer photos={value.photos} index={photoIndex} onChange={setPhotoIndex} onClose={() => setPhotoIndex(null)} />}
 
       <Card className="p-3">
         <label className="grid gap-2">

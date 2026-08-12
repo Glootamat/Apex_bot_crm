@@ -121,6 +121,25 @@ export function AppShell() {
   }, [account.data]);
 
   useEffect(() => {
+    if (!settings.desktopNotifications || !settings.appointmentReminders || !crm.data || !("Notification" in window) || Notification.permission !== "granted") return;
+    const notifySoon = () => {
+      const now = Date.now();
+      const sent = new Set<string>(JSON.parse(localStorage.getItem("apex-reminded-appointments") ?? "[]"));
+      for (const appointment of crm.data.appointments) {
+        const starts = new Date(appointment.starts_at).getTime();
+        const key = `${appointment.id}:${starts}`;
+        if (appointment.status === "scheduled" && starts >= now && starts <= now + 60 * 60_000 && !sent.has(key)) {
+          new Notification("Скоро запись в Apex CRM", { body: `${appointment.brand} ${appointment.model} — ${new Date(starts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}` });
+          sent.add(key);
+        }
+      }
+      localStorage.setItem("apex-reminded-appointments", JSON.stringify([...sent].slice(-100)));
+    };
+    notifySoon(); const timer = window.setInterval(notifySoon, 60_000);
+    return () => window.clearInterval(timer);
+  }, [crm.data, settings.appointmentReminders, settings.desktopNotifications]);
+
+  useEffect(() => {
     if (!settings.autoLockMinutes) return;
     let timer = window.setTimeout(() => logout(), settings.autoLockMinutes * 60_000);
     const resetTimer = () => {
