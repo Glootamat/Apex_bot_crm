@@ -791,6 +791,37 @@ class DatabaseTest(unittest.TestCase):
             self.assertIsNone(db.get_diagnostic(user_id, int(card["id"])))
             self.assertEqual(db.list_diagnostics(user_id), [])
 
+    def test_paired_brake_items_use_one_status_and_migrate_side_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            db = Database(path)
+            db.initialize()
+            user_id = db.add_or_update_user(4015, "Master", None)
+            car_id = db.add_car(user_id, "Lada", "Vesta")
+            card = db.start_diagnostic(
+                user_id, car_id, None,
+                [("brakes", "front_pads", "Передние тормозные колодки", False)],
+            )
+            assert card is not None
+            item = card["items"][0]
+            self.assertIsNone(item["left_status"])
+            self.assertIsNone(item["right_status"])
+
+            connection = db.connect()
+            try:
+                connection.execute(
+                    "UPDATE diagnostic_items SET left_status = 'critical', right_status = 'unchecked' WHERE id = ?",
+                    (item["id"],),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            db.initialize()
+            migrated = db.get_diagnostic(user_id, int(card["id"]))["items"][0]
+            self.assertEqual(migrated["status"], "critical")
+            self.assertIsNone(migrated["left_status"])
+            self.assertIsNone(migrated["right_status"])
+
     def test_diagnostic_creates_one_safe_order_without_invented_parts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

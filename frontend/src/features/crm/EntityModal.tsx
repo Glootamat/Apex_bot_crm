@@ -20,6 +20,14 @@ const text = (data: FormData, key: string) => { const value = data.get(key); ret
 const optional = (data: FormData, key: string) => text(data, key) || null;
 const number = (data: FormData, key: string) => { const value = text(data, key); return value ? Number(value) : null; };
 const requiredNumber = (data: FormData, key: string) => Number(text(data, key));
+type DiagnosticWork = { id: string; source: string; work: string };
+const diagnosticWorks = (concern: string | null | undefined): DiagnosticWork[] => {
+  if (!concern?.startsWith("По результатам диагностики №")) return [];
+  return concern.replace(/^По результатам диагностики №\d+:?\s*/i, "").split(/(?:\r?\n|\s*•\s*)+/).map((value) => value.trim()).filter(Boolean).map((source, index) => {
+    const [label] = source.split(/:\s*/, 1);
+    return { id: `${index}:${label}`, source, work: `Замена: ${label}` };
+  });
+};
 const moneyInput = (value: number | undefined) => ({
   type: "number" as const, min: "0", inputMode: "numeric" as const,
   defaultValue: value ?? 0,
@@ -49,6 +57,8 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
   const formRef = useRef<HTMLFormElement>(null);
   const [carQuery, setCarQuery] = useState("");
   const [selectedCarId, setSelectedCarId] = useState(() => entity.kind === "appointment" || entity.kind === "order" ? String(entity.value?.car_id ?? entity.carId ?? "") : "");
+  const [selectedDiagnosticWorks, setSelectedDiagnosticWorks] = useState<string[]>([]);
+  const availableDiagnosticWorks = entity.kind === "order" ? diagnosticWorks(entity.value?.concern) : [];
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", close);
@@ -93,6 +103,15 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
     const input = formRef.current?.elements.namedItem("vin");
     if (input instanceof HTMLInputElement) recognition.mutate({ vin: input.value });
   };
+  const addDiagnosticWorks = () => {
+    const input = formRef.current?.elements.namedItem("description");
+    if (!(input instanceof HTMLTextAreaElement)) return;
+    const additions = availableDiagnosticWorks.filter((item) => selectedDiagnosticWorks.includes(item.id)).map((item) => item.work);
+    const existing = input.value.split(/\r?\n/).map((item) => item.trim().toLocaleLowerCase("ru-RU"));
+    const unique = additions.filter((item) => !existing.includes(item.toLocaleLowerCase("ru-RU")));
+    if (unique.length) input.value = [input.value.trim(), ...unique].filter(Boolean).join("\n");
+    setSelectedDiagnosticWorks([]);
+  };
 
   const edit = Boolean(entity.value);
   const title = `${edit ? "Изменить" : "Создать"} ${{ customer: "клиента", car: "автомобиль", appointment: "запись", order: "заказ-наряд" }[entity.kind]}`;
@@ -128,7 +147,8 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
       {entity.kind === "order" && <>
         <Field label="Автомобиль" full><select className={inputClass} name="car_id" required value={selectedCarId} onChange={(event) => setSelectedCarId(event.target.value)}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
         <Field label="Пробег на момент визита"><input key={selectedCarId} className={inputClass} name="mileage_at_visit" type="number" min="0" defaultValue={entity.value?.mileage_at_visit ?? cars.find((item) => String(item.id) === selectedCarId)?.mileage ?? ""} placeholder="Например, 24000" /></Field>
-        <Field label="Работы" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} /></Field>
+        <Field label="Работы" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} placeholder={"Каждую выполненную работу указывайте с новой строки"} /></Field>
+        {availableDiagnosticWorks.length > 0 && <section className="grid gap-3 rounded-2xl border border-apex/30 bg-apex/5 p-3 sm:col-span-2"><div><p className="font-bold text-apex">Работы по диагностике</p><p className="mt-1 text-xs text-muted">Отметьте только то, что действительно сделали. Пункты добавятся в выполненные работы отдельными строками.</p></div><div className="grid gap-2 sm:grid-cols-2">{availableDiagnosticWorks.map((item) => { const selected = selectedDiagnosticWorks.includes(item.id); return <button key={item.id} type="button" aria-pressed={selected} onClick={() => setSelectedDiagnosticWorks((current) => selected ? current.filter((id) => id !== item.id) : [...current, item.id])} className={`flex min-h-11 items-center gap-2 rounded-xl border px-3 py-2 text-left text-sm transition ${selected ? "border-apex bg-apex/15 text-white" : "border-line bg-canvas text-muted hover:border-apex/50"}`}><span className={`grid size-5 shrink-0 place-items-center rounded border ${selected ? "border-apex bg-apex text-black" : "border-muted"}`}>{selected ? "✓" : ""}</span><span className="min-w-0"><b className="block break-words text-white">{item.work}</b><small className="block break-words text-xs text-muted">Выявлено: {item.source}</small></span></button>; })}</div><Button type="button" className="w-full sm:w-auto sm:justify-self-start" disabled={!selectedDiagnosticWorks.length} onClick={addDiagnosticWorks}>Добавить выбранные в работы</Button></section>}
         <Field label="Оплата за работу"><input className={inputClass} name="labor_revenue" {...moneyInput(entity.value?.labor_revenue)} /></Field>
         <Field label="Закупка запчастей"><input className={inputClass} name="parts_cost" {...moneyInput(entity.value?.parts_cost)} /></Field>
         <Field label="Продажа запчастей"><input className={inputClass} name="parts_revenue" {...moneyInput(entity.value?.parts_revenue)} /></Field>

@@ -13,10 +13,30 @@ export function orderCustomerLabel(order: Pick<Order, "customer_name" | "brand" 
   return name.localeCompare(car, "ru", { sensitivity: "base" }) === 0 ? "Не указан" : name;
 }
 
-function wrap(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, width: number, line = 42) {
-  const words = text.split(/\s+/); let row = ""; let top = y;
-  for (const word of words) { const next = `${row} ${word}`.trim(); if (ctx.measureText(next).width > width && row) { ctx.fillText(row, x, top); row = word; top += line; } else row = next; }
-  if (row) ctx.fillText(row, x, top); return top + line;
+function wrappedLines(ctx: CanvasRenderingContext2D, text: string, width: number) {
+  const lines: string[] = [];
+  let row = "";
+  for (const word of text.trim().split(/\s+/)) {
+    const next = `${row} ${word}`.trim();
+    if (row && ctx.measureText(next).width > width) { lines.push(row); row = word; } else row = next;
+  }
+  if (row) lines.push(row);
+  return lines;
+}
+
+function orderList(value: string, diagnostic = false) {
+  const source = value.trim();
+  const rawLines = source.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const header = diagnostic && /^По результатам диагностики №\d+:?$/i.test(rawLines[0] ?? "")
+    ? rawLines.shift()
+    : undefined;
+  const raw = rawLines.join("\n") || source;
+  const entries = raw
+    .split(/(?:\r?\n|\s*•\s*|\s*;\s*)+/)
+    .flatMap((item) => diagnostic ? [item] : item.split(/\s+(?=(?:замена|ремонт|установка|диагностика|регулировка|обслуживание|снятие|покраска)\b)/iu))
+    .map((item) => item.replace(/^[-–—•]\s*/, "").trim())
+    .filter(Boolean);
+  return { header, entries: entries.length ? entries : [source] };
 }
 
 function drawLegacyPartIcon(ctx: CanvasRenderingContext2D, name: string, x: number, y: number) {
@@ -115,7 +135,7 @@ async function renderOrderCanvas(order: Order) {
   const parts = groupedParts(order.parts ?? []);
   const partGroupsCount = new Set(parts.map((part) => partCategory(part.name))).size;
   const textBlocks = [order.concern, order.description, order.recommendations].filter(Boolean).join(" ");
-  const estimatedLines = Math.max(3, Math.ceil(textBlocks.length / 48));
+  const estimatedLines = Math.max(3, Math.ceil(textBlocks.length / 30));
   const canvas = document.createElement("canvas");
   canvas.width = 1080;
   canvas.height = Math.max(1180, 900 + estimatedLines * 36 + parts.length * 92 + partGroupsCount * 30);
@@ -142,18 +162,31 @@ async function renderOrderCanvas(order: Order) {
   ctx.fillText([orderCustomerLabel(order), order.customer_phone].filter(Boolean).join(" · "), 98, clientLabelY + 26);
   y += 230;
 
-  const section = (label: string, value: string, price?: number) => {
-    ctx.font = "600 25px sans-serif";
-    const lines = Math.max(1, Math.ceil(ctx.measureText(value).width / 820));
-    const height = 46 + lines * 34;
+  const section = (label: string, value: string, price?: number, diagnostic = false) => {
+    const list = orderList(value, diagnostic);
+    ctx.font = "600 24px sans-serif";
+    const textWidth = price != null ? 630 : 760;
+    const headerLines = list.header ? wrappedLines(ctx, list.header, 850) : [];
+    const itemLines = list.entries.map((item) => wrappedLines(ctx, item, textWidth));
+    const contentHeight = headerLines.length * 31 + (headerLines.length ? 12 : 0)
+      + itemLines.reduce((sum, lines) => sum + lines.length * 31 + 10, 0);
+    const height = Math.max(82, 28 + contentHeight);
     ctx.fillStyle = "#fff"; ctx.font = "900 23px sans-serif"; ctx.fillText(label.toUpperCase(), 68, y + 22);
     panel(y + 42, height);
     ctx.fillStyle = "#fff"; ctx.font = "600 24px sans-serif";
-    wrap(ctx, value, 98, y + 78, price ? 690 : 850, 34);
+    let contentY = y + 76;
+    for (const line of headerLines) { ctx.fillText(line, 98, contentY); contentY += 31; }
+    if (headerLines.length) contentY += 8;
+    for (const lines of itemLines) {
+      ctx.fillStyle = "#ffd600"; ctx.beginPath(); ctx.arc(106, contentY - 8, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff";
+      for (const line of lines) { ctx.fillText(line, 122, contentY); contentY += 31; }
+      contentY += 10;
+    }
     if (price != null) { ctx.fillStyle = "#ffd600"; ctx.font = "800 26px sans-serif"; ctx.textAlign = "right"; ctx.fillText(money(price), 975, y + 80); ctx.textAlign = "left"; }
     y += height + 54;
   };
-  if (order.concern) section(order.concern.startsWith("По результатам диагностики №") ? "Выявлено при диагностике" : "Обращение клиента", order.concern);
+  if (order.concern) section(order.concern.startsWith("По результатам диагностики №") ? "Выявлено при диагностике" : "Обращение клиента", order.concern, undefined, order.concern.startsWith("По результатам диагностики №"));
   if (order.description) section("Выполненные работы", order.description, order.labor_revenue || undefined);
   if (order.recommendations) section("Рекомендации", order.recommendations);
 

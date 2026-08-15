@@ -1,5 +1,5 @@
 import {
-  Banknote, BarChart3, BrainCircuit, ChevronDown, CircleAlert, ClipboardList, PackageOpen,
+  Banknote, BarChart3, BrainCircuit, ChevronDown, PackageOpen,
   TrendingUp, Wrench,
 } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -57,8 +57,6 @@ export function FinancePage() {
     { key: "parts" as const, label: "Запчасти и наценка", value: totals.markup, hint: `Закупка ${money(totals.partsCost)}`, icon: PackageOpen, color: "text-info", rows: [["Продажа", totals.partsRevenue], ["Закупка", totals.partsCost], ["Доп. прибыль", totals.extraPartsProfit], ["Наценка / прибыль", totals.markup]] as const },
     { key: "profit" as const, label: "Чистый заработок", value: totals.profit, hint: `Маржинальность ${margin}%`, icon: TrendingUp, color: "text-success", rows: [["Работы", totals.labor], ["Прибыль с запчастей", totals.markup], ["Итого", totals.profit]] as const },
   ];
-  const attention = allOrders.filter((item) => !item.archived_at && !["ready", "completed"].includes(item.status));
-  const scheduled = (crm.data?.appointments ?? []).filter((item) => item.status === "scheduled");
   const chart = dailyFinance(orders, period === 0 ? 30 : period, window.end);
   return <div className="grid min-w-0 gap-6">
     <header><p className="text-sm font-bold text-apex">АНАЛИТИКА</p><h1 className="text-3xl font-black">Финансы</h1><p className="mt-1 text-muted">Доходы, прибыль и состояние заказов</p></header>
@@ -68,7 +66,7 @@ export function FinancePage() {
       {Boolean(account.data?.platform_admin) && <button aria-label="Расходы на ИИ" className={`min-w-0 rounded-lg px-2 py-2 text-xs font-bold sm:px-3 sm:text-sm ${view === "ai" ? "bg-apex text-black" : "text-muted"}`} onClick={() => setView("ai")}><span className="inline-flex items-center justify-center gap-1.5"><BrainCircuit size={16} /><span className="hidden sm:inline">ИИ-расходы</span><span className="sm:hidden">ИИ</span></span></button>}
     </div>
     <div className="flex max-w-full gap-2 overflow-x-auto pb-1">{([[1,"Сегодня"],[7,"7 дней"],[30,"30 дней"],[0,"Всё время"]] as const).map(([value, label]) => <Button className="shrink-0" key={value} variant={period === value ? "primary" : "secondary"} onClick={() => setPeriod(value)}>{label}</Button>)}</div>
-    {view === "overview" ? <Overview sections={sections} open={open} setOpen={setOpen} orders={orders} ordersOpen={ordersOpen} setOrdersOpen={setOrdersOpen} openDetail={openDetail} totals={totals} margin={margin} /> : view === "analytics" ? <Analytics totals={totals} previous={previous} change={change} margin={margin} chart={chart} attention={attention} scheduled={scheduled} openDetail={openDetail} /> : <AiExpenses data={aiUsage.data} pending={aiUsage.isPending} />}
+    {view === "overview" ? <Overview sections={sections} open={open} setOpen={setOpen} orders={orders} ordersOpen={ordersOpen} setOrdersOpen={setOrdersOpen} openDetail={openDetail} totals={totals} margin={margin} /> : view === "analytics" ? <Analytics totals={totals} previous={previous} change={change} margin={margin} chart={chart} orders={orders} /> : <AiExpenses data={aiUsage.data} pending={aiUsage.isPending} />}
   </div>;
 }
 
@@ -105,7 +103,7 @@ function Overview({ sections, open, setOpen, orders, ordersOpen, setOrdersOpen, 
   </>;
 }
 
-function Analytics({ totals, previous, change, margin, chart, attention, scheduled, openDetail }: { totals: ReturnType<typeof calculateFinance>; previous: ReturnType<typeof calculateFinance>; change: number | null; margin: number; chart: DailyFinance[]; attention: Order[]; scheduled: { id: number }[]; openDetail: AppOutlet["openDetail"] }) {
+function Analytics({ totals, previous, change, margin, chart, orders }: { totals: ReturnType<typeof calculateFinance>; previous: ReturnType<typeof calculateFinance>; change: number | null; margin: number; chart: DailyFinance[]; orders: Order[] }) {
   const partsPercent = totals.revenue ? Math.round(totals.partsRevenue / totals.revenue * 100) : 0;
   const profitChange = percentChange(totals.profit, previous.profit);
   const averageCheck = totals.count ? totals.revenue / totals.count : 0;
@@ -125,7 +123,7 @@ function Analytics({ totals, previous, change, margin, chart, attention, schedul
     </section>
     <section className="grid gap-4 lg:grid-cols-2">
       <Card className="border-line/80 bg-gradient-to-br from-panel to-panel-soft"><h2 className="text-base font-black">Что изменилось</h2><div className="mt-3 grid gap-2"><ChangeRow label="Выручка" value={change} /><ChangeRow label="Прибыль" value={profitChange} /><ChangeRow label="Средний чек" value={averageChange} /><ChangeRow label="Маржинальность" value={margin} suffix="% сейчас" neutral /></div></Card>
-      <Card className="border-line/80 bg-gradient-to-br from-panel to-panel-soft"><h2 className="text-base font-black">Требует внимания</h2><div className="mt-3 grid gap-2"><AttentionRow icon={<ClipboardList size={18} />} label="Заказы в работе" value={attention.length} tone="text-danger" /><AttentionRow icon={<CircleAlert size={18} />} label="Запланированные визиты" value={scheduled.length} tone="text-apex" />{attention.slice(0, 2).map((item) => <button key={item.id} onClick={() => openDetail({ kind: "order", value: item })} className="flex items-center justify-between rounded-xl bg-canvas/70 px-3 py-2 text-left text-sm transition hover:bg-line"><span className="truncate">#{item.id} · {item.brand} {item.model}</span><span className="text-muted">Открыть</span></button>)}</div></Card>
+      <WorkRevenueDirections orders={orders} />
     </section>
   </div>;
 }
@@ -144,6 +142,33 @@ function LegendRow({ color, label, percent, value }: { color: string; label: str
 
 function RevenueDirections({ totals }: { totals: ReturnType<typeof calculateFinance> }) { const rows = [{ label: "Работы", value: totals.labor, color: "bg-info" }, { label: "Продажа запчастей", value: totals.partsRevenue, color: "bg-success" }, { label: "Прибыль с запчастей", value: totals.markup, color: "bg-apex" }, { label: "Закупка запчастей", value: totals.partsCost, color: "bg-purple-400" }]; const max = Math.max(...rows.map((row) => row.value), 1); return <Card className="border-line/80 bg-gradient-to-br from-panel to-panel-soft"><div className="flex items-center justify-between"><h2 className="text-base font-black">Доход по направлениям</h2><span className="text-xs text-muted">₽ за период</span></div><div className="mt-5 grid gap-4">{rows.map((row) => <div key={row.label}><div className="mb-1.5 flex justify-between gap-3 text-xs"><span className="text-muted">{row.label}</span><strong>{money(row.value)}</strong></div><div className="h-2 overflow-hidden rounded-full bg-canvas"><div className={`h-full rounded-full ${row.color}`} style={{ width: `${Math.max(row.value ? 4 : 0, row.value / max * 100)}%` }} /></div></div>)}</div></Card>; }
 
+type WorkRevenueRow = { label: string; value: number; color: string };
+const workGroups: Array<WorkRevenueRow & { pattern: RegExp }> = [
+  { label: "Тормозная система", value: 0, color: "bg-danger", pattern: /тормоз|колод|диск|барабан|суппорт|ручник/i },
+  { label: "ТО и масла", value: 0, color: "bg-apex", pattern: /то\b|масл|фильтр|жидкост|антифриз|свеч/i },
+  { label: "Ходовая часть", value: 0, color: "bg-info", pattern: /подвес|амортиз|стойк|пружин|рычаг|сайлент|шаров|тяга|наконеч|ступиц|подшип/i },
+  { label: "Двигатель", value: 0, color: "bg-success", pattern: /двигател|мотор|гбц|грм|ремень|цепь|турбин|форсунк|компресс|прокладк/i },
+  { label: "Электрика", value: 0, color: "bg-purple-400", pattern: /электр|провод|ламп|генератор|стартер|аккум|датчик|блок/i },
+  { label: "Кузов и салон", value: 0, color: "bg-pink-400", pattern: /кузов|двер|стекл|бампер|покрас|салон|сиден|замок/i },
+];
+
+function workRevenueRows(orders: Order[]): WorkRevenueRow[] {
+  const totals = new Map(workGroups.map((group) => [group.label, 0]));
+  totals.set("Прочие работы", 0);
+  for (const order of orders) {
+    if (!order.labor_revenue || !order.description.trim()) continue;
+    const lines = order.description.split(/(?:\r?\n|;\s*)+/).flatMap((line) => line.split(/\s+(?=(?:замена|ремонт|установка|диагностика|регулировка|обслуживание|снятие|покраска)\b)/iu)).filter(Boolean);
+    const groups = [...new Set(lines.map((line) => workGroups.find((group) => group.pattern.test(line))?.label ?? "Прочие работы"))];
+    for (const group of groups) totals.set(group, (totals.get(group) ?? 0) + order.labor_revenue / groups.length);
+  }
+  return [...workGroups.map(({ label, color }) => ({ label, color, value: totals.get(label) ?? 0 })), { label: "Прочие работы", color: "bg-muted", value: totals.get("Прочие работы") ?? 0 }].filter((row) => row.value > 0).sort((a, b) => b.value - a.value);
+}
+
+function WorkRevenueDirections({ orders }: { orders: Order[] }) {
+  const rows = workRevenueRows(orders); const max = Math.max(...rows.map((row) => row.value), 1);
+  return <Card className="border-line/80 bg-gradient-to-br from-panel to-panel-soft"><div className="flex items-center justify-between gap-3"><div><h2 className="text-base font-black">Доход по видам работ</h2><p className="mt-1 text-xs text-muted">Только оплата за выполненные работы</p></div><span className="text-xs text-muted">₽ за период</span></div><div className="mt-5 grid gap-4">{rows.length ? rows.map((row) => <div key={row.label}><div className="mb-1.5 flex justify-between gap-3 text-xs"><span className="text-muted">{row.label}</span><strong>{money(Math.round(row.value))}</strong></div><div className="h-2 overflow-hidden rounded-full bg-canvas"><div className={`h-full rounded-full ${row.color}`} style={{ width: `${Math.max(4, row.value / max * 100)}%` }} /></div></div>) : <p className="rounded-xl bg-canvas/60 p-3 text-sm text-muted">Добавьте выполненные работы в завершённые заказы — здесь появится разбивка.</p>}</div></Card>;
+}
+
 function ChangeRow({ label, value, suffix = "%", neutral = false }: { label: string; value: number | null; suffix?: string; neutral?: boolean }) { const shown = value === null ? "—" : `${!neutral && value >= 0 ? "+" : ""}${value}${suffix}`; return <div className="flex items-center justify-between rounded-xl bg-canvas/65 px-3 py-2 text-sm"><span className="text-muted">{label}</span><strong className={neutral || value === null ? "text-white" : value >= 0 ? "text-success" : "text-danger"}>{shown}</strong></div>; }
 
 function percentChange(current: number, previous: number) { return previous ? Math.round((current - previous) / Math.abs(previous) * 100) : null; }
@@ -151,6 +176,5 @@ function percentChange(current: number, previous: number) { return previous ? Ma
 function formatCompact(value: number) { const absolute = Math.abs(value); const sign = value < 0 ? "−" : ""; if (absolute >= 1_000_000) return `${sign}${(absolute / 1_000_000).toLocaleString("ru-RU", { maximumFractionDigits: 1 })}м`; if (absolute >= 1_000) return `${sign}${Math.round(absolute / 1_000)}к`; return `${sign}${Math.round(absolute)}`; }
 
 function OrdersCard({ orders, open, setOpen, openDetail }: { orders: Order[]; open: boolean; setOpen: (value: boolean) => void; openDetail: AppOutlet["openDetail"] }) { return <Card><button type="button" className="flex w-full flex-wrap items-center justify-between gap-3 text-left" onClick={() => setOpen(!open)}><div><h2 className="text-lg font-black">Заказы в расчёте</h2><p className="mt-1 text-sm text-muted">Подробная расшифровка каждой суммы</p></div><span className="flex items-center gap-2"><strong className="text-apex">{orders.length}</strong><ChevronDown className={`transition ${open ? "rotate-180" : ""}`} /></span></button>{open && <div className="mt-4 grid gap-2">{orders.length ? orders.map((item) => <button key={item.id} type="button" onClick={() => openDetail({ kind: "order", value: item })} className="grid min-w-0 gap-2 rounded-xl bg-panel-soft p-3 text-left transition hover:bg-line sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><p className="break-words font-bold">#{item.id} · {item.brand} {item.model}</p><p className="mt-1 break-words text-sm text-muted">{formatDateTime(item.completed_at || item.created_at)} · {item.description}</p></div><div className="grid grid-cols-2 gap-x-4 text-sm sm:text-right"><span className="text-muted">Выручка</span><strong>{money(item.labor_revenue + item.parts_revenue)}</strong><span className="text-muted">Прибыль</span><strong className="text-success">{money(item.profit)}</strong></div></button>) : <EmptyState>За выбранный период заказов нет</EmptyState>}</div>}</Card>; }
-function AttentionRow({ icon, label, value, tone }: { icon: React.ReactNode; label: string; value: number; tone: string }) { return <div className="flex items-center justify-between rounded-xl bg-panel-soft p-3"><span className={`flex items-center gap-2 ${tone}`}>{icon}{label}</span><strong className={tone}>{value}</strong></div>; }
 function Metric({ label, value, hint, positive }: { label: string; value: string; hint?: string; positive?: boolean }) { return <div className="rounded-xl bg-panel-soft p-4"><p className="text-sm text-muted">{label}</p><strong className="mt-1 block text-xl font-black">{value}</strong>{hint && <p className={`mt-1 text-xs ${positive === undefined ? "text-muted" : positive ? "text-success" : "text-danger"}`}>{hint}</p>}</div>; }
 function dailyFinance(orders: Order[], days: number, end: Date): DailyFinance[] { const start = startOfDay(end); start.setDate(start.getDate() - (days - 1)); return Array.from({ length: days }, (_, index) => { const day = new Date(start); day.setDate(start.getDate() + index); const next = new Date(day); next.setDate(day.getDate() + 1); const dailyOrders = orders.filter((order) => { const date = parseCrmDate(order.completed_at!); return date >= day && date < next; }); return { label: days <= 7 ? day.toLocaleDateString("ru-RU", { weekday: "short" }).slice(0, 2) : String(day.getDate()), revenue: dailyOrders.reduce((sum, order) => sum + order.labor_revenue + order.parts_revenue, 0), profit: dailyOrders.reduce((sum, order) => sum + order.profit, 0), labor: dailyOrders.reduce((sum, order) => sum + order.labor_revenue, 0), parts: dailyOrders.reduce((sum, order) => sum + order.parts_revenue, 0), orders: dailyOrders.length }; }); }

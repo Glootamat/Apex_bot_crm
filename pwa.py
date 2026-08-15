@@ -362,10 +362,12 @@ DIAGNOSTIC_CHECKLIST = [
     ("rear_suspension", "rear_bearings", "Задние ступичные подшипники", True),
     ("rear_suspension", "rear_bushings", "Сайлентблоки задней подвески", True),
     ("rear_suspension", "rear_arms", "Рычаги задней подвески", True),
-    ("brakes", "front_pads", "Передние тормозные колодки", True),
-    ("brakes", "rear_pads", "Задние тормозные колодки", True),
-    ("brakes", "front_discs", "Передние тормозные диски", True),
-    ("brakes", "rear_discs", "Задние диски или барабаны", True),
+    # These parts are replaced as an axle set.  A single status avoids the
+    # misleading left/right choice even when wear was noticed on one side.
+    ("brakes", "front_pads", "Передние тормозные колодки", False),
+    ("brakes", "rear_pads", "Задние тормозные колодки", False),
+    ("brakes", "front_discs", "Передние тормозные диски", False),
+    ("brakes", "rear_discs", "Задние диски или барабаны", False),
     ("brakes", "brake_fluid", "Тормозная жидкость", False),
     ("brakes", "parking_brake", "Стояночный тормоз", False),
     ("engine", "engine_oil_level", "Уровень масла", False),

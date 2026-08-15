@@ -698,6 +698,20 @@ class Database:
                    SET mileage_at_visit = (SELECT mileage FROM cars WHERE cars.id = service_orders.car_id)
                    WHERE mileage_at_visit IS NULL"""
             )
+            # Brake pads, discs and rear drums are replaced in axle sets.
+            # Convert older diagnostic cards that still have separate side statuses
+            # to one conservative combined status, preserving the worst finding.
+            connection.execute(
+                """UPDATE diagnostic_items
+                   SET status = CASE
+                       WHEN status = 'critical' OR left_status = 'critical' OR right_status = 'critical' THEN 'critical'
+                       WHEN status = 'attention' OR left_status = 'attention' OR right_status = 'attention' THEN 'attention'
+                       WHEN status = 'ok' OR left_status = 'ok' OR right_status = 'ok' THEN 'ok'
+                       ELSE 'unchecked' END,
+                       left_status = NULL, right_status = NULL
+                   WHERE item_key IN ('front_pads', 'rear_pads', 'front_discs', 'rear_discs')
+                     AND (left_status IS NOT NULL OR right_status IS NOT NULL)"""
+            )
             customer_columns = {row["name"] for row in connection.execute("PRAGMA table_info(customers)")}
             if "archived_at" not in customer_columns:
                 connection.execute("ALTER TABLE customers ADD COLUMN archived_at TEXT")
