@@ -163,6 +163,12 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(order.mileage_at_visit, 126000)
             db.update_car(car_id, None, None, None, None, None, None, 130000)
             self.assertEqual(db.get_service_order(order.id).mileage_at_visit, 126000)
+            later = db.add_service_order(car_id, "Замена масла", 1000, 0, 0, mileage_at_visit=140000)
+            self.assertEqual(later.mileage_at_visit, 140000)
+            self.assertEqual(db.find_car_by_details(user_id, None, None, None, "xta123").mileage, 140000)
+            db.update_order_crm_fields(later.id, user_id, mileage_at_visit=141000)
+            self.assertEqual(db.get_service_order(later.id).mileage_at_visit, 141000)
+            self.assertEqual(db.get_service_order(order.id).mileage_at_visit, 126000)
 
     def test_customer_overview_status_and_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -804,14 +810,14 @@ class DatabaseTest(unittest.TestCase):
             assert result is not None
             order, created = result
             self.assertTrue(created)
-            self.assertEqual(order.labor_revenue, 2500)
+            self.assertEqual(order.labor_revenue, 0)
             self.assertEqual(order.parts_cost, 0)
             self.assertEqual(order.parts_revenue, 0)
-            self.assertIn("Левая сторона", order.description)
-            self.assertIn("Правая сторона", order.description)
-            self.assertIn("Требуется подобрать запчасти", order.recommendations or "")
-            self.assertIn("• Рулевые тяги — левая сторона", order.recommendations or "")
-            self.assertNotIn("левая сторона Заменить", order.description)
+            self.assertEqual(order.description, "")
+            self.assertIsNone(order.recommendations)
+            self.assertIn("По результатам диагностики", order.concern or "")
+            self.assertIn("• Рулевые тяги — левая сторона", order.concern or "")
+            self.assertIn("• Рулевые тяги — правая сторона", order.concern or "")
             self.assertEqual(db.get_part_items(order.id), [])
 
             repeated = db.create_order_from_diagnostic(user_id, int(card["id"]))
@@ -820,6 +826,14 @@ class DatabaseTest(unittest.TestCase):
             self.assertFalse(repeated_created)
             self.assertEqual(repeated_order.id, order.id)
             self.assertEqual(repeated_order.description, order.description)
+
+            self.assertTrue(db.delete_service_order(user_id, order.id))
+            self.assertIsNone(db.get_diagnostic(user_id, int(card["id"]))["service_order_id"])
+            recreated = db.create_order_from_diagnostic(user_id, int(card["id"]))
+            assert recreated is not None
+            recreated_order, recreated_created = recreated
+            self.assertTrue(recreated_created)
+            self.assertNotEqual(recreated_order.id, order.id)
 
     def test_phone_and_plate_are_normalized_for_future_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

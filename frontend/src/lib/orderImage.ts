@@ -153,7 +153,7 @@ async function renderOrderCanvas(order: Order) {
     if (price != null) { ctx.fillStyle = "#ffd600"; ctx.font = "800 26px sans-serif"; ctx.textAlign = "right"; ctx.fillText(money(price), 975, y + 80); ctx.textAlign = "left"; }
     y += height + 54;
   };
-  if (order.concern) section("Обращение клиента", order.concern);
+  if (order.concern) section(order.concern.startsWith("По результатам диагностики №") ? "Выявлено при диагностике" : "Обращение клиента", order.concern);
   if (order.description) section("Выполненные работы", order.description, order.labor_revenue || undefined);
   if (order.recommendations) section("Рекомендации", order.recommendations);
 

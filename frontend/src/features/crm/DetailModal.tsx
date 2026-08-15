@@ -446,8 +446,9 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
             value={<span className="text-success">{money(o.profit)}</span>}
           />
         </dl>
-        <Row label="Жалоба клиента" value={o.concern} />
+        <Row label={o.concern?.startsWith("По результатам диагностики №") ? "Выявлено при диагностике" : "Жалоба клиента"} value={o.concern} />
         <Row label="Выполненные работы" value={o.description} />
+        <Row label="Пробег на момент визита" value={o.mileage_at_visit ? `${o.mileage_at_visit.toLocaleString("ru-RU")} км` : null} />
         <Row label="Рекомендации" value={o.recommendations} />
         <Gallery title="Фото работ" items={works} />
         {upload.error && (

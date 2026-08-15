@@ -283,9 +283,13 @@ export function AppShell() {
               height="56"
               alt="Apex CRM"
             /> : <div className="grid size-14 shrink-0 place-items-center rounded-2xl bg-apex/15 text-2xl font-black text-apex shadow-[0_8px_24px_rgba(255,214,0,.14)]" aria-label={organizationName}>{organizationName.slice(0, 1).toLocaleUpperCase("ru")}</div>}
-            <p className="min-w-0 truncate text-xl font-black leading-none tracking-tight text-white">
-              {organizationName}
-            </p>
+            {isApexOrganization ? (
+              <p className="min-w-0 truncate text-xl font-black leading-none tracking-tight">
+                <span className="text-apex">Apex</span>{" "}<span className="text-white">Auto</span>
+              </p>
+            ) : (
+              <p className="min-w-0 truncate text-xl font-black leading-none tracking-tight text-white">{organizationName}</p>
+            )}
           </div>
           <Button
             variant="ghost"

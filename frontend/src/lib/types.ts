@@ -61,4 +61,4 @@ export type ProfitLigaOrdersResult = { orders: ProfitLigaOrder[]; markup_percent
 export type CustomerInput = { full_name: string; phone: string | null };
 export type CarInput = { customer_id: number | null; brand: string; model: string; year: number | null; plate_number: string | null; vin: string | null; mileage: number | null };
 export type AppointmentInput = { car_id: number; description: string; starts_at: string; agreed_amount: number | null; is_flexible: boolean; parts_source: string | null };
-export type OrderInput = { car_id: number; description: string; labor_revenue: number; parts_cost: number; parts_revenue: number; parts_profit: number; concern: string | null; agreed_amount: number | null; recommendations: string | null; parts_source: string | null };
+export type OrderInput = { car_id: number; description: string; labor_revenue: number; parts_cost: number; parts_revenue: number; parts_profit: number; concern: string | null; agreed_amount: number | null; recommendations: string | null; parts_source: string | null; mileage_at_visit: number | null };

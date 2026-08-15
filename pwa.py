@@ -286,6 +286,7 @@ class OrderPayload(BaseModel):
     agreed_amount: Annotated[int | None, Field(ge=0, le=1_000_000_000)] = None
     recommendations: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=10_000)] = None
     parts_source: PartsSource = None
+    mileage_at_visit: Annotated[int | None, Field(ge=0, le=10_000_000)] = None
 
 
 class ActionPayload(BaseModel):
@@ -1112,6 +1113,7 @@ def create_order(data: OrderPayload, _: Annotated[str, Depends(require_user)]) -
         data.car_id, data.description.strip(), data.labor_revenue, data.parts_cost,
         data.parts_revenue, data.parts_profit, data.concern, data.agreed_amount,
         data.recommendations, data.parts_source,
+        data.mileage_at_visit,
     )
     return asdict(order) | {"profit": order.profit}
 
@@ -1133,6 +1135,7 @@ def edit_order(
             or data.agreed_amount != order.agreed_amount
             or data.recommendations != order.recommendations
             or data.parts_source != order.parts_source
+            or data.mileage_at_visit != order.mileage_at_visit
         )
         if restricted_changed:
             raise HTTPException(
@@ -1154,7 +1157,7 @@ def edit_order(
     order = db.update_order_crm_fields(
         order_id, owner_user_id(), concern=data.concern,
         agreed_amount=data.agreed_amount, recommendations=data.recommendations,
-        replace_nullable=True,
+        mileage_at_visit=data.mileage_at_visit, replace_nullable=True,
     )
     order = db.update_order_parts_source(order_id, data.parts_source, owner_user_id())
     return asdict(order) | {"profit": order.profit}

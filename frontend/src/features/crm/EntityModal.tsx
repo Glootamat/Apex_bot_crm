@@ -69,7 +69,7 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
         const payload: AppointmentInput = { car_id: requiredNumber(data, "car_id"), description: text(data, "description"), starts_at: text(data, "starts_at"), agreed_amount: number(data, "agreed_amount"), is_flexible: data.get("is_flexible") === "on", parts_source: optional(data, "parts_source") };
         return api.saveAppointment(payload, entity.value?.id);
       }
-      const payload: OrderInput = { car_id: requiredNumber(data, "car_id"), description: text(data, "description"), labor_revenue: number(data, "labor_revenue") ?? 0, parts_cost: number(data, "parts_cost") ?? 0, parts_revenue: number(data, "parts_revenue") ?? 0, parts_profit: number(data, "parts_profit") ?? 0, concern: optional(data, "concern"), agreed_amount: number(data, "agreed_amount"), recommendations: optional(data, "recommendations"), parts_source: optional(data, "parts_source") };
+      const payload: OrderInput = { car_id: requiredNumber(data, "car_id"), description: text(data, "description"), labor_revenue: number(data, "labor_revenue") ?? 0, parts_cost: number(data, "parts_cost") ?? 0, parts_revenue: number(data, "parts_revenue") ?? 0, parts_profit: number(data, "parts_profit") ?? 0, concern: optional(data, "concern"), agreed_amount: number(data, "agreed_amount"), recommendations: optional(data, "recommendations"), parts_source: optional(data, "parts_source"), mileage_at_visit: number(data, "mileage_at_visit") };
       return api.saveOrder(payload, entity.value?.id);
     },
     onSuccess: async () => { await refreshCrm(); onSaved?.(); onClose(); },
@@ -126,13 +126,14 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
         <label className="flex min-h-12 items-center gap-3 text-sm text-muted sm:col-span-2"><input className="size-5 accent-apex" name="is_flexible" type="checkbox" defaultChecked={entity.value?.is_flexible ?? false} />Время можно изменить</label>
       </>}
       {entity.kind === "order" && <>
-        <Field label="Автомобиль" full><select className={inputClass} name="car_id" required defaultValue={entity.value?.car_id ?? entity.carId ?? ""}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
+        <Field label="Автомобиль" full><select className={inputClass} name="car_id" required value={selectedCarId} onChange={(event) => setSelectedCarId(event.target.value)}><option value="">Выберите автомобиль</option>{cars.map((item) => <option key={item.id} value={item.id}>{carName(item)}</option>)}</select></Field>
+        <Field label="Пробег на момент визита"><input key={selectedCarId} className={inputClass} name="mileage_at_visit" type="number" min="0" defaultValue={entity.value?.mileage_at_visit ?? cars.find((item) => String(item.id) === selectedCarId)?.mileage ?? ""} placeholder="Например, 24000" /></Field>
         <Field label="Работы" full><textarea className={`${inputClass} min-h-24 resize-y`} name="description" required defaultValue={entity.value?.description ?? ""} /></Field>
         <Field label="Оплата за работу"><input className={inputClass} name="labor_revenue" {...moneyInput(entity.value?.labor_revenue)} /></Field>
         <Field label="Закупка запчастей"><input className={inputClass} name="parts_cost" {...moneyInput(entity.value?.parts_cost)} /></Field>
         <Field label="Продажа запчастей"><input className={inputClass} name="parts_revenue" {...moneyInput(entity.value?.parts_revenue)} /></Field>
         <Field label="Доп. прибыль по запчастям"><input className={inputClass} name="parts_profit" {...moneyInput(entity.value?.parts_profit)} /></Field>
-        <Field label="Жалоба клиента" full><textarea className={inputClass} name="concern" defaultValue={entity.value?.concern ?? ""} /></Field>
+        <Field label="Обращение / результаты диагностики" full><textarea className={inputClass} name="concern" defaultValue={entity.value?.concern ?? ""} /></Field>
         <Field label="Согласованная сумма"><input className={inputClass} name="agreed_amount" type="number" min="0" defaultValue={entity.value?.agreed_amount ?? ""} /></Field>
         <Field label="Запчасти"><select className={inputClass} name="parts_source" defaultValue={entity.value?.parts_source ?? ""}><option value="">Не указано</option><option value="workshop">Наши</option><option value="customer">Клиента</option></select></Field>
         <Field label="Рекомендации" full><textarea className={inputClass} name="recommendations" defaultValue={entity.value?.recommendations ?? ""} /></Field>

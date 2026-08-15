@@ -315,7 +315,7 @@ function DiagnosticCard({
     onSuccess: async (order) => {
       updateLocal((current) => ({ ...current, service_order_id: order.id }));
       await queryClient.invalidateQueries({ queryKey: ["crm"] });
-      void navigate(`/parts-catalog?order_id=${order.id}`);
+      void navigate(`/orders?car_id=${value.car_id}`);
     },
   });
   const uploadPhoto = (file?: File) => {
@@ -655,10 +655,10 @@ function DiagnosticCard({
         <div className="mt-3 grid gap-2 border-t border-line pt-3 sm:grid-cols-[1fr_auto] sm:items-center">
           <div>
             <p className="font-bold">Смета и заказ-наряд</p>
-            <p className="text-sm text-muted">Работы будут перенесены автоматически, запчасти — без артикула со статусом «Требуется подбор».</p>
+            <p className="text-sm text-muted">В заказ попадут только выявленные неисправности. Работы, запчасти и суммы добавляются после согласования с клиентом.</p>
           </div>
           {value.service_order_id ? (
-            <Button variant="secondary" onClick={() => orderMutation.mutate()} disabled={orderMutation.isPending}><ClipboardCheck size={17} />{orderMutation.isPending ? "Обновляю заказ…" : `Подобрать запчасти · заказ №${value.service_order_id}`}</Button>
+            <Button variant="secondary" onClick={() => orderMutation.mutate()} disabled={orderMutation.isPending}><ClipboardCheck size={17} />{orderMutation.isPending ? "Открываю заказ…" : `Открыть заказ №${value.service_order_id}`}</Button>
           ) : (
             <Button onClick={() => orderMutation.mutate()} disabled={orderMutation.isPending}><ClipboardCheck size={17} />{orderMutation.isPending ? "Создаю…" : "Создать заказ-наряд"}</Button>
           )}

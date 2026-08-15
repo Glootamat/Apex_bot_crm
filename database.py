@@ -2303,7 +2303,7 @@ class Database:
         self, car_id: int, description: str, labor_revenue: int, parts_cost: int,
         parts_revenue: int, parts_profit: int = 0, concern: str | None = None,
         agreed_amount: int | None = None, recommendations: str | None = None,
-        parts_source: str | None = None,
+        parts_source: str | None = None, mileage_at_visit: int | None = None,
     ) -> ServiceOrder:
         connection = self.connect()
         try:
@@ -2311,10 +2311,17 @@ class Database:
                 """INSERT INTO service_orders
                    (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
                     concern, agreed_amount, recommendations, parts_source, mileage_at_visit)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT mileage FROM cars WHERE id = ?))""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT mileage FROM cars WHERE id = ?)))""",
                 (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
-                 concern, agreed_amount, recommendations, parts_source, car_id),
+                 concern, agreed_amount, recommendations, parts_source, mileage_at_visit, car_id),
             )
+            if mileage_at_visit is not None:
+                connection.execute(
+                    """UPDATE cars SET mileage = CASE
+                           WHEN mileage IS NULL OR mileage <= ? THEN ? ELSE mileage END
+                       WHERE id = ?""",
+                    (mileage_at_visit, mileage_at_visit, car_id),
+                )
             order_id = int(cursor.lastrowid)
             connection.commit()
         finally:
@@ -2541,6 +2548,11 @@ class Database:
                 "UPDATE service_orders SET archived_at = CURRENT_TIMESTAMP WHERE id = ? AND archived_at IS NULL AND car_id IN (SELECT id FROM cars WHERE user_id = ?)",
                 (order_id, user_id),
             )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE diagnostics SET service_order_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE service_order_id = ?",
+                    (order_id,),
+                )
             self._write_audit(connection, user_id, "order", order_id, "archived")
             connection.commit()
             return cursor.rowcount > 0
@@ -3064,27 +3076,36 @@ class Database:
     def update_order_crm_fields(
         self, order_id: int, user_id: int | None = None, *, concern: str | None = None,
         agreed_amount: int | None = None, recommendations: str | None = None,
-        replace_nullable: bool = False,
+        mileage_at_visit: int | None = None, replace_nullable: bool = False,
     ) -> ServiceOrder:
         connection = self.connect()
         try:
             current = connection.execute(
-                "SELECT concern, agreed_amount, recommendations FROM service_orders WHERE id = ?", (order_id,)
+                "SELECT car_id, concern, agreed_amount, recommendations, mileage_at_visit FROM service_orders WHERE id = ?", (order_id,)
             ).fetchone()
             if current is None:
                 raise ValueError(f"Service order {order_id} does not exist")
             if replace_nullable:
                 connection.execute(
-                    """UPDATE service_orders SET concern = ?, agreed_amount = ?, recommendations = ?
+                    """UPDATE service_orders SET concern = ?, agreed_amount = ?, recommendations = ?,
+                       mileage_at_visit = ?
                        WHERE id = ?""",
-                    (concern, agreed_amount, recommendations, order_id),
+                    (concern, agreed_amount, recommendations, mileage_at_visit, order_id),
                 )
             else:
                 connection.execute(
                     """UPDATE service_orders SET concern = COALESCE(?, concern),
-                       agreed_amount = COALESCE(?, agreed_amount), recommendations = COALESCE(?, recommendations)
+                       agreed_amount = COALESCE(?, agreed_amount), recommendations = COALESCE(?, recommendations),
+                       mileage_at_visit = COALESCE(?, mileage_at_visit)
                        WHERE id = ?""",
-                    (concern, agreed_amount, recommendations, order_id),
+                    (concern, agreed_amount, recommendations, mileage_at_visit, order_id),
+                )
+            if mileage_at_visit is not None:
+                connection.execute(
+                    """UPDATE cars SET mileage = CASE
+                           WHEN mileage IS NULL OR mileage <= ? THEN ? ELSE mileage END
+                       WHERE id = ?""",
+                    (mileage_at_visit, mileage_at_visit, current["car_id"]),
                 )
             details = f"concern={concern!r}; agreed_amount={agreed_amount!r}; recommendations={recommendations!r}"
             self._write_audit(connection, user_id, "order", order_id, "crm_fields_updated", details)
@@ -3278,17 +3299,16 @@ class Database:
             if diagnostic is None:
                 return None
             rows = connection.execute(
-                """SELECT label, status, left_status, right_status, recommendation,
+                """SELECT label, status, left_status, right_status, comment, recommendation,
                           estimated_cost
                    FROM diagnostic_items WHERE diagnostic_id = ? ORDER BY id""",
                 (diagnostic_id,),
             ).fetchall()
             issue_statuses = {"attention", "critical"}
-            works: list[str] = []
-            required_parts: list[str] = []
-            labor_revenue = 0
+            findings: list[str] = []
             for row in rows:
                 recommendation = str(row["recommendation"] or "").strip()
+                comment = str(row["comment"] or "").strip()
                 label = str(row["label"])
                 sides: list[str] = []
                 if row["left_status"] in issue_statuses:
@@ -3296,40 +3316,47 @@ class Database:
                 if row["right_status"] in issue_statuses:
                     sides.append("правая сторона")
                 if sides:
-                    side_lines = "\n".join(f"• {side.capitalize()}" for side in sides)
-                    works.append(f"{recommendation or label}:\n{side_lines}")
-                    required_parts.extend(f"• {label} — {side}" for side in sides)
+                    detail = comment or recommendation
+                    findings.extend(
+                        f"• {label} — {side}" + (f": {detail}" if detail else "")
+                        for side in sides
+                    )
                 elif row["status"] in issue_statuses or recommendation:
-                    works.append(recommendation or label)
-                    required_parts.append(f"• {label}")
-                if (sides or row["status"] in issue_statuses or recommendation) and row["estimated_cost"] is not None:
-                    labor_revenue += max(0, int(row["estimated_cost"]))
-            # Preserve order while removing identical recommendations.
-            works = list(dict.fromkeys(works))
-            required_parts = list(dict.fromkeys(required_parts))
-            if not works:
+                    detail = comment or recommendation
+                    findings.append(f"• {label}" + (f": {detail}" if detail else ""))
+            findings = list(dict.fromkeys(findings))
+            if not findings:
                 return None
-            description = "\n\n".join(works)
-            recommendations = "Требуется подобрать запчасти:\n" + "\n".join(required_parts)
+            diagnostic_marker = f"По результатам диагностики №{diagnostic_id}"
+            concern = diagnostic_marker + ":\n" + "\n".join(findings)
             linked_order_id = diagnostic["service_order_id"]
             if linked_order_id is not None:
                 linked_order_id = int(linked_order_id)
-                expected_concern = f"По результатам диагностики №{diagnostic_id}"
                 linked = connection.execute(
                     "SELECT concern FROM service_orders WHERE id = ? AND car_id = ? AND archived_at IS NULL",
                     (linked_order_id, diagnostic["car_id"]),
                 ).fetchone()
+                if linked is None:
+                    # The linked order may have been archived or purged. Release the
+                    # stale link so this diagnostic can create a fresh order.
+                    connection.execute(
+                        "UPDATE diagnostics SET service_order_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND service_order_id = ?",
+                        (diagnostic_id, linked_order_id),
+                    )
+                    linked_order_id = None
                 # Refresh only orders created by this workflow; never overwrite a manually linked order.
-                if linked is not None and linked["concern"] == expected_concern:
+                if linked is not None and linked["concern"] == diagnostic_marker:
                     connection.execute(
                         """UPDATE service_orders
-                           SET description = ?, labor_revenue = ?, recommendations = ?
+                           SET description = '', labor_revenue = 0,
+                               recommendations = NULL, concern = ?
                            WHERE id = ?""",
-                        (description, labor_revenue, recommendations, linked_order_id),
+                        (concern, linked_order_id),
                     )
                     self._write_audit(connection, user_id, "service_order", linked_order_id, "synced_from_diagnostic")
                     connection.commit()
-                return self.get_service_order(linked_order_id), False
+                if linked_order_id is not None:
+                    return self.get_service_order(linked_order_id), False
             cursor = connection.execute(
                 """INSERT INTO service_orders
                    (car_id, description, labor_revenue, parts_cost, parts_revenue,
@@ -3338,9 +3365,7 @@ class Database:
                            (SELECT COALESCE(d.mileage, c.mileage) FROM diagnostics d
                             JOIN cars c ON c.id = d.car_id WHERE d.id = ?))""",
                 (
-                    diagnostic["car_id"], description, labor_revenue,
-                    f"По результатам диагностики №{diagnostic_id}",
-                    recommendations,
+                    diagnostic["car_id"], "", 0, concern, None,
                     diagnostic_id,
                 ),
             )
@@ -3387,10 +3412,12 @@ class Database:
             if result.get("service_order_id") is not None:
                 order = connection.execute(
                     """SELECT description, labor_revenue, parts_revenue
-                       FROM service_orders WHERE id = ?""",
+                       FROM service_orders WHERE id = ? AND archived_at IS NULL""",
                     (result["service_order_id"],),
                 ).fetchone()
-                if order is not None:
+                if order is None:
+                    result["service_order_id"] = None
+                else:
                     result["order_description"] = order["description"]
                     result["labor_revenue"] = int(order["labor_revenue"] or 0)
                     result["parts_revenue"] = int(order["parts_revenue"] or 0)
