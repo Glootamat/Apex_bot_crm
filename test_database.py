@@ -184,6 +184,21 @@ class DatabaseTest(unittest.TestCase):
 
             self.assertEqual(completed.mileage_at_visit, 24500)
 
+    def test_deleting_order_restores_previous_vehicle_mileage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(997, "Мастер", None)
+            car_id = db.add_car(user_id, "Hyundai", "Solaris", mileage=64500)
+            previous = db.add_service_order(car_id, "Замена свечей", 0, 0, 0)
+            temporary = db.add_service_order(car_id, "Тестовая замена масла", 0, 0, 0, mileage_at_visit=66000)
+
+            self.assertEqual(db.find_car_by_details(user_id, "Hyundai", "Solaris", None, None).mileage, 66000)
+            self.assertTrue(db.delete_service_order(user_id, temporary.id))
+
+            self.assertEqual(db.get_service_order(previous.id).mileage_at_visit, 64500)
+            self.assertEqual(db.find_car_by_details(user_id, "Hyundai", "Solaris", None, None).mileage, 64500)
+
     def test_customer_overview_status_and_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

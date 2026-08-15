@@ -458,6 +458,7 @@ class Database:
                     archived_at TEXT,
                     parts_source TEXT,
                     mileage_at_visit INTEGER,
+                    mileage_before_visit INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (car_id) REFERENCES cars(id) ON DELETE CASCADE
                 );
@@ -689,6 +690,7 @@ class Database:
                 ("archived_at", "TEXT"),
                 ("parts_source", "TEXT"),
                 ("mileage_at_visit", "INTEGER"),
+                ("mileage_before_visit", "INTEGER"),
             ):
                 if name not in order_columns:
                     connection.execute(f"ALTER TABLE service_orders ADD COLUMN {name} {declaration}")
@@ -2324,10 +2326,11 @@ class Database:
             cursor = connection.execute(
                 """INSERT INTO service_orders
                    (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
-                    concern, agreed_amount, recommendations, parts_source, mileage_at_visit)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT mileage FROM cars WHERE id = ?)))""",
+                    concern, agreed_amount, recommendations, parts_source, mileage_at_visit, mileage_before_visit)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT mileage FROM cars WHERE id = ?)),
+                           (SELECT mileage FROM cars WHERE id = ?))""",
                 (car_id, description, labor_revenue, parts_cost, parts_revenue, parts_profit,
-                 concern, agreed_amount, recommendations, parts_source, mileage_at_visit, car_id),
+                 concern, agreed_amount, recommendations, parts_source, mileage_at_visit, car_id, car_id),
             )
             if mileage_at_visit is not None:
                 connection.execute(
@@ -2569,11 +2572,32 @@ class Database:
     def delete_service_order(self, user_id: int, order_id: int) -> bool:
         connection = self.connect()
         try:
+            source = connection.execute(
+                """SELECT o.car_id, o.mileage_at_visit, o.mileage_before_visit, c.mileage AS car_mileage
+                   FROM service_orders o JOIN cars c ON c.id = o.car_id
+                   WHERE o.id = ? AND o.archived_at IS NULL AND c.user_id = ?""",
+                (order_id, user_id),
+            ).fetchone()
             cursor = connection.execute(
                 "UPDATE service_orders SET archived_at = CURRENT_TIMESTAMP WHERE id = ? AND archived_at IS NULL AND car_id IN (SELECT id FROM cars WHERE user_id = ?)",
                 (order_id, user_id),
             )
             if cursor.rowcount:
+                if source and source["mileage_at_visit"] is not None and source["car_mileage"] == source["mileage_at_visit"]:
+                    remaining = connection.execute(
+                        """SELECT MAX(mileage) AS value FROM (
+                             SELECT mileage_at_visit AS mileage FROM service_orders
+                             WHERE car_id = ? AND archived_at IS NULL
+                             UNION ALL
+                             SELECT mileage FROM diagnostics WHERE car_id = ?
+                           ) WHERE mileage IS NOT NULL""",
+                        (source["car_id"], source["car_id"]),
+                    ).fetchone()["value"]
+                    candidates = [value for value in (source["mileage_before_visit"], remaining) if value is not None]
+                    connection.execute(
+                        "UPDATE cars SET mileage = ? WHERE id = ?",
+                        (max(candidates) if candidates else None, source["car_id"]),
+                    )
                 connection.execute(
                     "UPDATE diagnostics SET service_order_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE service_order_id = ?",
                     (order_id,),
@@ -3126,6 +3150,12 @@ class Database:
                     (concern, agreed_amount, recommendations, mileage_at_visit, order_id),
                 )
             if mileage_at_visit is not None:
+                connection.execute(
+                    """UPDATE service_orders SET mileage_before_visit = COALESCE(
+                           mileage_before_visit, (SELECT mileage FROM cars WHERE id = ?)
+                       ) WHERE id = ?""",
+                    (current["car_id"], order_id),
+                )
                 connection.execute(
                     """UPDATE cars SET mileage = CASE
                            WHEN mileage IS NULL OR mileage <= ? THEN ? ELSE mileage END
