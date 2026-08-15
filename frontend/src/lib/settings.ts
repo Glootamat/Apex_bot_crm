@@ -1,15 +1,17 @@
 import { useSyncExternalStore } from "react";
 
-export type ModuleKey = "calendar" | "orders" | "diagnostics" | "customers" | "cars" | "finance" | "trash";
+export type ModuleKey = "calendar" | "orders" | "diagnostics" | "customers" | "cars" | "laborStandards" | "finance" | "trash";
 export type AppSettings = {
   workspaceName: string; city: string; modules: Record<ModuleKey, boolean>;
+  laborHourRate: number;
   compactMode: boolean; reduceMotion: boolean; desktopNotifications: boolean;
   appointmentReminders: boolean; orderStatusNotifications: boolean; dailySummary: boolean;
   autoLockMinutes: number;
 };
 export const defaultSettings: AppSettings = {
   workspaceName: "APEX AUTO", city: "Москва",
-  modules: { calendar: false, orders: false, diagnostics: false, customers: true, cars: true, finance: false, trash: true },
+  modules: { calendar: false, orders: false, diagnostics: false, customers: true, cars: true, laborStandards: false, finance: false, trash: true },
+  laborHourRate: 2000,
   compactMode: false, reduceMotion: false, desktopNotifications: false,
   appointmentReminders: true, orderStatusNotifications: true, dailySummary: false, autoLockMinutes: 30,
 };

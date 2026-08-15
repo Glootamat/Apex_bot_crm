@@ -19,6 +19,7 @@ const NotFoundPage = lazy(() => import("../pages/NotFoundPage").then((module) =>
 const SettingsPage = lazy(() => import("../pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
 const OwnerPanelPage = lazy(() => import("../pages/OwnerPanelPage").then((module) => ({ default: module.OwnerPanelPage })));
 const PartsCatalogPage = lazy(() => import("../pages/PartsCatalogPage").then((module) => ({ default: module.PartsCatalogPage })));
+const LaborStandardsPage = lazy(() => import("../pages/LaborStandardsPage").then((module) => ({ default: module.LaborStandardsPage })));
 
 const suspense = (node: React.ReactNode) => <Suspense fallback={<Spinner />}>{node}</Suspense>;
 const router = createBrowserRouter([
@@ -36,6 +37,7 @@ const router = createBrowserRouter([
     { path: "settings", element: suspense(<SettingsPage />) },
     { path: "owner", element: suspense(<OwnerPanelPage />) },
     { path: "parts-catalog", element: suspense(<PartsCatalogPage />) },
+    { path: "labor-standards", element: suspense(<LaborStandardsPage />) },
     { path: "diagnostics", element: suspense(<DiagnosticsIndexPage />) },
     { path: "diagnostics/start", element: suspense(<DiagnosticPage />) },
     { path: "diagnostics/:diagnosticId", element: suspense(<DiagnosticPage />) },

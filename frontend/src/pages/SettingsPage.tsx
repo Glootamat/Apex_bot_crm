@@ -11,6 +11,7 @@ const moduleItems: { key: ModuleKey; title: string; description: string }[] = [
   { key: "calendar", title: "Календарь", description: "Записи, загрузка постов и расписание" }, { key: "orders", title: "Заказ-наряды", description: "Работы, запчасти и статусы ремонта" },
   { key: "diagnostics", title: "Диагностика", description: "Чек-листы, фото и заключения" }, { key: "customers", title: "Клиенты", description: "Контакты и история обращений" },
   { key: "cars", title: "Автомобили", description: "Карточки машин и сервисная история" }, { key: "finance", title: "Финансы", description: "Выручка, расходы и прибыль" },
+  { key: "laborStandards", title: "Нормы времени", description: "Справочник операций и расчёт стоимости по нормо-часу" },
   { key: "trash", title: "Корзина", description: "Восстановление удалённых данных" },
 ];
 function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) { return <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)} className={`relative h-7 w-12 shrink-0 rounded-full transition focus-visible:outline-2 focus-visible:outline-apex ${checked ? "bg-apex" : "bg-line"}`}><span className={`absolute top-1 size-5 rounded-full bg-white shadow transition ${checked ? "left-6" : "left-1"}`} /></button>; }

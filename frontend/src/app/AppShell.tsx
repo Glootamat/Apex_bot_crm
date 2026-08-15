@@ -1,5 +1,6 @@
 import {
   CalendarDays,
+  BookOpen,
   CarFront,
   ClipboardCheck,
   ClipboardList,
@@ -49,6 +50,7 @@ const navigation = [
   { to: "/diagnostics", label: "Диагностика", icon: ClipboardCheck },
   { to: "/customers", label: "Клиенты", icon: UserRound },
   { to: "/cars", label: "Автомобили", icon: CarFront },
+  { to: "/labor-standards", label: "Нормы времени", icon: BookOpen },
   { to: "/finance", label: "Финансы", icon: WalletCards },
   { to: "/trash", label: "Корзина", icon: Trash2 },
 ];
@@ -58,12 +60,13 @@ const mobileNavigation = [
   navigation[1]!,
   navigation[2]!,
   navigation[3]!,
-  navigation[6]!,
+  navigation[7]!,
 ];
 
 const moduleByPath: Partial<Record<string, ModuleKey>> = {
   "/calendar": "calendar", "/orders": "orders", "/diagnostics": "diagnostics",
   "/customers": "customers", "/cars": "cars", "/finance": "finance", "/trash": "trash",
+  "/labor-standards": "laborStandards",
 };
 
 function hasModalHistoryState() {
