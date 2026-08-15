@@ -16,7 +16,7 @@ describe("labor standards starter catalog", () => {
   });
 
   it("keeps every market reference traceable and internally consistent", () => {
-    expect(Object.keys(laborMarket).length).toBeGreaterThanOrEqual(90);
+    expect(Object.keys(laborMarket).length).toBe(laborStandards.length);
     const operationIds = new Set(laborStandards.map((item) => item.id));
     for (const [id, reference] of Object.entries(laborMarket)) {
       if (!reference) throw new Error(`Missing market reference for ${id}`);
