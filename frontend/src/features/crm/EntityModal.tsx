@@ -153,7 +153,7 @@ export function EntityModal({ entity, customers, cars, onClose, onSaved }: Props
         <Field label="Закупка запчастей"><input className={inputClass} name="parts_cost" {...moneyInput(entity.value?.parts_cost)} /></Field>
         <Field label="Продажа запчастей"><input className={inputClass} name="parts_revenue" {...moneyInput(entity.value?.parts_revenue)} /></Field>
         <Field label="Доп. прибыль по запчастям"><input className={inputClass} name="parts_profit" {...moneyInput(entity.value?.parts_profit)} /></Field>
-        <Field label="Обращение / результаты диагностики" full><textarea className={inputClass} name="concern" defaultValue={entity.value?.concern ?? ""} /></Field>
+        {entity.value?.concern?.startsWith("По результатам диагностики №") ? <input name="concern" type="hidden" value={entity.value.concern} /> : <Field label="Жалоба клиента" full><textarea className={inputClass} name="concern" defaultValue={entity.value?.concern ?? ""} /></Field>}
         <Field label="Согласованная сумма"><input className={inputClass} name="agreed_amount" type="number" min="0" defaultValue={entity.value?.agreed_amount ?? ""} /></Field>
         <Field label="Запчасти"><select className={inputClass} name="parts_source" defaultValue={entity.value?.parts_source ?? ""}><option value="">Не указано</option><option value="workshop">Наши</option><option value="customer">Клиента</option></select></Field>
         <Field label="Рекомендации" full><textarea className={inputClass} name="recommendations" defaultValue={entity.value?.recommendations ?? ""} /></Field>

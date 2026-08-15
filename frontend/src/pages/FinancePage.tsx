@@ -146,9 +146,9 @@ type WorkRevenueRow = { label: string; value: number; color: string };
 const workGroups: Array<WorkRevenueRow & { pattern: RegExp }> = [
   { label: "Тормозная система", value: 0, color: "bg-danger", pattern: /тормоз|колод|диск|барабан|суппорт|ручник/i },
   { label: "ТО и масла", value: 0, color: "bg-apex", pattern: /то\b|масл|фильтр|жидкост|антифриз|свеч/i },
-  { label: "Ходовая часть", value: 0, color: "bg-info", pattern: /подвес|амортиз|стойк|пружин|рычаг|сайлент|шаров|тяга|наконеч|ступиц|подшип/i },
-  { label: "Двигатель", value: 0, color: "bg-success", pattern: /двигател|мотор|гбц|грм|ремень|цепь|турбин|форсунк|компресс|прокладк/i },
-  { label: "Электрика", value: 0, color: "bg-purple-400", pattern: /электр|провод|ламп|генератор|стартер|аккум|датчик|блок/i },
+  { label: "Ходовая часть", value: 0, color: "bg-info", pattern: /ходов|подвес|амортиз|стойк|пружин|рычаг|сайлент|шаров|тяга|наконеч|ступиц|подшип|гранат/i },
+  { label: "Двигатель", value: 0, color: "bg-success", pattern: /двигател|мотор|гбц|грм|ремень|цепь|турбин|форсунк|компресс|прокладк|сальник/i },
+  { label: "Электрика", value: 0, color: "bg-purple-400", pattern: /электр|провод|ламп|генератор|стартер|аккум|датчик|блок|бензонасос/i },
   { label: "Кузов и салон", value: 0, color: "bg-pink-400", pattern: /кузов|двер|стекл|бампер|покрас|салон|сиден|замок/i },
 ];
 
