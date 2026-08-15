@@ -225,10 +225,6 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
   if (detail.kind === "car") {
     const owner = data.customers.find((x) => x.id === detail.value.customer_id);
     const orders = data.orders.filter((x) => x.car_id === detail.value.id);
-    const visits = data.appointment_history.filter(
-      (x) => x.car_id === detail.value.id,
-    );
-    const contacts = recentContacts(visits, orders);
     return (
       <Modal
         title={`${detail.value.brand} ${detail.value.model}`}
@@ -278,29 +274,6 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
                 #{x.id} · {x.description} · {money(x.profit)}
               </Link>
             ))}
-          </Related>
-          <Related title="Последние обращения" empty="Обращений пока нет">
-            {contacts.slice(0, 5).map((x) =>
-              x.kind === "appointment" ? (
-                <Link
-                  key={`a-${x.value.id}`}
-                  onClick={() =>
-                    onOpen({ kind: "appointment", value: x.value })
-                  }
-                  icon={<CalendarDays />}
-                >
-                  {formatDateTime(x.date)} · {x.value.description}
-                </Link>
-              ) : (
-                <Link
-                  key={`o-${x.value.id}`}
-                  onClick={() => onOpen({ kind: "order", value: x.value })}
-                  icon={<ClipboardList />}
-                >
-                  {formatDateTime(x.date)} · {x.value.description}
-                </Link>
-              ),
-            )}
           </Related>
           <div className="grid gap-2 sm:grid-cols-2">
             <Button
