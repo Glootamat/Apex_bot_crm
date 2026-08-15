@@ -2,6 +2,7 @@ import {
   CalendarDays,
   Camera,
   CarFront,
+  CheckCircle2,
   ClipboardCheck,
   ClipboardList,
   FileDown,
@@ -10,6 +11,7 @@ import {
   PackageSearch,
   Save,
   Share2,
+  RotateCcw,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -92,6 +94,16 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     onSuccess: async (value) => {
       setAttachments((items) => [...items, value]);
       await refreshCrm();
+    },
+  });
+  const orderStatus = useMutation({
+    mutationFn: (value: "ready" | "in_progress") =>
+      detail.kind === "order"
+        ? api.orderStatus(detail.value.id, value)
+        : Promise.reject(new Error("Изменение статуса недоступно")),
+    onSuccess: async () => {
+      await refreshCrm();
+      onClose();
     },
   });
   const go = (path: string) => {
@@ -482,6 +494,18 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
             <Button variant="secondary" onClick={() => { setOrderExportOpen(false); void exportOrderImage(o, false); }}><FileImage size={17} />Сохранить картинкой</Button>
           </div>}
           {diagnosticAction}
+          {!["ready", "completed"].includes(o.status) ? (
+            <Button className="sm:col-span-2" onClick={() => orderStatus.mutate("ready")} disabled={orderStatus.isPending}>
+              <CheckCircle2 size={17} />
+              {orderStatus.isPending ? "Сохраняю…" : "Завершить заказ"}
+            </Button>
+          ) : (
+            <Button className="sm:col-span-2" variant="secondary" onClick={() => orderStatus.mutate("in_progress")} disabled={orderStatus.isPending}>
+              <RotateCcw size={17} />
+              {orderStatus.isPending ? "Возвращаю…" : "Вернуть в работу"}
+            </Button>
+          )}
+          {orderStatus.error && <p className="rounded-xl bg-danger/10 p-3 text-sm text-danger sm:col-span-2">Не удалось изменить статус заказ-наряда</p>}
           <Button className="sm:col-span-2" onClick={() => onEdit({ kind: "order", value: o })}>
             <Pencil size={17} />
             Изменить заказ-наряд
