@@ -154,7 +154,7 @@ async function renderOrderCanvas(order: Order) {
   ctx.fillStyle = "#96a1ad"; ctx.font = "500 23px sans-serif";
   const carLine = [order.plate_number, order.vin, order.year ? `${order.year} г.` : null].filter(Boolean).join(" · ");
   ctx.fillText(carLine || "Данные автомобиля не указаны", 98, y + 101);
-  const mileage = order.mileage_at_visit ?? order.mileage;
+  const mileage = order.mileage_at_visit;
   if (mileage) ctx.fillText(`Пробег: ${mileage.toLocaleString("ru-RU")} км`, 98, y + 132);
   const clientLabelY = y + (mileage ? 158 : 132);
   ctx.fillStyle = "#96a1ad"; ctx.font = "700 17px sans-serif"; ctx.fillText("КЛИЕНТ", 98, clientLabelY);

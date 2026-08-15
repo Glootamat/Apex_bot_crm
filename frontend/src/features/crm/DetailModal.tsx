@@ -392,8 +392,6 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     );
   const o = detail.value;
   const currentCarMileage = data.cars.find((item) => item.id === o.car_id)?.mileage ?? o.mileage;
-  const visitMileage = o.mileage_at_visit ?? currentCarMileage;
-  const hasVisitMileageSnapshot = o.mileage_at_visit != null;
   const finishOrder = () => {
     const value = completionMileage.trim();
     if (value && (!/^\d+$/.test(value) || Number(value) > 10_000_000)) {
@@ -450,7 +448,7 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
         </dl>
         {!o.concern?.startsWith("По результатам диагностики №") && <Row label="Жалоба клиента" value={o.concern} />}
         <Row label="Выполненные работы" value={o.description} />
-        <Row label={hasVisitMileageSnapshot ? "Пробег на момент визита" : "Пробег автомобиля"} value={visitMileage != null ? <>{visitMileage.toLocaleString("ru-RU")} км{!hasVisitMileageSnapshot && <small className="mt-1 block font-normal text-muted">Снимок визита не был сохранён — показан текущий пробег.</small>}</> : null} />
+        <Row label="Пробег на момент визита" value={o.mileage_at_visit != null ? `${o.mileage_at_visit.toLocaleString("ru-RU")} км` : null} />
         <Row label="Рекомендации" value={o.recommendations} />
         <Gallery title="Фото работ" items={works} />
         {upload.error && (

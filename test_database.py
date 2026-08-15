@@ -161,6 +161,10 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(order.parts_margin, 500)
             self.assertEqual(order.profit, 500)
             self.assertEqual(order.mileage_at_visit, 126000)
+            self.assertEqual(
+                db.get_recent_orders_for_telegram_user(999)[0].mileage_at_visit,
+                126000,
+            )
             db.update_car(car_id, None, None, None, None, None, None, 130000)
             self.assertEqual(db.get_service_order(order.id).mileage_at_visit, 126000)
             later = db.add_service_order(car_id, "Замена масла", 1000, 0, 0, mileage_at_visit=140000)

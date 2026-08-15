@@ -695,11 +695,6 @@ class Database:
                 if name not in order_columns:
                     connection.execute(f"ALTER TABLE service_orders ADD COLUMN {name} {declaration}")
             connection.execute("UPDATE service_orders SET status = 'ready' WHERE status = 'completed'")
-            connection.execute(
-                """UPDATE service_orders
-                   SET mileage_at_visit = (SELECT mileage FROM cars WHERE cars.id = service_orders.car_id)
-                   WHERE mileage_at_visit IS NULL"""
-            )
             # Brake pads, discs and rear drums are replaced in axle sets.
             # Convert older diagnostic cards that still have separate side statuses
             # to one conservative combined status, preserving the worst finding.
@@ -2369,7 +2364,8 @@ class Database:
             rows = connection.execute(
                 """SELECT o.id, o.car_id, o.description, o.labor_revenue, o.parts_cost, o.parts_revenue, o.parts_profit, o.status, o.created_at,
                           c.brand, c.model, c.plate_number, c.vin, c.mileage, cu.full_name AS customer_name
-                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at, o.parts_source
+                          , o.concern, o.agreed_amount, o.recommendations, o.completed_at, o.archived_at,
+                          o.parts_source, o.mileage_at_visit
                    FROM service_orders AS o JOIN cars AS c ON c.id = o.car_id
                    LEFT JOIN customers cu ON cu.id = c.customer_id JOIN users AS u ON u.id = c.user_id
                    WHERE u.telegram_id = ? AND o.archived_at IS NULL AND c.archived_at IS NULL ORDER BY o.id DESC LIMIT ?""",
