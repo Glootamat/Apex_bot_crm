@@ -2493,12 +2493,23 @@ class Database:
             raise ValueError("Unknown order status")
         connection = self.connect()
         try:
-            previous = connection.execute("SELECT status FROM service_orders WHERE id = ?", (order_id,)).fetchone()
+            previous = connection.execute("SELECT status, car_id FROM service_orders WHERE id = ?", (order_id,)).fetchone()
             connection.execute(
                 "UPDATE service_orders SET status = ?, completed_at = CASE WHEN ? = 'ready' THEN CURRENT_TIMESTAMP ELSE completed_at END WHERE id = ?",
                 (status, status, order_id),
             )
             if status == "ready":
+                # Keep a visit snapshot for automatically created orders, without
+                # replacing any existing historical mileage.
+                connection.execute(
+                    """UPDATE service_orders
+                       SET mileage_at_visit = COALESCE(
+                           mileage_at_visit,
+                           (SELECT mileage FROM cars WHERE id = ?)
+                       )
+                       WHERE id = ?""",
+                    (previous["car_id"], order_id),
+                )
                 connection.execute(
                     """UPDATE appointments SET status = 'completed'
                        WHERE service_order_id = ? AND status IN ('scheduled', 'in_progress')""",

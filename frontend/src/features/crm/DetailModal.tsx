@@ -68,6 +68,7 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
   );
   const [orderExportOpen, setOrderExportOpen] = useState(false);
   const [photoSourceOpen, setPhotoSourceOpen] = useState(false);
+  const [completionMileage, setCompletionMileage] = useState("");
   const cameraInput = useRef<HTMLInputElement>(null);
   const galleryInput = useRef<HTMLInputElement>(null);
   const remove = useMutation({
@@ -97,9 +98,9 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     },
   });
   const orderStatus = useMutation({
-    mutationFn: (value: "ready" | "in_progress") =>
+    mutationFn: ({ action, mileageAtVisit }: { action: "ready" | "in_progress"; mileageAtVisit?: number }) =>
       detail.kind === "order"
-        ? api.orderStatus(detail.value.id, value)
+        ? api.orderStatus(detail.value.id, action, mileageAtVisit)
         : Promise.reject(new Error("Изменение статуса недоступно")),
     onSuccess: async () => {
       await refreshCrm();
@@ -417,6 +418,20 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
       </Modal>
     );
   const o = detail.value;
+  const currentCarMileage = data.cars.find((item) => item.id === o.car_id)?.mileage ?? o.mileage;
+  const finishOrder = () => {
+    const value = completionMileage.trim();
+    if (value && (!/^\d+$/.test(value) || Number(value) > 10_000_000)) {
+      window.alert("Укажите пробег целым числом в километрах.");
+      return;
+    }
+    const mileageAtVisit = value ? Number(value) : currentCarMileage ?? undefined;
+    if (mileageAtVisit == null) {
+      window.alert("Перед завершением укажите пробег автомобиля на момент визита.");
+      return;
+    }
+    orderStatus.mutate({ action: "ready", mileageAtVisit });
+  };
   const markup = o.parts_revenue === 0
     ? o.parts_profit
     : o.parts_revenue - o.parts_cost + o.parts_profit;
@@ -494,13 +509,14 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
             <Button variant="secondary" onClick={() => { setOrderExportOpen(false); void exportOrderImage(o, false); }}><FileImage size={17} />Сохранить картинкой</Button>
           </div>}
           {diagnosticAction}
+          {!["ready", "completed"].includes(o.status) && !o.mileage_at_visit && <label className="grid gap-1 rounded-xl border border-apex/30 bg-apex/5 p-3 text-sm sm:col-span-2"><span className="font-bold text-apex">Пробег на момент визита</span><span className="text-xs text-muted">Сохранится в истории автомобиля и обновит текущий пробег, если значение больше.</span><input className="mt-1 rounded-lg border border-line bg-canvas px-3 py-2 font-bold text-white outline-none transition focus:border-apex" type="number" min="0" inputMode="numeric" value={completionMileage} onChange={(event) => setCompletionMileage(event.target.value)} placeholder={currentCarMileage != null ? `${currentCarMileage} км` : "Например, 24000"} /></label>}
           {!["ready", "completed"].includes(o.status) ? (
-            <Button className="sm:col-span-2" onClick={() => orderStatus.mutate("ready")} disabled={orderStatus.isPending}>
+            <Button className="sm:col-span-2" onClick={finishOrder} disabled={orderStatus.isPending}>
               <CheckCircle2 size={17} />
               {orderStatus.isPending ? "Сохраняю…" : "Завершить заказ"}
             </Button>
           ) : (
-            <Button className="sm:col-span-2" variant="secondary" onClick={() => orderStatus.mutate("in_progress")} disabled={orderStatus.isPending}>
+            <Button className="sm:col-span-2" variant="secondary" onClick={() => orderStatus.mutate({ action: "in_progress" })} disabled={orderStatus.isPending}>
               <RotateCcw size={17} />
               {orderStatus.isPending ? "Возвращаю…" : "Вернуть в работу"}
             </Button>

@@ -170,6 +170,20 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(db.get_service_order(later.id).mileage_at_visit, 141000)
             self.assertEqual(db.get_service_order(order.id).mileage_at_visit, 126000)
 
+    def test_completing_order_backfills_missing_visit_mileage_from_car(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            user_id = db.add_or_update_user(998, "Мастер", None)
+            car_id = db.add_car(user_id, "Hyundai", "Solaris")
+            order = db.add_service_order(car_id, "Замена масла", 0, 0, 0)
+            self.assertIsNone(order.mileage_at_visit)
+
+            db.update_car(car_id, None, None, None, None, None, None, 24500)
+            completed = db.set_order_status(order.id, "ready", user_id)
+
+            self.assertEqual(completed.mileage_at_visit, 24500)
+
     def test_customer_overview_status_and_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.sqlite3")

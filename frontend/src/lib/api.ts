@@ -126,6 +126,6 @@ export const api = {
   appointmentAction: (id: number, action: "arrived" | "no_show") => request(`/api/appointments/${id}/action`, { method: "POST", ...json({ action }) }),
   saveOrder: (data: OrderInput, id?: number) => request(`/api/orders${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", ...json(data) }),
   deleteOrder: (id: number) => request<{ status: string }>(`/api/orders/${id}`, { method: "DELETE" }),
-  orderStatus: (id: number, action: "ready" | "in_progress" | "completed") => request(`/api/orders/${id}/status`, { method: "POST", ...json({ action }) }),
+  orderStatus: (id: number, action: "ready" | "in_progress" | "completed", mileageAtVisit?: number) => request(`/api/orders/${id}/status`, { method: "POST", ...json({ action, mileage_at_visit: mileageAtVisit ?? null }) }),
   uploadOrderPhoto: (id: number, file: File, photoType: "work" | "receipt") => request<ReceiptUploadResult>(`/api/orders/${id}/photos?photo_type=${photoType}`, { method: "POST", body: file, headers: { "Content-Type": file.type } }),
 };

@@ -291,6 +291,7 @@ class OrderPayload(BaseModel):
 
 class ActionPayload(BaseModel):
     action: Literal["arrived", "no_show", "ready", "in_progress", "completed"]
+    mileage_at_visit: Annotated[int | None, Field(ge=0, le=10_000_000)] = None
 
 
 class DiagnosticStartPayload(BaseModel):
@@ -1171,6 +1172,10 @@ def order_status(
 ) -> dict[str, object]:
     require_order(order_id)
     try:
+        if data.mileage_at_visit is not None:
+            db.update_order_crm_fields(
+                order_id, owner_user_id(), mileage_at_visit=data.mileage_at_visit,
+            )
         order = db.set_order_status(order_id, data.action, owner_user_id())
     except ValueError as error:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
