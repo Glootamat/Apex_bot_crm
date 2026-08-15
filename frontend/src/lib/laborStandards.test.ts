@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { laborCategories, laborStandards } from "./laborStandards";
+import { laborCategories, laborMarket, laborSources, laborStandards } from "./laborStandards";
 
 describe("labor standards starter catalog", () => {
   it("contains unique, valid operations in every category", () => {
@@ -12,5 +12,17 @@ describe("labor standards starter catalog", () => {
     const paired = laborStandards.filter((item) => /колодок|тормозных дисков|тормозных барабанов/i.test(item.name));
     expect(paired.length).toBeGreaterThan(0);
     expect(paired.every((item) => /ось|пара/.test(item.unit))).toBe(true);
+  });
+
+  it("keeps every market reference traceable and internally consistent", () => {
+    const operationIds = new Set(laborStandards.map((item) => item.id));
+    for (const [id, reference] of Object.entries(laborMarket)) {
+      if (!reference) throw new Error(`Missing market reference for ${id}`);
+      expect(operationIds.has(id)).toBe(true);
+      expect(reference.priceMin).toBeGreaterThan(0);
+      expect(reference.priceMax).toBeGreaterThanOrEqual(reference.priceMin);
+      expect(reference.sourceIds.length).toBeGreaterThan(0);
+      for (const sourceId of reference.sourceIds) expect(laborSources[sourceId].url).toMatch(/^https:\/\//);
+    }
   });
 });
