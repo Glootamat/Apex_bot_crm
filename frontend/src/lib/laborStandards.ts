@@ -1,4 +1,6 @@
-export type LaborCategory = "ТО и масла" | "Тормозная система" | "Ходовая часть" | "Двигатель" | "Электрика";
+import { extendedLaborStandards } from "./laborStandardsExtended";
+
+export type LaborCategory = "ТО и масла" | "Тормозная система" | "Ходовая часть" | "Рулевое управление" | "Двигатель" | "Трансмиссия" | "Охлаждение и отопление" | "Топливная система" | "Выхлопная система" | "Электрика" | "Кондиционер" | "Кузов и оснащение" | "Диагностика";
 
 export type LaborStandard = {
   id: string;
@@ -27,9 +29,9 @@ export const laborSources = {
 
 export const laborMarketCheckedAt = "15.08.2026";
 
-export const laborCategories: LaborCategory[] = ["ТО и масла", "Тормозная система", "Ходовая часть", "Двигатель", "Электрика"];
+export const laborCategories: LaborCategory[] = ["ТО и масла", "Тормозная система", "Ходовая часть", "Рулевое управление", "Двигатель", "Трансмиссия", "Охлаждение и отопление", "Топливная система", "Выхлопная система", "Электрика", "Кондиционер", "Кузов и оснащение", "Диагностика"];
 
-export const laborStandards: LaborStandard[] = [
+const baseLaborStandards: LaborStandard[] = [
   { id: "oil-engine", name: "Замена моторного масла и масляного фильтра", category: "ТО и масла", hours: 0.5, applicability: "Все автомобили", unit: "комплекс" },
   { id: "filter-air", name: "Замена воздушного фильтра", category: "ТО и масла", hours: 0.2, applicability: "Все автомобили", unit: "1 шт." },
   { id: "filter-cabin", name: "Замена салонного фильтра", category: "ТО и масла", hours: 0.3, applicability: "Все автомобили", unit: "1 шт." },
@@ -71,6 +73,8 @@ export const laborStandards: LaborStandard[] = [
   { id: "electric-diagnostics", name: "Диагностика электрооборудования", category: "Электрика", hours: 1, applicability: "Первичная диагностика", unit: "диагностика" },
 ];
 
+export const laborStandards: LaborStandard[] = [...baseLaborStandards, ...extendedLaborStandards];
+
 export const laborMarket: Partial<Record<string, LaborMarketReference>> = {
   "oil-engine": { priceMin: 500, priceMax: 790, publicHoursMin: .5, sourceIds: ["virbac", "abrand", "avangard"] },
   "filter-air": { priceMin: 300, priceMax: 520, publicHoursMin: .17, sourceIds: ["virbac", "abrand", "avangard", "fresh"] },
@@ -109,4 +113,64 @@ export const laborMarket: Partial<Record<string, LaborMarketReference>> = {
   "fuel-pump": { priceMin: 1800, priceMax: 2000, sourceIds: ["abrand", "avangard"] },
   "lamp": { priceMin: 200, priceMax: 600, sourceIds: ["abrand", "avangard"] },
   "electric-diagnostics": { priceMin: 600, priceMax: 1400, sourceIds: ["abrand", "fresh"] },
+  "oil-at-full": { priceMin: 2500, priceMax: 4950, sourceIds: ["avangard", "fresh"] },
+  "oil-transfer": { priceMin: 500, priceMax: 680, sourceIds: ["abrand", "avangard"] },
+  "filter-fuel-external": { priceMin: 300, priceMax: 400, sourceIds: ["abrand", "avangard"] },
+  "filter-fuel-tank": { priceMin: 1800, priceMax: 2000, sourceIds: ["abrand", "avangard"] },
+  "power-steering-fluid": { priceMin: 1000, priceMax: 1300, sourceIds: ["abrand", "avangard"] },
+  "service-throttle": { priceMin: 1000, priceMax: 1400, sourceIds: ["abrand"] },
+  "service-injectors": { priceMin: 1800, priceMax: 2300, sourceIds: ["abrand"] },
+  "brake-hose": { priceMin: 600, priceMax: 900, sourceIds: ["abrand"] },
+  "brake-bleed": { priceMin: 900, priceMax: 1500, sourceIds: ["abrand", "localrepair"] },
+  "parking-brake-cable": { priceMin: 1200, priceMax: 1400, sourceIds: ["abrand"] },
+  "caliper-repair": { priceMin: 1400, priceMax: 1900, sourceIds: ["abrand"] },
+  "alignment": { priceMin: 1900, priceMax: 1980, sourceIds: ["avangard", "fresh"] },
+  "power-steering-pump": { priceMin: 2000, priceMax: 2800, sourceIds: ["abrand"] },
+  "control-arm-front": { priceMin: 1000, priceMax: 1400, sourceIds: ["abrand", "avangard"] },
+  "control-arm-rear": { priceMin: 1000, priceMax: 1500, sourceIds: ["abrand", "avangard"] },
+  "silent-block-arm": { priceMin: 1000, priceMax: 1400, sourceIds: ["abrand"] },
+  "subframe": { priceMin: 4000, priceMax: 5000, sourceIds: ["abrand", "avangard"] },
+  "spring-front": { priceMin: 1500, priceMax: 2500, sourceIds: ["abrand", "avangard"] },
+  "spring-rear": { priceMin: 1000, priceMax: 1500, sourceIds: ["abrand", "avangard"] },
+  "knuckle": { priceMin: 2000, priceMax: 2800, sourceIds: ["abrand"] },
+  "rear-beam": { priceMin: 3800, priceMax: 5000, sourceIds: ["abrand", "avangard"] },
+  "rear-beam-bushes": { priceMin: 3800, priceMax: 5000, sourceIds: ["abrand", "avangard"] },
+  "engine-mount": { priceMin: 900, priceMax: 1400, sourceIds: ["abrand"] },
+  "timing-chain": { priceMin: 8000, priceMax: 11000, sourceIds: ["abrand", "avangard"] },
+  "water-pump": { priceMin: 1400, priceMax: 2500, sourceIds: ["abrand"] },
+  "oil-pan": { priceMin: 2000, priceMax: 2500, sourceIds: ["abrand", "avangard"] },
+  "oil-pan-gasket": { priceMin: 2000, priceMax: 2500, sourceIds: ["abrand", "avangard"] },
+  "cylinder-head": { priceMin: 9000, priceMax: 11000, sourceIds: ["abrand", "avangard"] },
+  "head-gasket": { priceMin: 6000, priceMax: 9000, sourceIds: ["abrand", "avangard"] },
+  "valve-adjust": { priceMin: 1200, priceMax: 2000, sourceIds: ["avangard"] },
+  "camshaft": { priceMin: 6000, priceMax: 8000, sourceIds: ["abrand"] },
+  "oil-pump": { priceMin: 5000, priceMax: 7000, sourceIds: ["abrand"] },
+  "engine-remove-install": { priceMin: 10000, priceMax: 15000, sourceIds: ["abrand"] },
+  "engine-overhaul": { priceMin: 35000, priceMax: 35000, sourceIds: ["abrand"] },
+  "intake-manifold": { priceMin: 1800, priceMax: 2500, sourceIds: ["abrand"] },
+  "exhaust-manifold": { priceMin: 1800, priceMax: 3000, sourceIds: ["abrand"] },
+  "gearbox-mt": { priceMin: 3500, priceMax: 6000, sourceIds: ["abrand"] },
+  "gearbox-mt-repair": { priceMin: 3500, priceMax: 10000, sourceIds: ["abrand"] },
+  "drive-shaft": { priceMin: 1600, priceMax: 3500, sourceIds: ["abrand", "avangard"] },
+  "cv-joint-inner": { priceMin: 1400, priceMax: 3500, sourceIds: ["abrand", "avangard"] },
+  "transfer-case": { priceMin: 2800, priceMax: 4000, sourceIds: ["abrand"] },
+  "radiator": { priceMin: 2800, priceMax: 3500, sourceIds: ["abrand"] },
+  "thermostat": { priceMin: 1900, priceMax: 2500, sourceIds: ["abrand"] },
+  "cooling-fan": { priceMin: 1400, priceMax: 1800, sourceIds: ["abrand"] },
+  "coolant-hose": { priceMin: 600, priceMax: 1000, sourceIds: ["abrand"] },
+  "cooling-flush": { priceMin: 1800, priceMax: 2000, sourceIds: ["abrand"] },
+  "heater-radiator": { priceMin: 1500, priceMax: 5000, sourceIds: ["abrand"] },
+  "heater-motor": { priceMin: 1800, priceMax: 2000, sourceIds: ["abrand"] },
+  "fuel-pump-module": { priceMin: 1800, priceMax: 2000, sourceIds: ["abrand", "avangard"] },
+  "injector-remove": { priceMin: 1800, priceMax: 2300, sourceIds: ["abrand"] },
+  "fuel-rail": { priceMin: 1200, priceMax: 1800, sourceIds: ["abrand"] },
+  "throttle-body": { priceMin: 1000, priceMax: 1400, sourceIds: ["abrand"] },
+  "ignition-coil": { priceMin: 600, priceMax: 900, sourceIds: ["abrand"] },
+  "headlamp": { priceMin: 800, priceMax: 1200, sourceIds: ["abrand"] },
+  "fuse-box": { priceMin: 600, priceMax: 1500, sourceIds: ["abrand"] },
+  "ac-refill": { priceMin: 1300, priceMax: 2500, sourceIds: ["abrand"] },
+  "ac-disinfection": { priceMin: 1000, priceMax: 1600, sourceIds: ["abrand"] },
+  "ac-compressor": { priceMin: 2800, priceMax: 4000, sourceIds: ["abrand"] },
+  "ac-pipe": { priceMin: 1400, priceMax: 2000, sourceIds: ["abrand"] },
+  "ac-belt": { priceMin: 600, priceMax: 1000, sourceIds: ["abrand"] },
 };

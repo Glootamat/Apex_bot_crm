@@ -3,6 +3,7 @@ import { laborCategories, laborMarket, laborSources, laborStandards } from "./la
 
 describe("labor standards starter catalog", () => {
   it("contains unique, valid operations in every category", () => {
+    expect(laborStandards.length).toBeGreaterThanOrEqual(150);
     expect(new Set(laborStandards.map((item) => item.id)).size).toBe(laborStandards.length);
     expect(laborStandards.every((item) => item.hours > 0)).toBe(true);
     for (const category of laborCategories) expect(laborStandards.some((item) => item.category === category)).toBe(true);
@@ -15,6 +16,7 @@ describe("labor standards starter catalog", () => {
   });
 
   it("keeps every market reference traceable and internally consistent", () => {
+    expect(Object.keys(laborMarket).length).toBeGreaterThanOrEqual(90);
     const operationIds = new Set(laborStandards.map((item) => item.id));
     for (const [id, reference] of Object.entries(laborMarket)) {
       if (!reference) throw new Error(`Missing market reference for ${id}`);
