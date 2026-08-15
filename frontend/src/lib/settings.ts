@@ -9,7 +9,7 @@ export type AppSettings = {
 };
 export const defaultSettings: AppSettings = {
   workspaceName: "APEX AUTO", city: "Москва",
-  modules: { calendar: true, orders: true, diagnostics: true, customers: true, cars: true, finance: true, trash: true },
+  modules: { calendar: false, orders: false, diagnostics: false, customers: true, cars: true, finance: false, trash: true },
   compactMode: false, reduceMotion: false, desktopNotifications: false,
   appointmentReminders: true, orderStatusNotifications: true, dailySummary: false, autoLockMinutes: 30,
 };

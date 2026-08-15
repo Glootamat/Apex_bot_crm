@@ -272,7 +272,7 @@ export function AppShell() {
   return (
     <div className={`min-h-dvh w-full max-w-full overflow-x-hidden bg-canvas text-white ${settings.compactMode ? "app-compact" : ""} ${settings.reduceMotion ? "app-reduce-motion" : ""}`}>
       <aside
-        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-line bg-sidebar p-4 transition-transform lg:translate-x-0 ${menuOpen ? "translate-x-0" : "-translate-x-full"}`}
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col overflow-y-auto border-r border-line bg-sidebar p-4 transition-transform lg:translate-x-0 ${menuOpen ? "translate-x-0" : "-translate-x-full"}`}
       >
         <div className="mb-7 flex items-center justify-between px-2">
           <div className="flex min-w-0 items-center gap-3">
