@@ -17,7 +17,7 @@ from aiogram.methods import SendMessage, SendPhoto, SendDocument
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, CopyTextButton, FSInputFile, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from backup import create_backup, verify_backup
@@ -26,6 +26,7 @@ from openrouter import OpenRouterError, WorkshopCommand, analyze_receipt_image, 
 
 
 BASE_DIR = Path(__file__).resolve().parent
+ORDER_PHOTO_UPLOAD_DIR = BASE_DIR / "uploads" / "order_photos"
 load_dotenv(BASE_DIR / ".env")
 db = Database(BASE_DIR / "workshop.sqlite3")
 router = Router()
@@ -1484,19 +1485,38 @@ async def show_order_photos(callback: CallbackQuery) -> None:
             reply_markup=order_detail_keyboard(order_id),
         )
         return
-    await callback.message.answer(
-        f"🖼 Фото работ · заказ #{order_id} · {order.brand} {order.model}\n"
-        f"Всего фотографий: {len(photos)}"
-    )
-    for number, photo in enumerate(photos, start=1):
-        caption = str(photo["caption"] or "").strip()
-        photo_caption = f"Фото {number}/{len(photos)}"
-        if caption:
-            photo_caption += f"\n{caption}"
-        await callback.message.answer_photo(
-            str(photo["telegram_file_id"]),
-            caption=photo_caption,
-        )
+    media: list[InputMediaPhoto] = []
+    skipped = 0
+    for photo in photos:
+        stored_file_id = str(photo["telegram_file_id"])
+        if stored_file_id.startswith("pwa:"):
+            filename = stored_file_id[4:]
+            path = ORDER_PHOTO_UPLOAD_DIR / filename
+            if Path(filename).name != filename or not path.is_file():
+                skipped += 1
+                continue
+            image: str | FSInputFile = FSInputFile(path)
+        else:
+            image = stored_file_id
+        media.append(InputMediaPhoto(media=image))
+
+    if not media:
+        await callback.message.answer("Фото работ не найдены: файлы были удалены с сервера.")
+        return
+
+    title = f"🖼 Фото работ · заказ #{order_id} · {order.brand} {order.model}"
+    if len(media) == 1:
+        await callback.message.answer_photo(media[0].media, caption=title)
+        if skipped:
+            await callback.message.answer(f"Не удалось найти файлов: {skipped}.")
+        return
+    for start in range(0, len(media), 10):
+        batch = media[start:start + 10]
+        if start == 0:
+            batch[0].caption = title
+        await callback.message.answer_media_group(batch)
+    if skipped:
+        await callback.message.answer(f"Не удалось найти файлов: {skipped}.")
 
 
 @router.callback_query(F.data.startswith("order:add-photo:"))

@@ -523,12 +523,13 @@ export function DetailModal({ detail, data, onClose, onEdit, onOpen }: Props) {
     </Modal>
   );
 }
-function ProtectedOrderPhoto({ item, title }: { item: OrderAttachment; title: string }) {
+function ProtectedOrderPhoto({ item, title, onOpen }: { item: OrderAttachment; title: string; onOpen: (source: string, label: string) => void }) {
   const photo = useQuery({ queryKey: ["order-photo", item.id, item.url], queryFn: async () => URL.createObjectURL(await api.orderPhoto(item.url!)), staleTime: Infinity });
   useEffect(() => () => { if (photo.data) URL.revokeObjectURL(photo.data); }, [photo.data]);
   if (photo.isPending) return <div className="aspect-square animate-pulse rounded-xl bg-panel-soft" />;
   if (photo.isError || !photo.data) return <div className="grid aspect-square place-items-center rounded-xl bg-danger/10 p-2 text-center text-xs text-danger">Фото недоступно</div>;
-  return <a href={photo.data} target="_blank" rel="noreferrer"><img className="aspect-square w-full rounded-xl object-cover" src={photo.data} alt={item.caption || title} loading="lazy" /></a>;
+  const label = item.caption || title;
+  return <button type="button" className="block rounded-xl text-left focus:outline-none focus:ring-2 focus:ring-apex" onClick={() => onOpen(photo.data, label)} aria-label={`Открыть: ${label}`}><img className="aspect-square w-full rounded-xl object-cover" src={photo.data} alt={label} loading="lazy" /></button>;
 }
 function Gallery({
   title,
@@ -537,13 +538,15 @@ function Gallery({
   title: string;
   items: OrderAttachment[];
 }) {
+  const [selected, setSelected] = useState<{ source: string; label: string } | null>(null);
   if (!items.length) return null;
   return (
     <section>
       <h3 className="mb-2 font-black">{title}</h3>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-        {items.map((item) => <ProtectedOrderPhoto key={item.id} item={item} title={title} />)}
+        {items.map((item) => <ProtectedOrderPhoto key={item.id} item={item} title={title} onOpen={(source, label) => setSelected({ source, label })} />)}
       </div>
+      {selected && <Modal title={selected.label} onClose={() => setSelected(null)}><img className="max-h-[75vh] w-full rounded-xl object-contain" src={selected.source} alt={selected.label} /></Modal>}
     </section>
   );
 }
